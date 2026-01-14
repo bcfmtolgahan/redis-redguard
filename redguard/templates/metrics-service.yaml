@@ -1,0 +1,19 @@
+{{- if .Values.metrics.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redguard.fullname" . }}-metrics
+  labels:
+    {{- include "redguard.labels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: {{ .Values.metrics.port }}
+    targetPort: {{ .Values.metrics.port }}
+    protocol: TCP
+  selector:
+    {{- include "redguard.selectorLabels" . | nindent 4 }}
+    control-plane: controller-manager
+{{- end }}

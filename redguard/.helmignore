@@ -1,0 +1,7 @@
+# Patterns to ignore when building packages.
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.DS_Store

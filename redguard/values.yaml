@@ -1,0 +1,60 @@
+# Default values for redguard operator
+
+# Operator configuration
+operator:
+  # Number of operator replicas
+  replicas: 1
+
+  image:
+    repository: ghcr.io/bcfmtolgahan/redguard
+    tag: v0.2.1
+    pullPolicy: IfNotPresent
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  # Node selector
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+  # Affinity
+  affinity: {}
+
+# ServiceAccount configuration
+serviceAccount:
+  # Create service account
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use
+  name: ""
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources
+  create: true
+
+# Metrics service
+metrics:
+  enabled: true
+  port: 8080
+
+# Health probe
+health:
+  port: 8081

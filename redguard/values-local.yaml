@@ -1,0 +1,44 @@
+# Local test values for redguard operator
+
+operator:
+  replicas: 1
+
+  image:
+    repository: redguard
+    tag: v0.1.3
+    pullPolicy: Never  # Use local image
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
+
+metrics:
+  enabled: true
+  port: 8080
+
+health:
+  port: 8081
