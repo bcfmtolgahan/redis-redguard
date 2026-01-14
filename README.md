@@ -53,7 +53,7 @@ Redguard simplifies Redis deployment and management on Kubernetes by automating:
 
 ```bash
 # Add Helm repository
-helm repo add redguard https://bcfmtolgahan.github.io/redis-operator
+helm repo add redguard https://bcfmtolgahan.github.io/redis-redguard
 helm repo update
 
 # Install the operator
