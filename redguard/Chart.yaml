@@ -10,7 +10,7 @@ keywords:
   - operator
   - high-availability
 maintainers:
-  - name: redguard
-home: https://github.com/redguard/redguard
+  - name: bcfmtolgahan
+home: https://github.com/bcfmtolgahan/redis-redguard
 sources:
-  - https://github.com/redguard/redguard
+  - https://github.com/bcfmtolgahan/redis-redguard

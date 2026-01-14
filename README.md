@@ -45,11 +45,11 @@ Redguard simplifies Redis deployment and management on Kubernetes by automating:
 ## Installation
 
 ### Prerequisites
-- Kubernetes 1.30+
+- Kubernetes 1.20+
 - kubectl configured
 - Helm 3+
 
-### Using Helm (Recommended)
+### Install with Helm
 
 ```bash
 # Add Helm repository
@@ -237,9 +237,9 @@ Redguard creates the following Kubernetes resources:
 4. Replicas reconfigured to follow new master
 5. Operator updates status with new master information
 
-## Configuration Examples
+## Examples
 
-See [config/samples/](./config/samples/) for more examples:
+Additional configuration examples are available in [config/samples/](./config/samples/):
 - [Basic Redis cluster](./config/samples/redis_v1alpha1_redissentinel.yaml)
 - [Redis with TLS](./config/samples/redis_v1alpha1_redissentinel_tls.yaml)
 - [Redis User ACL](./config/samples/redis_v1alpha1_redisuser.yaml)
@@ -261,25 +261,19 @@ For production deployments:
 
 ## Uninstalling
 
-### Helm Installation
+To remove the operator and all resources:
 
 ```bash
-# Delete all Redis instances
+# Delete all Redis instances first
 kubectl delete redissentinel --all --all-namespaces
 
-# Uninstall operator
+# Uninstall the operator
 helm uninstall redguard -n redguard-system
 
-# Delete CRDs (optional)
+# Delete CRDs (optional - this will delete all custom resources)
 kubectl delete crd redissentinels.redis.redguard.io
 kubectl delete crd redisusers.redis.redguard.io
 kubectl delete crd redisbackups.redis.redguard.io
-```
-
-### kubectl Installation
-
-```bash
-kubectl delete -f install-ready.yaml
 ```
 
 ## Contributing
