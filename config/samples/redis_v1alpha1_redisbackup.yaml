@@ -1,0 +1,61 @@
+apiVersion: redis.redguard.io/v1alpha1
+kind: RedisBackup
+metadata:
+  name: redis-daily-backup
+  namespace: default
+spec:
+  # Reference to the RedisSentinel cluster to backup
+  redisClusterRef: redis-cluster
+  
+  # Schedule using cron expression (daily at 2 AM)
+  # For one-time backup, leave empty
+  schedule: "0 2 * * *"
+  
+  # S3 Configuration
+  s3:
+    # S3 bucket name
+    bucket: my-redis-backups
+    
+    # AWS region
+    region: us-east-1
+    
+    # Optional: S3-compatible endpoint (for MinIO, DigitalOcean Spaces, etc.)
+    # endpoint: https://s3.us-east-1.amazonaws.com
+    
+    # Path prefix in the bucket
+    prefix: redis-cluster/backups
+    
+    # Secret containing AWS credentials (kubectl create secret generic aws-s3-creds --from-literal=accessKeyId=xxx --from-literal=secretAccessKey=yyy)
+    # If using IAM roles (IRSA), set useIAMRole: true instead
+    credentialsSecretRef: aws-s3-creds
+    
+    # Use IAM role instead of credentials (e.g., with IRSA on EKS)
+    useIAMRole: false
+  
+  # Retention: keep last 7 backups
+  retentionPolicy: 7
+  
+  # Enable gzip compression
+  compression: true
+  
+  # Suspend scheduled backups (useful for maintenance)
+  suspend: false
+---
+apiVersion: redis.redguard.io/v1alpha1
+kind: RedisBackup
+metadata:
+  name: redis-onetime-backup
+  namespace: default
+spec:
+  redisClusterRef: redis-cluster
+  
+  # No schedule = one-time backup
+  
+  s3:
+    bucket: my-redis-backups
+    region: us-east-1
+    prefix: redis-cluster/manual
+    credentialsSecretRef: aws-s3-creds
+  
+  retentionPolicy: 30
+  compression: true
