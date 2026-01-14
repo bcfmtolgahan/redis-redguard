@@ -1,0 +1,42 @@
+apiVersion: redis.redguard.io/v1alpha1
+kind: RedisUser
+metadata:
+  name: app-user
+  namespace: default
+spec:
+  # Reference to the RedisSentinel cluster
+  redisClusterRef: redis-cluster
+  
+  # Username for Redis ACL
+  username: app-user
+  
+  # Secret containing password (kubectl create secret generic app-user-password --from-literal=password=mypassword)
+  passwordSecretRef: app-user-password
+  
+  # ACL Rules - Redis 6+ Access Control Lists
+  aclRules:
+    # Categories: @all, @read, @write, @set, @sortedset, @list, @hash, @string, @bitmap, @hyperloglog, @geo, @stream, @pubsub, @admin, @fast, @slow, @blocking, @dangerous, @connection, @transaction, @scripting
+    categories:
+      - "+@read"      # Allow all read commands
+      - "+@write"     # Allow all write commands
+      - "-@dangerous" # Deny dangerous commands (FLUSHDB, FLUSHALL, etc.)
+    
+    # Individual commands (prefix with + to allow, - to deny)
+    commands:
+      - "+get"
+      - "+set"
+      - "+del"
+      - "-flushdb"
+      - "-flushall"
+    
+    # Key patterns this user can access
+    keys:
+      - "~app:*"      # Can access keys starting with "app:"
+      - "~cache:*"    # Can access keys starting with "cache:"
+    
+    # Pub/Sub channel patterns
+    channels:
+      - "&notifications:*"
+  
+  # User enabled status
+  enabled: true
