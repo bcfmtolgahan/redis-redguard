@@ -1,0 +1,52 @@
+apiVersion: redis.redguard.io/v1alpha1
+kind: RedisSentinel
+metadata:
+  name: redis-cluster-tls
+  namespace: default
+spec:
+  redisConfig:
+    replicas: 3
+    image: redis:7-alpine
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    storage:
+      size: 1Gi
+      storageClassName: standard
+    
+    # Authentication with password
+    auth:
+      secretName: redis-password  # kubectl create secret generic redis-password --from-literal=password=mysecurepassword
+
+  sentinelConfig:
+    replicas: 3
+    quorum: 2
+    downAfterMilliseconds: 5000
+    failoverTimeout: 10000
+    parallelSyncs: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
+  # TLS Configuration
+  tls:
+    enabled: true
+    
+    # TLS certificate secret (kubectl create secret tls redis-tls-cert --cert=tls.crt --key=tls.key)
+    certificateSecretRef: redis-tls-cert
+    
+    # CA certificate secret (kubectl create secret generic redis-ca-cert --from-file=ca.crt)
+    caSecretRef: redis-ca-cert
+    
+    # Enable mutual TLS (client certificate verification)
+    mutualTLS: true
+
+  serviceType: ClusterIP
