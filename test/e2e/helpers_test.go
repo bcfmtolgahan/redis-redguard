@@ -204,6 +204,35 @@ func splitByRole(states []replicaState) (masters, replicas []replicaState) {
 	return masters, replicas
 }
 
+// serviceEndpointIPs returns the ready endpoint addresses of a Service, the
+// set of pods traffic to it can actually reach.
+func serviceEndpointIPs(namespace, service string) ([]string, error) {
+	out, err := kubectl("get", "endpoints", service, "-n", namespace, "-o", "json")
+	if err != nil {
+		return nil, err
+	}
+
+	var endpoints struct {
+		Subsets []struct {
+			Addresses []struct {
+				IP string `json:"ip"`
+			} `json:"addresses"`
+		} `json:"subsets"`
+	}
+	if err := json.Unmarshal([]byte(out), &endpoints); err != nil {
+		return nil, fmt.Errorf("parse endpoints for %q: %w", service, err)
+	}
+
+	var ips []string
+	for _, subset := range endpoints.Subsets {
+		for _, addr := range subset.Addresses {
+			ips = append(ips, addr.IP)
+		}
+	}
+	sort.Strings(ips)
+	return ips, nil
+}
+
 // sentinelStatus mirrors the RedisSentinel status subresource fields the specs read.
 type sentinelStatus struct {
 	Phase          string `json:"phase"`

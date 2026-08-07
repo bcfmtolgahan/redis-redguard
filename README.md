@@ -125,8 +125,18 @@ kubectl get pods -l redis.redguard.io/redis-name=my-redis
 
 ### Connect to Redis
 
+The operator creates two client Services per cluster:
+
+- `<name>-redis` routes to the current master only. Use it for writes. The
+  operator moves its endpoint when Sentinel promotes a new master; during the
+  failover window the Service has no endpoints and writes fail fast instead of
+  reaching a read-only replica.
+- `<name>-redis-replicas` routes to every Redis pod, master included. Use it
+  to spread read-only traffic; a write sent here can land on a replica and be
+  rejected with `-READONLY`.
+
 ```bash
-# Port-forward to Redis service
+# Port-forward to the master (write) service
 kubectl port-forward svc/my-redis-redis 6379:6379
 
 # Connect with redis-cli
@@ -239,7 +249,10 @@ Redguard creates the following Kubernetes resources:
 
 - **StatefulSet (Redis)**: Master and replica pods with persistent storage
 - **StatefulSet (Sentinel)**: Sentinel pods for monitoring and failover
-- **Services**: Headless and ClusterIP services for pod discovery
+- **Services**: headless Services for pod discovery, `<name>-redis` for writes
+  (master only, tracked via the `redis.redguard.io/role: master` pod label),
+  `<name>-redis-replicas` for read scaling, `<name>-sentinel` for Sentinel
+  clients
 - **ConfigMaps**: Redis and Sentinel configuration
 - **PersistentVolumeClaims**: Storage for Redis data
 
@@ -248,7 +261,12 @@ Redguard creates the following Kubernetes resources:
 2. Quorum of Sentinels agree on failure
 3. New master is elected from healthy replicas
 4. Replicas reconfigured to follow new master
-5. Operator updates status with new master information
+5. Operator moves the `redis.redguard.io/role: master` label to the promoted
+   pod, repointing `<name>-redis`, and updates the status
+
+The role label only moves while the operator runs. If the operator is down
+during a failover, `<name>-redis` keeps pointing at the demoted pod until the
+operator comes back and reconciles.
 
 ## Configuration Examples
 

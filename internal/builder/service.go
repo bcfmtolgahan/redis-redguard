@@ -7,6 +7,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+// RoleLabelKey marks the pod Sentinel currently reports as master. The
+// reconciler stamps it on the master and strips it from every other Redis
+// pod; the client Service selects on it so writes never reach a replica.
+// It is deliberately absent from the pod template: a template-borne value
+// would reassert itself on restart regardless of the real role.
+const (
+	RoleLabelKey = "redis.redguard.io/role"
+	RoleMaster   = "master"
+)
+
 // BuildRedisHeadlessService creates a headless service for Redis StatefulSet
 func BuildRedisHeadlessService(rs *redisv1alpha1.RedisSentinel) *corev1.Service {
 	return &corev1.Service{
@@ -32,11 +42,43 @@ func BuildRedisHeadlessService(rs *redisv1alpha1.RedisSentinel) *corev1.Service 
 	}
 }
 
-// BuildRedisService creates a service for Redis external access
+// BuildRedisService creates the client-facing write endpoint. It selects only
+// the pod carrying the master role label, so between a master failing and the
+// reconciler moving the label the Service has no endpoints: writes fail fast
+// instead of landing on a read-only replica. If the operator itself is down,
+// the label cannot move and the Service keeps pointing at the last known
+// master until the operator returns.
 func BuildRedisService(rs *redisv1alpha1.RedisSentinel) *corev1.Service {
+	selector := buildLabels(rs, "redis")
+	selector[RoleLabelKey] = RoleMaster
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      rs.Name + "-redis",
+			Namespace: rs.Namespace,
+			Labels:    buildLabels(rs, "redis"),
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     rs.Spec.ServiceType,
+			Selector: selector,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "redis",
+					Port:       6379,
+					TargetPort: intstr.FromInt(6379),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
+// BuildRedisReplicasService creates a read-scaling endpoint selecting every
+// Redis pod, master included. Connections may land on any node, so it is only
+// suitable for read-only clients.
+func BuildRedisReplicasService(rs *redisv1alpha1.RedisSentinel) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rs.Name + "-redis-replicas",
 			Namespace: rs.Namespace,
 			Labels:    buildLabels(rs, "redis"),
 		},

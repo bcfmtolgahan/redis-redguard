@@ -143,6 +143,24 @@ var _ = Describe("Redguard", Ordered, func() {
 			g.Expect(available).To(Equal("True"), "Available condition: %s", message)
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
+		By("checking the write Service routes to the master and the replicas Service to every pod")
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			masters, _ := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1))
+
+			writeIPs, err := serviceEndpointIPs(clusterNamespace, sentinelName+"-redis")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(writeIPs).To(ConsistOf(masters[0].IP),
+				"the write Service must route to the master and nothing else")
+
+			readIPs, err := serviceEndpointIPs(clusterNamespace, sentinelName+"-redis-replicas")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(readIPs).To(HaveLen(3),
+				"the replicas Service must route to every Redis pod")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
 		// Sentinel learns about replicas from INFO polling and about its peers
 		// from the master's pub/sub channel, so the full topology becomes
 		// visible a few seconds after the replicas are already in sync.
@@ -307,6 +325,32 @@ var _ = Describe("Redguard", Ordered, func() {
 			g.Expect(status.MasterNode).To(Equal(newMaster.IP+":6379"),
 				"the CR does not report the promoted pod as master")
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for the write Service endpoints to move to the new master")
+		Eventually(func(g Gomega) {
+			ips, err := serviceEndpointIPs(clusterNamespace, sentinelName+"-redis")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(ips).To(ConsistOf(newMaster.IP),
+				"the write Service still routes somewhere other than the promoted master")
+
+			labeled, err := listPods(clusterNamespace,
+				redisSelector+",redis.redguard.io/role=master")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(labeled).To(HaveLen(1), "exactly one pod may carry the master role label")
+			g.Expect(labeled[0].Name).To(Equal(newMaster.Pod),
+				"the master role label sits on a pod that is not the master")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		// Eventually: endpoints are already correct above, but kube-proxy may
+		// lag a moment behind the Endpoints object.
+		By("writing through the write Service")
+		Eventually(func(g Gomega) {
+			reply, err := redisCLI(clusterNamespace, newMaster.Pod,
+				"-h", sentinelName+"-redis", "SET", "redguard-e2e:write-service", "ok")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(reply).To(Equal("OK"),
+				"a write through the client Service was not accepted: %q", reply)
+		}, 1*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("reading the pre-failover key back from the new master")
 		value, err := redisCLI(clusterNamespace, newMaster.Pod, "GET", failoverKey)

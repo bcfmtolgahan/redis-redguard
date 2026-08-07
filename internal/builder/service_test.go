@@ -77,6 +77,78 @@ func TestBuildRedisService_Metadata(t *testing.T) {
 	assertSinglePort(t, svc, "redis", 6379)
 }
 
+// The client Service is the write endpoint. Selecting on the pod labels alone
+// would round-robin writes across replicas, which answer -READONLY, so the
+// selector must additionally require the reconciler-maintained role label.
+func TestRedisServiceSelectsMasterOnly(t *testing.T) {
+	rs := testSentinel()
+	svc := BuildRedisService(rs)
+	podLabels := BuildRedisStatefulSet(rs).Spec.Template.Labels
+
+	if got, want := svc.Spec.Selector[RoleLabelKey], RoleMaster; got != want {
+		t.Fatalf("selector[%s] = %q, want %q — every replica would receive writes", RoleLabelKey, got, want)
+	}
+	if _, ok := podLabels[RoleLabelKey]; ok {
+		t.Errorf("pod template must not carry %s; the reconciler stamps it on the actual master only", RoleLabelKey)
+	}
+	for k, v := range svc.Spec.Selector {
+		if k == RoleLabelKey {
+			continue
+		}
+		if podLabels[k] != v {
+			t.Errorf("selector wants %s=%s but pods carry %v — Service gets zero endpoints", k, v, podLabels)
+		}
+	}
+}
+
+func TestBuildRedisReplicasService(t *testing.T) {
+	rs := testSentinel()
+	svc := BuildRedisReplicasService(rs)
+	podLabels := BuildRedisStatefulSet(rs).Spec.Template.Labels
+
+	if got, want := svc.Name, "test-rs-redis-replicas"; got != want {
+		t.Errorf("Service name = %q, want %q", got, want)
+	}
+	if _, ok := svc.Spec.Selector[RoleLabelKey]; ok {
+		t.Errorf("replicas Service must select every Redis pod; selecting on %s would drop endpoints during failover", RoleLabelKey)
+	}
+	if len(svc.Spec.Selector) == 0 {
+		t.Fatal("replicas Service has an empty selector")
+	}
+	for k, v := range svc.Spec.Selector {
+		if podLabels[k] != v {
+			t.Errorf("selector wants %s=%s but pods carry %v", k, v, podLabels)
+		}
+	}
+	if svc.Spec.ClusterIP == corev1.ClusterIPNone {
+		t.Error("replicas Service must not be headless")
+	}
+	assertSinglePort(t, svc, "redis", 6379)
+}
+
+func TestBuildRedisReplicasService_HonoursServiceType(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.ServiceType = corev1.ServiceTypeNodePort
+
+	if got := BuildRedisReplicasService(rs).Spec.Type; got != corev1.ServiceTypeNodePort {
+		t.Errorf("type = %q, want NodePort", got)
+	}
+}
+
+// The headless Service backs StatefulSet DNS, so it must keep selecting every
+// pod regardless of role.
+func TestHeadlessServicesIgnoreRoleLabel(t *testing.T) {
+	rs := testSentinel()
+	for _, svc := range []*corev1.Service{
+		BuildRedisHeadlessService(rs),
+		BuildSentinelHeadlessService(rs),
+	} {
+		if _, ok := svc.Spec.Selector[RoleLabelKey]; ok {
+			t.Errorf("%s selects on %s; pod DNS would break for non-master pods", svc.Name, RoleLabelKey)
+		}
+	}
+}
+
 // Sentinel is an internal control-plane endpoint and is never exposed, whatever
 // serviceType the user asks for on the Redis client Service.
 func TestBuildSentinelService_AlwaysClusterIP(t *testing.T) {
@@ -102,13 +174,15 @@ func TestServiceSelectorsMatchStatefulSetPodLabels(t *testing.T) {
 	redisPodLabels := BuildRedisStatefulSet(rs).Spec.Template.Labels
 	sentinelPodLabels := BuildSentinelStatefulSet(rs).Spec.Template.Labels
 
+	// The write Service is absent here: its selector adds the role label the
+	// reconciler maintains at runtime, covered by TestRedisServiceSelectsMasterOnly.
 	tests := []struct {
 		name      string
 		svc       *corev1.Service
 		podLabels map[string]string
 	}{
 		{"redis-headless", BuildRedisHeadlessService(rs), redisPodLabels},
-		{"redis", BuildRedisService(rs), redisPodLabels},
+		{"redis-replicas", BuildRedisReplicasService(rs), redisPodLabels},
 		{"sentinel-headless", BuildSentinelHeadlessService(rs), sentinelPodLabels},
 		{"sentinel", BuildSentinelService(rs), sentinelPodLabels},
 	}
@@ -158,6 +232,7 @@ func TestServices_Labels(t *testing.T) {
 	}{
 		{BuildRedisHeadlessService(rs), "redis"},
 		{BuildRedisService(rs), "redis"},
+		{BuildRedisReplicasService(rs), "redis"},
 		{BuildSentinelHeadlessService(rs), "sentinel"},
 		{BuildSentinelService(rs), "sentinel"},
 	}
@@ -179,6 +254,7 @@ func TestServices_NamespaceFollowsCR(t *testing.T) {
 	for _, svc := range []*corev1.Service{
 		BuildRedisHeadlessService(rs),
 		BuildRedisService(rs),
+		BuildRedisReplicasService(rs),
 		BuildSentinelHeadlessService(rs),
 		BuildSentinelService(rs),
 	} {
