@@ -90,6 +90,33 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+# Chart files written by hack/sync-chart.sh. Anything else under charts/ is
+# hand-maintained and is not part of the drift gate.
+CHART_DIR := charts/redguard
+CHART_GENERATED := crds \
+	templates/role.yaml templates/rolebinding.yaml \
+	templates/leader-election-role.yaml templates/leader-election-rolebinding.yaml \
+	templates/metrics-auth-role.yaml templates/metrics-auth-rolebinding.yaml
+
+.PHONY: sync-chart
+sync-chart: manifests ## Regenerate chart CRDs and RBAC from config/.
+	./hack/sync-chart.sh
+
+.PHONY: verify-chart
+verify-chart: manifests ## Fail if the chart is out of sync with config/.
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT; \
+	./hack/sync-chart.sh "$$tmp" >/dev/null; \
+	rc=0; \
+	for f in $(CHART_GENERATED); do \
+		diff -ru "$(CHART_DIR)/$$f" "$$tmp/$$f" || rc=1; \
+	done; \
+	if [ $$rc -ne 0 ]; then \
+		echo "ERROR: $(CHART_DIR) is out of sync with config/. Run 'make sync-chart' and commit."; \
+		exit 1; \
+	fi
+	helm lint $(CHART_DIR)
+	helm template redguard $(CHART_DIR) >/dev/null
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run
@@ -265,8 +292,8 @@ cleanup-local: ## Cleanup local test environment
 
 .PHONY: helm-install-local
 helm-install-local: ## Install operator with Helm (local)
-	helm upgrade --install redguard ./helm/redguard \
-		--values ./helm/redguard/values-local.yaml \
+	helm upgrade --install redguard ./$(CHART_DIR) \
+		--values ./$(CHART_DIR)/values-local.yaml \
 		--namespace redguard-system \
 		--create-namespace \
 		--wait

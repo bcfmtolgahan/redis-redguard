@@ -21,3 +21,9 @@ jobs:
         run: |
           go mod tidy
           make test
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Verify chart is in sync with config/
+        run: make verify-chart
