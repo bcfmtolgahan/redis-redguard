@@ -108,8 +108,7 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 		tmpVolume(),
 	}
 
-	// Build probe command - with or without auth
-	probeCommand := buildRedisProbeCommand(rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "")
+	probes := redisProbeCLI(rs)
 
 	// Add auth if configured
 	if rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "" {
@@ -167,13 +166,6 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 		}
 	}
 
-	// Update probe command for TLS if enabled
-	if tlsEnabled {
-		probeCommand = buildRedisProbeCommandWithTLS(
-			rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "",
-			rs.Spec.TLS.CASecretRef != "")
-	}
-
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      rs.Name + "-redis",
@@ -218,7 +210,7 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: probeCommand,
+										Command: probes.livenessCommand(),
 									},
 								},
 								InitialDelaySeconds: 15,
@@ -229,7 +221,7 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: probeCommand,
+										Command: probes.readinessCommand(),
 									},
 								},
 								InitialDelaySeconds: 5,
@@ -290,14 +282,10 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 	// Check if TLS is enabled
 	tlsEnabled := rs.Spec.TLS != nil && rs.Spec.TLS.Enabled
 
-	// Sentinel carries requirepass on 26379 whenever auth is configured, so an
-	// unauthenticated PING answers NOAUTH and every probe would fail.
-	var sentinelProbeCommand []string
-	if tlsEnabled {
-		sentinelProbeCommand = buildSentinelProbeCommandWithTLS(authEnabled, rs.Spec.TLS.CASecretRef != "")
-	} else {
-		sentinelProbeCommand = buildSentinelProbeCommand(authEnabled)
-	}
+	// Sentinel has no replication link of its own, so readiness can only assert
+	// that it answers on 26379; the master it monitors is asserted by the Redis
+	// pods' own readiness.
+	sentinelProbeCommand := sentinelProbeCLI(rs).livenessCommand()
 
 	// Environment variables
 	env := []corev1.EnvVar{}
@@ -498,65 +486,80 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-// buildRedisProbeCommand creates the probe command for Redis with optional auth
-func buildRedisProbeCommand(authEnabled bool) []string {
-	if authEnabled {
-		// Use REDISCLI_AUTH environment variable to avoid password in command line
-		return []string{
-			"sh",
-			"-c",
-			"REDISCLI_AUTH=$REDIS_PASSWORD redis-cli -h $(hostname) ping | grep -q PONG",
+// probeCLI describes how a probe reaches the server in its own container.
+// A probe may issue more than one redis-cli call and every call has to carry
+// the same flags: one without them answers NOAUTH or fails the TLS handshake,
+// and the pod never becomes ready.
+type probeCLI struct {
+	// port is empty for the Redis default of 6379.
+	port string
+	// tlsDir is where the TLS material for this container is mounted.
+	tlsDir string
+	auth   bool
+	tls    bool
+	// cacert is false unless a CA secret is mounted. Pointing --cacert at a
+	// file that is not there fails every probe; without it redis-cli verifies
+	// against the system trust store.
+	cacert bool
+}
+
+// call renders a single redis-cli invocation. The password travels in
+// REDISCLI_AUTH because argv is readable by every process in the pod.
+func (p probeCLI) call(args string) string {
+	cmd := "redis-cli -h $(hostname)"
+	if p.port != "" {
+		cmd += " -p " + p.port
+	}
+	if p.tls {
+		cmd += " --tls --cert " + p.tlsDir + "/tls.crt --key " + p.tlsDir + "/tls.key"
+		if p.cacert {
+			cmd += " --cacert " + p.tlsDir + "/ca.crt"
 		}
 	}
-	return []string{
-		"sh",
-		"-c",
-		"redis-cli -h $(hostname) ping | grep -q PONG",
-	}
-}
-
-// buildSentinelProbeCommand creates the probe command for Sentinel with optional auth
-func buildSentinelProbeCommand(authEnabled bool) []string {
-	if authEnabled {
-		return []string{
-			"sh",
-			"-c",
-			"REDISCLI_AUTH=$REDIS_PASSWORD redis-cli -h $(hostname) -p 26379 ping | grep -q PONG",
-		}
-	}
-	return []string{
-		"sh",
-		"-c",
-		"redis-cli -h $(hostname) -p 26379 ping | grep -q PONG",
-	}
-}
-
-// buildRedisProbeCommandWithTLS creates the probe command for Redis with TLS.
-// --cacert is passed only when a CA secret is mounted; otherwise redis-cli
-// verifies against the system trust store, and pointing --cacert at a file
-// that is not there would fail every probe.
-func buildRedisProbeCommandWithTLS(authEnabled, caMounted bool) []string {
-	cmd := "redis-cli -h $(hostname) --tls --cert /etc/redis/tls/tls.crt --key /etc/redis/tls/tls.key"
-	if caMounted {
-		cmd += " --cacert /etc/redis/tls/ca.crt"
-	}
-	cmd += " ping | grep -q PONG"
-	if authEnabled {
+	if p.auth {
+		// A bare assignment prefix is not field-split, so a password
+		// containing spaces or globs survives unquoted.
 		cmd = "REDISCLI_AUTH=$REDIS_PASSWORD " + cmd
 	}
-	return []string{"sh", "-c", cmd}
+	return cmd + " " + args
 }
 
-// buildSentinelProbeCommandWithTLS creates the probe command for Sentinel with
-// TLS. Same --cacert rule as buildRedisProbeCommandWithTLS.
-func buildSentinelProbeCommandWithTLS(authEnabled, caMounted bool) []string {
-	cmd := "redis-cli -h $(hostname) -p 26379 --tls --cert /etc/sentinel/tls/tls.crt --key /etc/sentinel/tls/tls.key"
-	if caMounted {
-		cmd += " --cacert /etc/sentinel/tls/ca.crt"
+// livenessCommand checks only that the server answers. It must stay blind to
+// replication state: a replica whose link is down has to leave the Service, and
+// restarting it would not reconnect it any faster.
+func (p probeCLI) livenessCommand() []string {
+	return []string{"sh", "-c", p.call("ping") + " | grep -q PONG"}
+}
+
+// readinessCommand additionally requires a replication state that can serve
+// correct reads: a master, or a replica that finished its initial sync and
+// still has the link up. A replica that only answers PONG returns stale or
+// empty data for as long as it is in the Service endpoints.
+func (p probeCLI) readinessCommand() []string {
+	script := p.call("ping") + " | grep -q PONG || exit 1\n" +
+		p.call("info replication") + " | grep -Eq '^(role:master|master_link_status:up)'\n"
+	return []string{"sh", "-c", script}
+}
+
+// redisProbeCLI builds the invocation for the Redis container.
+func redisProbeCLI(rs *redisv1alpha1.RedisSentinel) probeCLI {
+	p := probeCLI{
+		tlsDir: "/etc/redis/tls",
+		auth:   rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "",
 	}
-	cmd += " ping | grep -q PONG"
-	if authEnabled {
-		cmd = "REDISCLI_AUTH=$REDIS_PASSWORD " + cmd
+	if rs.Spec.TLS != nil && rs.Spec.TLS.Enabled {
+		p.tls = true
+		p.cacert = rs.Spec.TLS.CASecretRef != ""
 	}
-	return []string{"sh", "-c", cmd}
+	return p
+}
+
+// sentinelProbeCLI builds the invocation for the Sentinel container. Sentinel
+// carries requirepass on 26379 whenever Redis auth is configured, so an
+// unauthenticated PING answers NOAUTH and every probe would fail.
+func sentinelProbeCLI(rs *redisv1alpha1.RedisSentinel) probeCLI {
+	p := redisProbeCLI(rs)
+	p.port = "26379"
+	p.tlsDir = "/etc/sentinel/tls"
+	return p
 }
