@@ -211,42 +211,95 @@ func (sc *SentinelClient) Ping(ctx context.Context) error {
 	return sc.client.Ping(ctx).Err()
 }
 
+// replyFields flattens one sentinel field reply into its fields. RESP2 answers
+// with a flat array of alternating name and value; RESP3, which go-redis
+// negotiates by default, answers with a map.
+func replyFields(reply interface{}) (map[string]string, error) {
+	switch v := reply.(type) {
+	case map[interface{}]interface{}:
+		fields := make(map[string]string, len(v))
+		for name, value := range v {
+			fields[fmt.Sprintf("%v", name)] = fmt.Sprintf("%v", value)
+		}
+		return fields, nil
+	case []interface{}:
+		if len(v)%2 != 0 {
+			return nil, fmt.Errorf("sentinel reply has %d fields, want an even count", len(v))
+		}
+		fields := make(map[string]string, len(v)/2)
+		for i := 0; i < len(v); i += 2 {
+			fields[fmt.Sprintf("%v", v[i])] = fmt.Sprintf("%v", v[i+1])
+		}
+		return fields, nil
+	default:
+		return nil, fmt.Errorf("unexpected sentinel reply type %T", reply)
+	}
+}
+
+// replyEntries flattens a sentinel reply that is a list of field replies.
+func replyEntries(reply interface{}) ([]map[string]string, error) {
+	values, ok := reply.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected sentinel reply type %T", reply)
+	}
+	entries := make([]map[string]string, 0, len(values))
+	for _, v := range values {
+		fields, err := replyFields(v)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, fields)
+	}
+	return entries, nil
+}
+
+func parseMasterReply(reply interface{}) (*MasterInfo, error) {
+	fields, err := replyFields(reply)
+	if err != nil {
+		return nil, err
+	}
+	return &MasterInfo{
+		Name:              fields["name"],
+		IP:                fields["ip"],
+		Port:              fields["port"],
+		Quorum:            fields["quorum"],
+		NumSlaves:         fields["num-slaves"],
+		NumOtherSentinels: fields["num-other-sentinels"],
+		Flags:             fields["flags"],
+	}, nil
+}
+
+func parseSentinelsReply(reply interface{}) ([]map[string]string, error) {
+	return replyEntries(reply)
+}
+
+func parseReplicasReply(reply interface{}) ([]ReplicaInfo, error) {
+	entries, err := replyEntries(reply)
+	if err != nil {
+		return nil, err
+	}
+	replicas := make([]ReplicaInfo, 0, len(entries))
+	for _, fields := range entries {
+		replicas = append(replicas, ReplicaInfo{
+			Name:             fields["name"],
+			IP:               fields["ip"],
+			Port:             fields["port"],
+			Flags:            fields["flags"],
+			MasterLinkStatus: fields["master-link-status"],
+			MasterHost:       fields["master-host"],
+			MasterPort:       fields["master-port"],
+		})
+	}
+	return replicas, nil
+}
+
 // GetMaster returns the current master information
 func (sc *SentinelClient) GetMaster(ctx context.Context, masterName string) (*MasterInfo, error) {
 	result, err := sc.client.Do(ctx, "SENTINEL", "master", masterName).Result()
 	if err != nil {
 		return nil, err
 	}
-
-	values, ok := result.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected result type")
-	}
-
-	info := &MasterInfo{}
-	for i := 0; i < len(values); i += 2 {
-		key := fmt.Sprintf("%v", values[i])
-		value := fmt.Sprintf("%v", values[i+1])
-
-		switch key {
-		case "name":
-			info.Name = value
-		case "ip":
-			info.IP = value
-		case "port":
-			info.Port = value
-		case "quorum":
-			info.Quorum = value
-		case "num-slaves":
-			info.NumSlaves = value
-		case "num-other-sentinels":
-			info.NumOtherSentinels = value
-		case "flags":
-			info.Flags = value
-		}
-	}
-
-	return info, nil
+	return parseMasterReply(result)
 }
 
 // GetMasterAddr returns the master address
@@ -292,29 +345,7 @@ func (sc *SentinelClient) GetSentinels(ctx context.Context, masterName string) (
 	if err != nil {
 		return nil, err
 	}
-
-	sentinels := []map[string]string{}
-	values, ok := result.([]interface{})
-	if !ok {
-		return sentinels, nil
-	}
-
-	for _, v := range values {
-		sentinelData, ok := v.([]interface{})
-		if !ok {
-			continue
-		}
-
-		sentinel := make(map[string]string)
-		for i := 0; i < len(sentinelData); i += 2 {
-			key := fmt.Sprintf("%v", sentinelData[i])
-			value := fmt.Sprintf("%v", sentinelData[i+1])
-			sentinel[key] = value
-		}
-		sentinels = append(sentinels, sentinel)
-	}
-
-	return sentinels, nil
+	return parseSentinelsReply(result)
 }
 
 // Close closes the client connection
@@ -365,45 +396,7 @@ func (sc *SentinelClient) GetReplicas(ctx context.Context, masterName string) ([
 			return nil, err
 		}
 	}
-
-	replicas := []ReplicaInfo{}
-	values, ok := result.([]interface{})
-	if !ok {
-		return replicas, nil
-	}
-
-	for _, v := range values {
-		replicaData, ok := v.([]interface{})
-		if !ok {
-			continue
-		}
-
-		replica := ReplicaInfo{}
-		for i := 0; i < len(replicaData); i += 2 {
-			key := fmt.Sprintf("%v", replicaData[i])
-			value := fmt.Sprintf("%v", replicaData[i+1])
-
-			switch key {
-			case "name":
-				replica.Name = value
-			case "ip":
-				replica.IP = value
-			case "port":
-				replica.Port = value
-			case "flags":
-				replica.Flags = value
-			case "master-link-status":
-				replica.MasterLinkStatus = value
-			case "master-host":
-				replica.MasterHost = value
-			case "master-port":
-				replica.MasterPort = value
-			}
-		}
-		replicas = append(replicas, replica)
-	}
-
-	return replicas, nil
+	return parseReplicasReply(result)
 }
 
 // SentinelReset resets all the masters matching the given pattern
