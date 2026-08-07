@@ -194,10 +194,21 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.RedisBackupReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RESTConfig: mgr.GetConfig(),
+		Recorder:   mgr.GetEventRecorderFor("redisbackup-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisBackup")
+		os.Exit(1)
+	}
+	if err := (&controller.RedisRestoreReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RESTConfig: mgr.GetConfig(),
+		Recorder:   mgr.GetEventRecorderFor("redisrestore-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "RedisRestore")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

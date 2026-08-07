@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,8 +51,11 @@ import (
 // RedisRestoreReconciler reconciles a RedisRestore object
 type RedisRestoreReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
+	Scheme *runtime.Scheme
+	// RESTConfig is required by the pod-exec path that writes the RDB into a
+	// Redis pod; without it every restore fails.
 	RESTConfig *rest.Config
+	Recorder   record.EventRecorder
 	// RedisFactory builds Redis clients; nil means DefaultFactory.
 	RedisFactory redisclient.Factory
 }
@@ -528,6 +532,12 @@ func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redi
 func (r *RedisRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RedisFactory == nil {
 		r.RedisFactory = redisclient.DefaultFactory{}
+	}
+	if r.RESTConfig == nil {
+		r.RESTConfig = mgr.GetConfig()
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("redisrestore-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisRestore{}).

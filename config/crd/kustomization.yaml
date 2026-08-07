@@ -5,6 +5,7 @@ resources:
 - bases/redis.redguard.io_redissentinels.yaml
 - bases/redis.redguard.io_redisusers.yaml
 - bases/redis.redguard.io_redisbackups.yaml
+- bases/redis.redguard.io_redisrestores.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

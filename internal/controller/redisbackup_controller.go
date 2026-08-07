@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -57,8 +58,11 @@ const redisBackupFinalizer = "redis.redguard.io/redisbackup-finalizer"
 // RedisBackupReconciler reconciles a RedisBackup object
 type RedisBackupReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
+	Scheme *runtime.Scheme
+	// RESTConfig is required by the pod-exec path that streams the RDB out of a
+	// Redis pod; without it every backup fails after firing BGSAVE.
 	RESTConfig *rest.Config
+	Recorder   record.EventRecorder
 	// RedisFactory builds Redis clients; nil means DefaultFactory.
 	RedisFactory redisclient.Factory
 }
@@ -749,6 +753,12 @@ func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *r
 func (r *RedisBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RedisFactory == nil {
 		r.RedisFactory = redisclient.DefaultFactory{}
+	}
+	if r.RESTConfig == nil {
+		r.RESTConfig = mgr.GetConfig()
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("redisbackup-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisBackup{}).

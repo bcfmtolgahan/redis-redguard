@@ -59,6 +59,16 @@ func factoryOrDefault(f redisclient.Factory) redisclient.Factory {
 	return redisclient.DefaultFactory{}
 }
 
+// recordEvent drops the event when no recorder is wired. A reconciler built
+// outside SetupWithManager has a nil Recorder, and losing an event must not
+// take down the manager. Shared by all reconcilers in this package.
+func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason, message string) {
+	if rec == nil {
+		return
+	}
+	rec.Event(obj, eventType, reason, message)
+}
+
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels/finalizers,verbs=update
@@ -110,19 +120,19 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if err := r.reconcileServices(ctx, rs); err != nil {
 		logger.Error(err, "Failed to reconcile Services")
-		r.Recorder.Event(rs, corev1.EventTypeWarning, "ServiceReconcileFailed", err.Error())
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "ServiceReconcileFailed", err.Error())
 		return ctrl.Result{}, err
 	}
 
 	if err := r.reconcileNetworkPolicies(ctx, rs); err != nil {
 		logger.Error(err, "Failed to reconcile NetworkPolicies")
-		r.Recorder.Event(rs, corev1.EventTypeWarning, "NetworkPolicyReconcileFailed", err.Error())
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "NetworkPolicyReconcileFailed", err.Error())
 		return ctrl.Result{}, err
 	}
 
 	if err := r.reconcileStatefulSets(ctx, rs); err != nil {
 		logger.Error(err, "Failed to reconcile StatefulSets")
-		r.Recorder.Event(rs, corev1.EventTypeWarning, "StatefulSetReconcileFailed", err.Error())
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "StatefulSetReconcileFailed", err.Error())
 		return ctrl.Result{}, err
 	}
 
@@ -254,7 +264,7 @@ func (r *RedisSentinelReconciler) reconcileNetworkPolicies(ctx context.Context, 
 	}
 	logger.Info("Reconciled Sentinel NetworkPolicy", "name", sentinelNetPol.Name)
 
-	r.Recorder.Event(rs, corev1.EventTypeNormal, "NetworkPoliciesReconciled", "Network policies successfully created/updated")
+	recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "NetworkPoliciesReconciled", "Network policies successfully created/updated")
 
 	return nil
 }
@@ -310,7 +320,7 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 			if rs.Status.MasterNode != "" && rs.Status.MasterNode != masterNode {
 				// Failover detected
 				logger.Info("Failover detected", "old", rs.Status.MasterNode, "new", masterNode)
-				r.Recorder.Event(rs, corev1.EventTypeWarning, "FailoverDetected",
+				recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverDetected",
 					fmt.Sprintf("Master changed from %s to %s", rs.Status.MasterNode, masterNode))
 				now := metav1.Now()
 				rs.Status.LastFailoverTime = &now
@@ -454,7 +464,7 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 	quorumHealthy, quorumMsg, err := r.checkSentinelQuorum(ctx, rs)
 	if err != nil {
 		logger.Error(err, "Failed to check quorum health, aborting failover handling")
-		r.Recorder.Event(rs, corev1.EventTypeWarning, "FailoverAborted",
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverAborted",
 			"Cannot verify sentinel quorum, failover handling aborted for safety")
 		return
 	}
@@ -462,7 +472,7 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 	if !quorumHealthy {
 		logger.Error(nil, "Sentinel quorum not healthy, aborting failover handling",
 			"quorumStatus", quorumMsg)
-		r.Recorder.Event(rs, corev1.EventTypeWarning, "FailoverAborted",
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverAborted",
 			fmt.Sprintf("Sentinel quorum not healthy: %s", quorumMsg))
 		return
 	}
@@ -497,7 +507,7 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 					logger.Error(err, "Failed to reconfigure old master as replica", "oldMaster", oldMaster)
 				} else {
 					logger.Info("Reconfigured old master as replica of new master", "oldMaster", oldMaster, "newMaster", newMaster)
-					r.Recorder.Event(rs, corev1.EventTypeNormal, "FailoverHandled",
+					recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "FailoverHandled",
 						fmt.Sprintf("Reconfigured %s as replica of %s", oldMaster, newMaster))
 				}
 			}()
@@ -912,6 +922,9 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RedisFactory == nil {
 		r.RedisFactory = redisclient.DefaultFactory{}
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("redissentinel-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisSentinel{}).
