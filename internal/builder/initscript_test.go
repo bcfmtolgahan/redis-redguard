@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -310,14 +311,11 @@ func TestSentinelInitScript_FirstStart_SeedsSubstitutesResolves(t *testing.T) {
 
 func TestSentinelInitScript_Restart_KeepsExistingState(t *testing.T) {
 	// State a sentinel rewrote after a failover: the master is no longer the
-	// bootstrap pod and the password is already literal. Re-seeding would
-	// re-monitor redis-0; re-substituting would corrupt content that happens
-	// to contain the placeholder text.
+	// bootstrap pod. Re-seeding would re-monitor redis-0 and lose the epoch.
 	existing := "port 26379\n" +
 		"dir /data\n" +
 		"sentinel monitor test-rs-master 10.9.9.9 6379 2\n" +
 		"sentinel known-replica test-rs-master 10.9.9.8 6379\n" +
-		"sentinel auth-pass test-rs-master literal${REDIS_PASSWORD}chunk\n" +
 		"sentinel current-epoch 5\n"
 
 	script, seedConf := testSentinelInit(t)
@@ -328,11 +326,122 @@ func TestSentinelInitScript_Restart_KeepsExistingState(t *testing.T) {
 	if res.err != nil {
 		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
 	}
-	if res.conf != existing {
-		t.Errorf("existing state was modified on restart:\ngot:\n%s\nwant:\n%s", res.conf, existing)
+	for _, line := range strings.Split(strings.TrimRight(existing, "\n"), "\n") {
+		if !strings.Contains(res.conf, line+"\n") {
+			t.Errorf("restart dropped learned state line %q:\n%s", line, res.conf)
+		}
+	}
+	if strings.Contains(res.conf, "test-rs-redis-0.") {
+		t.Errorf("restart re-seeded the monitor target from the template:\n%s", res.conf)
 	}
 	if want := "WOULD_EXEC redis-sentinel " + filepath.Join(res.dataDir, "sentinel.conf"); !strings.Contains(res.output, want) {
 		t.Errorf("script must exec sentinel on the durable state file, output:\n%s", res.output)
+	}
+}
+
+// sentinelCredentialLines returns the state-file lines that carry a credential,
+// in file order.
+func sentinelCredentialLines(conf string) []string {
+	var out []string
+	for _, l := range strings.Split(conf, "\n") {
+		f := strings.Fields(l)
+		if len(f) == 0 {
+			continue
+		}
+		switch {
+		case f[0] == "requirepass",
+			f[0] == "sentinel" && len(f) > 1 && (f[1] == "auth-pass" || f[1] == "sentinel-pass"),
+			f[0] == "user":
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestSentinelInitScript_Restart_RebuildsCredentials covers the state file
+// sentinel owns after the first start: it is kept verbatim across restarts, so
+// a file written before requirepass existed would leave port 26379 open
+// forever, and a rotated password would never reach sentinel.
+func TestSentinelInitScript_Restart_RebuildsCredentials(t *testing.T) {
+	const password = `sw&rd\fi&sh\\x`
+
+	// A pre-auth state file plus the stale default-user ACL a config rewrite
+	// leaves behind, which would otherwise outrank a later requirepass.
+	existing := "port 26379\n" +
+		"sentinel monitor test-rs-master 10.9.9.9 6379 2\n" +
+		"sentinel auth-pass test-rs-master oldpassword\n" +
+		"sentinel current-epoch 5\n" +
+		"user default on #" + sha256Hex("oldpassword") + " ~* &* +@all\n"
+
+	script, seedConf := testSentinelInit(t)
+	res := runSentinelInitScript(t, script, seedConf, existing, map[string]string{
+		"REDIS_PASSWORD": password,
+	})
+	if res.err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
+	}
+
+	want := []string{
+		"sentinel auth-pass test-rs-master " + password,
+		"sentinel sentinel-pass " + password,
+		"requirepass " + password,
+	}
+	if got := sentinelCredentialLines(res.conf); !slices.Equal(got, want) {
+		t.Errorf("credential lines = %q, want exactly %q (in that order, after the monitor line):\n%s", got, want, res.conf)
+	}
+	if !strings.Contains(res.conf, "sentinel current-epoch 5") {
+		t.Errorf("rebuilding credentials dropped learned state:\n%s", res.conf)
+	}
+	if strings.Contains(res.output, password) {
+		t.Errorf("password printed to stdout/stderr:\n%s", res.output)
+	}
+	if got := res.mode.Perm(); got != 0o600 {
+		t.Errorf("state file mode = %o, want 600; it holds the redis password", got)
+	}
+}
+
+// TestSentinelInitScript_NoPassword_DropsCredentials is the reverse direction:
+// clearing auth must not leave sentinel demanding a password nobody holds.
+func TestSentinelInitScript_NoPassword_DropsCredentials(t *testing.T) {
+	existing := "port 26379\n" +
+		"sentinel monitor test-rs-master 10.9.9.9 6379 2\n" +
+		"sentinel auth-pass test-rs-master oldpassword\n" +
+		"sentinel sentinel-pass oldpassword\n" +
+		"requirepass oldpassword\n" +
+		"user default on #" + sha256Hex("oldpassword") + " ~* &* +@all\n"
+
+	rs := testSentinel()
+	cm := BuildSentinelConfigMap(rs)
+	res := runSentinelInitScript(t, cm.Data["init.sh"], cm.Data["sentinel.conf"], existing, nil)
+	if res.err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
+	}
+	if got := sentinelCredentialLines(res.conf); len(got) != 0 {
+		t.Errorf("auth disabled but the state file still carries credentials %q:\n%s", got, res.conf)
+	}
+	if !strings.Contains(res.conf, "sentinel monitor test-rs-master 10.9.9.9 6379 2") {
+		t.Errorf("dropping credentials dropped learned state:\n%s", res.conf)
+	}
+}
+
+func TestSentinelInitScript_FirstStart_WritesCredentials(t *testing.T) {
+	const password = `sw&rd\fi&sh\\x`
+
+	script, seedConf := testSentinelInit(t)
+	res := runSentinelInitScript(t, script, seedConf, "", map[string]string{
+		"REDGUARD_TEST_RESOLVE_IP": "10.244.0.7",
+		"REDIS_PASSWORD":           password,
+	})
+	if res.err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
+	}
+	want := []string{
+		"sentinel auth-pass test-rs-master " + password,
+		"sentinel sentinel-pass " + password,
+		"requirepass " + password,
+	}
+	if got := sentinelCredentialLines(res.conf); !slices.Equal(got, want) {
+		t.Errorf("credential lines = %q, want exactly %q:\n%s", got, want, res.conf)
 	}
 }
 

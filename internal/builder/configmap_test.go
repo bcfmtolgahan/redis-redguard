@@ -175,7 +175,7 @@ func TestConfigMapsNeverEmbedLiteralPassword(t *testing.T) {
 	}
 
 	// Every directive that carries a credential must carry exactly the placeholder.
-	credentialDirectives := []string{"requirepass", "masterauth", "sentinel auth-pass"}
+	credentialDirectives := []string{"requirepass", "masterauth", "sentinel auth-pass", "sentinel sentinel-pass"}
 
 	for kind, cm := range cms {
 		for file, body := range cm.Data {
@@ -432,6 +432,71 @@ func TestBuildSentinelConfigMap_NoAuthHasNoAuthPass(t *testing.T) {
 
 	if strings.Contains(conf, "auth-pass") {
 		t.Errorf("auth disabled but sentinel.conf contains auth-pass:\n%s", conf)
+	}
+}
+
+// TestSentinelConfigRequiresPasswordWhenAuthEnabled covers the control plane
+// itself: "sentinel auth-pass" is the credential sentinel presents to redis, not
+// one clients must present. Without requirepass the default user on 26379 stays
+// nopass and any pod that can reach the port may issue SENTINEL FAILOVER, SET or
+// REMOVE.
+func TestSentinelConfigRequiresPasswordWhenAuthEnabled(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: "redis-pass"}
+
+	conf := BuildSentinelConfigMap(rs).Data["sentinel.conf"]
+
+	line, ok := findDirective(conf, "requirepass")
+	if !ok {
+		t.Fatalf("auth is configured but sentinel.conf has no requirepass, so port 26379 accepts any credential:\n%s", conf)
+	}
+	if want := "requirepass ${REDIS_PASSWORD}"; line != want {
+		t.Errorf("requirepass = %q, want %q", line, want)
+	}
+}
+
+// TestSentinelConfigAuthenticatesToPeers guards the other half of requirepass:
+// sentinels PING each other and vote through SENTINEL is-master-down-by-addr on
+// the same protected port, so without a peer credential every sentinel sees the
+// others as down and no failover can be authorized.
+func TestSentinelConfigAuthenticatesToPeers(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: "redis-pass"}
+
+	conf := BuildSentinelConfigMap(rs).Data["sentinel.conf"]
+
+	line, ok := findDirective(conf, "sentinel sentinel-pass")
+	if !ok {
+		t.Fatalf("requirepass without sentinel-pass leaves peers unable to authenticate:\n%s", conf)
+	}
+	if want := "sentinel sentinel-pass ${REDIS_PASSWORD}"; line != want {
+		t.Errorf("sentinel-pass = %q, want %q", line, want)
+	}
+}
+
+func TestBuildSentinelConfigMap_NoAuthHasNoRequirepass(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = nil
+
+	conf := BuildSentinelConfigMap(rs).Data["sentinel.conf"]
+
+	for _, unwanted := range []string{"requirepass", "sentinel sentinel-pass"} {
+		if _, found := findDirective(conf, unwanted); found {
+			t.Errorf("auth disabled but sentinel.conf contains %q:\n%s", unwanted, conf)
+		}
+	}
+}
+
+func TestBuildSentinelConfigMap_EmptySecretNameIsNoAuth(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: ""}
+
+	conf := BuildSentinelConfigMap(rs).Data["sentinel.conf"]
+
+	for _, unwanted := range []string{"requirepass", "sentinel sentinel-pass"} {
+		if _, found := findDirective(conf, unwanted); found {
+			t.Errorf("empty secretName must not render %q:\n%s", unwanted, conf)
+		}
 	}
 }
 

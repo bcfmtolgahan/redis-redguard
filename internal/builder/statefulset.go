@@ -290,12 +290,13 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 	// Check if TLS is enabled
 	tlsEnabled := rs.Spec.TLS != nil && rs.Spec.TLS.Enabled
 
-	// Build probe command - Sentinel probe (Sentinel itself doesn't require auth to PING)
+	// Sentinel carries requirepass on 26379 whenever auth is configured, so an
+	// unauthenticated PING answers NOAUTH and every probe would fail.
 	var sentinelProbeCommand []string
 	if tlsEnabled {
-		sentinelProbeCommand = buildSentinelProbeCommandWithTLS(false, rs.Spec.TLS.CASecretRef != "")
+		sentinelProbeCommand = buildSentinelProbeCommandWithTLS(authEnabled, rs.Spec.TLS.CASecretRef != "")
 	} else {
-		sentinelProbeCommand = buildSentinelProbeCommand(false)
+		sentinelProbeCommand = buildSentinelProbeCommand(authEnabled)
 	}
 
 	// Environment variables

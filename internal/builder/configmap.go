@@ -247,7 +247,19 @@ func BuildSentinelConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 
 	// Add auth if configured
 	if rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "" {
-		config = append(config, fmt.Sprintf("sentinel auth-pass %s ${REDIS_PASSWORD}", masterName))
+		config = append(config,
+			// auth-pass is what sentinel presents to redis; requirepass is what
+			// clients must present to sentinel. Without it the default user on
+			// 26379 stays nopass and any pod that reaches the port can issue
+			// SENTINEL FAILOVER, SET or REMOVE.
+			fmt.Sprintf("sentinel auth-pass %s ${REDIS_PASSWORD}", masterName),
+			// Sentinels PING each other and vote on the same protected port.
+			// Sentinel falls back to its own requirepass for those outgoing
+			// connections, but only as a compatibility path; naming the peer
+			// credential keeps the grant explicit.
+			"sentinel sentinel-pass ${REDIS_PASSWORD}",
+			"requirepass ${REDIS_PASSWORD}",
+		)
 	}
 
 	// Add TLS configuration if enabled
@@ -288,18 +300,18 @@ func BuildSentinelConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 		},
 		Data: map[string]string{
 			"sentinel.conf": strings.Join(config, "\n"),
-			"init.sh":       buildSentinelInitScript(masterHost),
+			"init.sh":       buildSentinelInitScript(masterHost, masterName),
 		},
 	}
 }
 
 // buildSentinelInitScript creates the sentinel startup script. Invariants the
-// script must hold: existing state on the PVC is kept verbatim (sentinel wrote
-// the learned master, replicas and epoch into it, and its password is already
-// literal), a seed is published atomically only after the master hostname
+// script must hold: learned state on the PVC (master, replicas, epochs) is kept
+// verbatim, the credential lines are always the ones the current password
+// implies, a seed is published atomically only after the master hostname
 // resolved, an unresolvable master is fatal rather than a silent fall-through,
 // and the state file holding the password is never readable beyond its owner.
-func buildSentinelInitScript(masterHost string) string {
+func buildSentinelInitScript(masterHost, masterName string) string {
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
 
@@ -362,9 +374,30 @@ else
     mv "$SEED" "$STATE"
 fi
 
+# Sentinel rewrites this file itself and the seed above runs only once, so the
+# credential lines are rebuilt from the current password on every start: state
+# written before requirepass existed would otherwise leave port 26379 open, and
+# a rotated password would never reach sentinel. The default-user ACL line a
+# config rewrite emits is dropped with them because requirepass, appended last,
+# is what defines that account. The password reaches awk through the
+# environment, never through the program text or argv.
+awk -v master="%s" 'BEGIN { pass = ENVIRON["REDIS_PASSWORD"] }
+     $1 == "requirepass" { next }
+     $1 == "user" && $2 == "default" { next }
+     $1 == "sentinel" && ($2 == "auth-pass" || $2 == "sentinel-pass") { next }
+     { print }
+     END {
+         if (pass != "") {
+             print "sentinel auth-pass " master " " pass
+             print "sentinel sentinel-pass " pass
+             print "requirepass " pass
+         }
+     }' "$STATE" > "$STATE.tmp"
+mv "$STATE.tmp" "$STATE"
+
 chmod 600 "$STATE"
 exec redis-sentinel "$STATE"
-`, masterHost)
+`, masterHost, masterName)
 }
 
 // reservedDirectives are redis.conf/sentinel.conf directives the operator owns

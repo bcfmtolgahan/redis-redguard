@@ -548,6 +548,47 @@ func TestBuildSentinelStatefulSet_Probes(t *testing.T) {
 	}
 }
 
+// TestBuildSentinelStatefulSet_ProbesAuthenticate pairs with requirepass on
+// 26379: an unauthenticated PING answers NOAUTH, so a probe without
+// REDISCLI_AUTH marks every sentinel unready and the StatefulSet never rolls.
+func TestBuildSentinelStatefulSet_ProbesAuthenticate(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: "redis-pass"}
+
+	for _, tc := range []struct {
+		name string
+		tls  *redisv1alpha1.TLSConfig
+	}{
+		{name: "plain"},
+		{name: "tls", tls: &redisv1alpha1.TLSConfig{Enabled: true, CertificateSecretRef: "sentinel-tls"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := rs.DeepCopy()
+			rs.Spec.TLS = tc.tls
+
+			c := BuildSentinelStatefulSet(rs).Spec.Template.Spec.Containers[0]
+
+			for name, probe := range map[string]*corev1.Probe{
+				"liveness":  c.LivenessProbe,
+				"readiness": c.ReadinessProbe,
+			} {
+				cmd := strings.Join(probe.Exec.Command, " ")
+				if !strings.Contains(cmd, "REDISCLI_AUTH=$REDIS_PASSWORD") {
+					t.Errorf("%s probe does not authenticate against a password-protected sentinel: %q", name, cmd)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildSentinelStatefulSet_ProbesOmitAuthWhenUnset(t *testing.T) {
+	c := BuildSentinelStatefulSet(testSentinel()).Spec.Template.Spec.Containers[0]
+
+	if cmd := strings.Join(c.ReadinessProbe.Exec.Command, " "); strings.Contains(cmd, "REDISCLI_AUTH") {
+		t.Errorf("no auth configured but probe references REDISCLI_AUTH: %q", cmd)
+	}
+}
+
 func TestBuildSentinelStatefulSet_TLS(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.TLS = &redisv1alpha1.TLSConfig{
