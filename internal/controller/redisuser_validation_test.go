@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -86,9 +88,19 @@ func TestACLRulesAllowScopedGrants(t *testing.T) {
 	allowed := [][]string{
 		{"+@read"},
 		{"+@write"},
+		{"+@keyspace"},
+		{"+@string", "+@list", "+@set", "+@sortedset", "+@hash", "+@stream"},
+		{"+@geo", "+@bitmap", "+@hyperloglog"},
+		{"+@pubsub", "+@transaction", "+@connection", "+@scripting"},
 		{"-@dangerous"},
 		{"-@all"},
+		{"-@admin"},
 		{"+get", "+set", "-del"},
+		// Commands that carry a key specification stay inside the user's ~scope.
+		{"+dump", "+eval", "+evalsha", "+fcall", "+object|encoding", "+memory|usage"},
+		// Commands that touch neither keys nor channels are scope-neutral.
+		{"+ping", "+auth", "+hello", "+echo", "+command|info", "+client|id"},
+		{"+subscribe", "+publish", "+psubscribe"},
 		{"~app:*"},
 		{"~*"},
 		{"%R~cache:*"},
@@ -98,10 +110,116 @@ func TestACLRulesAllowScopedGrants(t *testing.T) {
 		{"allchannels"},
 		{"resetkeys"},
 		{"resetchannels"},
+		{"nocommands"},
 	}
 	for _, rules := range allowed {
 		if err := validateACLRules(rules); err != nil {
 			t.Errorf("validateACLRules(%q) = %v, want nil", rules, err)
+		}
+	}
+}
+
+// TestACLRulesRejectDataPlaneEscape covers the escapes a denylist misses: a
+// command with no key specification runs across the whole keyspace regardless
+// of a ~pattern, and the admin/dangerous families read or destroy data beyond
+// the user's scope. Redis parses rules case-insensitively, so case variants and
+// subcommand forms are part of the table.
+func TestACLRulesRejectDataPlaneEscape(t *testing.T) {
+	denied := [][]string{
+		{"+monitor"},   // mirrors every command, including other clients' AUTH
+		{"+MONITOR"},   //
+		{"+psync"},     // streams a full-keyspace RDB
+		{"+sync"},      //
+		{"+replconf"},  //
+		{"+flushall"},  // wipes the keyspace despite ~app:*
+		{"+flushdb"},   //
+		{"+swapdb"},    //
+		{"+FlushAll"},  //
+		{"+keys"},      // enumerates every key name past ~app:*
+		{"+scan"},      //
+		{"+randomkey"}, //
+		{"+dbsize"},    // counts the whole keyspace
+		{"+migrate"},   // exfiltrates keys to an arbitrary external host
+		{"+function"},  // registers global server-side functions
+		{"+function|load"},
+		{"+script"}, // loads global server-side scripts
+		{"+script|load"},
+		{"+bgsave"},
+		{"+save"},
+		{"+restore"},         // arbitrary payload deserialization
+		{"+sort"},            // BY/GET/STORE reach keys outside the ~pattern
+		{"+sort_ro"},         //
+		{"+wait"},            // no key specification
+		{"+lolwut"},          //
+		{"+object"},          // bare container grants object|help and every sub
+		{"+client"},          // bare container grants client|no-evict and kill
+		{"+client|no-evict"}, //
+		{"+pubsub"},          // enumerates channel names past &scope
+		{"+pubsub|channels"}, //
+		{"+cluster|nodes"},   // discloses cluster topology
+		{"+@nonsense"},       // unknown category
+		{"+notacommand"},     // unknown command
+	}
+	for _, rules := range denied {
+		if err := validateACLRules(rules); err == nil {
+			t.Errorf("validateACLRules(%q) = nil, want data-plane escape rejection", rules)
+		}
+	}
+}
+
+// TestACLRuleRejectionNamesRuleAndRemedy pins the operator contract: a rejected
+// rule is quoted verbatim and the message points at what is permitted instead.
+func TestACLRuleRejectionNamesRuleAndRemedy(t *testing.T) {
+	err := validateACLRule("+flushall")
+	if err == nil {
+		t.Fatal("validateACLRule(\"+flushall\") = nil, want rejection")
+	}
+	if !strings.Contains(err.Error(), "+flushall") {
+		t.Errorf("message %q does not name the offending rule", err)
+	}
+	if !strings.Contains(err.Error(), "+@read") {
+		t.Errorf("message %q does not say what is permitted instead", err)
+	}
+}
+
+// TestBuildACLRulesAppendsConfinementFloor pins the defense-in-depth layer:
+// a category grant carries commands with no key specification, so the rendered
+// rules must end with the removals that pull them back inside the user's scope.
+func TestBuildACLRulesAppendsConfinementFloor(t *testing.T) {
+	user := &redisv1alpha1.RedisUser{
+		Spec: redisv1alpha1.RedisUserSpec{
+			Username: "appuser",
+			ACLRules: redisv1alpha1.ACLRule{
+				Categories: []string{"+@read", "+@write"},
+				Keys:       []string{"~app:*"},
+			},
+		},
+	}
+	rules := buildACLRules(user, "secret")
+
+	for _, floor := range redisConfinementFloor {
+		if !slices.Contains(rules, floor) {
+			t.Errorf("rendered rules %q missing confinement token %q", rules, floor)
+		}
+	}
+	// The floor must win over the category grants, so it comes last.
+	firstFloor := slices.Index(rules, redisConfinementFloor[0])
+	lastGrant := slices.Index(rules, "+@write")
+	if firstFloor < lastGrant {
+		t.Errorf("confinement floor precedes the category grants; Redis applies rules left to right, so the removals would not win: %q", rules)
+	}
+}
+
+// TestBuildACLRulesNoFloorWithoutGrants keeps an unconfigured user minimal: with
+// nothing granted there is nothing to confine, so no removals are emitted.
+func TestBuildACLRulesNoFloorWithoutGrants(t *testing.T) {
+	user := &redisv1alpha1.RedisUser{
+		Spec: redisv1alpha1.RedisUserSpec{Username: "appuser"},
+	}
+	rules := buildACLRules(user, "secret")
+	for _, floor := range redisConfinementFloor {
+		if slices.Contains(rules, floor) {
+			t.Errorf("empty aclRules emitted confinement token %q; rules %q", floor, rules)
 		}
 	}
 }
@@ -215,6 +333,52 @@ var _ = Describe("RedisUser validation", func() {
 
 			// Deletion holds the finalizer until the ACL user has been removed
 			// from a reachable pod, so the cleanup path needs one.
+			ensureReadyRedisPod("test-cluster-redis-0", ns, "test-cluster", "10.244.5.2")
+			defer deleteRedisPods(ns, "test-cluster")
+
+			Expect(k8sClient.Delete(ctx, updated)).To(Succeed())
+			Eventually(func(g Gomega) {
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &redisv1alpha1.RedisUser{}))).To(BeTrue())
+			}).Should(Succeed())
+		})
+
+		It("degrades a data-plane escape and names the offending rule", func() {
+			ensureTestSentinel("test-cluster", ns)
+			ensureSecret("user-pass", ns, map[string][]byte{"password": []byte("pw")})
+
+			// "+monitor" is a single clean token that clears the structural CRD
+			// checks. It is not administrative, so a denylist of admin commands
+			// would miss it, yet it mirrors every command on the server.
+			user := newUser("rec-monitor")
+			user.Spec.ACLRules.Commands = []string{"+monitor"}
+			Expect(k8sClient.Create(ctx, user)).To(Succeed())
+
+			factory := redisfake.NewFactory()
+			reconciler := &RedisUserReconciler{
+				Client:       k8sClient,
+				Scheme:       k8sClient.Scheme(),
+				RedisFactory: factory,
+			}
+			key := types.NamespacedName{Name: user.Name, Namespace: ns}
+
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+
+			updated := &redisv1alpha1.RedisUser{}
+			Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Degraded"))
+
+			cond := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Message).To(ContainSubstring("+monitor"))
+			Expect(cond.Message).To(ContainSubstring("+@read"), "the message must say what is permitted instead")
+
+			Expect(factory.Calls()).To(BeEmpty(), "a rejected spec must never reach Redis")
+
 			ensureReadyRedisPod("test-cluster-redis-0", ns, "test-cluster", "10.244.5.2")
 			defer deleteRedisPods(ns, "test-cluster")
 

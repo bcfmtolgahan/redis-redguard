@@ -307,6 +307,21 @@ func validateUsername(username string) error {
 	return nil
 }
 
+// redisConfinementFloor is appended after a user's positive grants. A +@category
+// grant bundles commands that carry no key specification and so ignore any
+// ~pattern: @read pulls in KEYS/SCAN/RANDOMKEY (full key-name enumeration),
+// @write pulls in FLUSHALL/FLUSHDB/SWAPDB (keyspace wipe), and every category
+// can reach the @admin/@dangerous families. Redis applies rules left to right,
+// so these trailing removals win and hold the user inside its declared key and
+// channel scope. -pubsub drops the channel-name enumerators while leaving
+// SUBSCRIBE/PUBLISH; -function and -script drop server-global state management
+// while leaving the key-scoped EVAL/FCALL.
+var redisConfinementFloor = []string{
+	"-@admin", "-@dangerous",
+	"-scan", "-randomkey", "-dbsize",
+	"-pubsub", "-function", "-script",
+}
+
 // deniedACLKeywords are standalone rules that weaken authentication or fight
 // the fields the operator renders itself (password, on/off, reset).
 var deniedACLKeywords = map[string]string{
@@ -318,32 +333,28 @@ var deniedACLKeywords = map[string]string{
 	"allcommands": "it grants every command, including administrative ones",
 }
 
-// deniedACLCategories grant administrative control when added with +@.
-var deniedACLCategories = map[string]struct{}{
-	"all":       {},
-	"admin":     {},
-	"dangerous": {},
+// scopeSafeKeywords are standalone rules that set or reset the user's own key,
+// channel or command scope, or a benign ACL flag. None can widen access beyond
+// the user's declared scope.
+var scopeSafeKeywords = map[string]struct{}{
+	"allkeys":            {},
+	"resetkeys":          {},
+	"allchannels":        {},
+	"resetchannels":      {},
+	"nocommands":         {},
+	"clearselectors":     {},
+	"sanitize-payload":   {},
+	"nosanitize-payload": {},
 }
 
-// deniedACLCommands can subvert authentication, configuration, replication
-// topology or the server process; the whole command is denied, subcommand
-// grants (+acl|setuser) included.
-var deniedACLCommands = map[string]struct{}{
-	"acl":       {},
-	"config":    {},
-	"shutdown":  {},
-	"debug":     {},
-	"failover":  {},
-	"replicaof": {},
-	"slaveof":   {},
-	"module":    {},
-	"cluster":   {},
-}
-
-// validateACLRules rejects rules that would escalate a RedisUser beyond its
-// own account. Redis parses rules case-insensitively and accepts several rules
-// inside one (...) selector argument, so every rule is lowercased and must be
-// a single bare token before the denylist applies.
+// validateACLRules confines a RedisUser to its declared scope. A denylist is not
+// enough: Redis adds commands over time and every future one would default to
+// permitted, and the escape vectors are open-ended (KEYS, SCAN, FLUSHALL,
+// MONITOR, PSYNC, MIGRATE, ...). So command grants are checked against an
+// allowlist derived from Redis: a command may be granted only if it carries a
+// key specification, so a ~pattern confines it, or it touches neither keys nor
+// channels. Category grants are limited to the non-administrative categories and
+// then narrowed by the confinement floor at render time.
 func validateACLRules(rules []string) error {
 	for _, rule := range rules {
 		if err := validateACLRule(rule); err != nil {
@@ -371,19 +382,49 @@ func validateACLRule(rule string) error {
 	if why, ok := deniedACLKeywords[norm]; ok {
 		return fmt.Errorf("aclRules: rule %q is not allowed: %s", rule, why)
 	}
-	if category, ok := strings.CutPrefix(norm, "+@"); ok {
-		if _, denied := deniedACLCategories[category]; denied {
-			return fmt.Errorf("aclRules: rule %q grants administrative control of the cluster", rule)
-		}
+	if _, ok := scopeSafeKeywords[norm]; ok {
 		return nil
 	}
+	switch norm[0] {
+	case '~', '%', '&':
+		// Key and channel scope declarations only set the user's own scope.
+		return nil
+	case '-':
+		// A negation can only remove permission.
+		return nil
+	}
+	if category, ok := strings.CutPrefix(norm, "+@"); ok {
+		return validateCategoryGrant(rule, category)
+	}
 	if command, ok := strings.CutPrefix(norm, "+"); ok {
-		base, _, _ := strings.Cut(command, "|")
-		if _, denied := deniedACLCommands[base]; denied {
-			return fmt.Errorf("aclRules: rule %q: command can subvert authentication, configuration or topology", rule)
-		}
+		return validateCommandGrant(rule, command)
+	}
+	return fmt.Errorf("aclRules: rule %q is not a recognized ACL rule; grant key-scoped commands (+get), a category (+@read), key patterns (~app:*) or channel patterns (&events:*)", rule)
+}
+
+// validateCategoryGrant accepts a +@category only for a non-administrative
+// category Redis defines. The confinement floor strips the keyspace-wide and
+// administrative commands the category still bundles, so an accepted category
+// stays inside the user's scope.
+func validateCategoryGrant(rule, category string) error {
+	switch category {
+	case "all", "admin", "dangerous":
+		return fmt.Errorf("aclRules: rule %q grants administrative or unscoped control; grant a data category such as +@read or +@write instead", rule)
+	}
+	if _, ok := redisACLCategories[category]; !ok {
+		return fmt.Errorf("aclRules: rule %q names an unknown ACL category; grant a data category such as +@read or +@write instead", rule)
 	}
 	return nil
+}
+
+// validateCommandGrant accepts +command only for a command Redis confines to a
+// key scope or that touches no keys or channels. Everything else runs
+// server-wide or outside the user's scope and is rejected.
+func validateCommandGrant(rule, command string) error {
+	if _, ok := redisAllowedCommands[command]; ok {
+		return nil
+	}
+	return fmt.Errorf("aclRules: rule %q is not permitted: %s has no key specification and runs across the whole keyspace or the server, escaping the user's scope; grant a scoped category such as +@read or a key-scoped command such as +get instead", rule, command)
 }
 
 // validateRedisUserSpec re-checks at reconcile what the CRD rejects at
@@ -431,6 +472,13 @@ func buildACLRules(redisUser *redisv1alpha1.RedisUser, password string) []string
 	rules = append(rules, redisUser.Spec.ACLRules.Commands...)
 	rules = append(rules, redisUser.Spec.ACLRules.Keys...)
 	rules = append(rules, redisUser.Spec.ACLRules.Channels...)
+
+	// A category or command grant can pull in commands that ignore ~patterns.
+	// The floor removes them last, after the grants, so it wins. With nothing
+	// granted there is nothing to confine.
+	if len(redisUser.Spec.ACLRules.Categories) > 0 || len(redisUser.Spec.ACLRules.Commands) > 0 {
+		rules = append(rules, redisConfinementFloor...)
+	}
 
 	return rules
 }
