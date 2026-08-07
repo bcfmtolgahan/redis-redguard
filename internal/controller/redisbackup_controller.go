@@ -50,6 +50,7 @@ import (
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/redisclient"
+	"github.com/redguard/redguard/internal/tlsutil"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
 )
 
@@ -280,8 +281,12 @@ func (r *RedisBackupReconciler) getMasterPod(ctx context.Context, redisSentinel 
 func (r *RedisBackupReconciler) getBackupPod(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel) (*corev1.Pod, bool, error) {
 	logger := log.FromContext(ctx)
 
-	// Get admin password
+	// Resolved once, reused for the role probe of every pod below.
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve client TLS config: %w", err)
+	}
 
 	// List all Redis pods
 	podList := &corev1.PodList{}
@@ -322,7 +327,7 @@ func (r *RedisBackupReconciler) getBackupPod(ctx context.Context, redisSentinel 
 
 		// Check role of this pod
 		addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-		redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+		redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 		isMaster, err := redisClient.IsMaster(ctx)
 		redisClient.Close()
 
@@ -335,7 +340,7 @@ func (r *RedisBackupReconciler) getBackupPod(ctx context.Context, redisSentinel 
 			masterPod = pod
 		} else {
 			// Check if replica is healthy (master_link_status = up)
-			redisClient = factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+			redisClient = factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 			replInfo, err := redisClient.GetReplicationInfo(ctx)
 			redisClient.Close()
 
@@ -382,9 +387,13 @@ func (r *RedisBackupReconciler) getAdminPassword(ctx context.Context, redisSenti
 func (r *RedisBackupReconciler) triggerBGSave(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) error {
 	logger := log.FromContext(ctx)
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		return fmt.Errorf("resolve client TLS config: %w", err)
+	}
 
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
 	// Check if BGSAVE is already in progress
@@ -415,9 +424,13 @@ func (r *RedisBackupReconciler) triggerBGSave(ctx context.Context, redisSentinel
 func (r *RedisBackupReconciler) waitForBGSave(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) error {
 	logger := log.FromContext(ctx)
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		return fmt.Errorf("resolve client TLS config: %w", err)
+	}
 
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
 	// Get the last save time before we started
@@ -538,9 +551,13 @@ func (r *RedisBackupReconciler) getRDBData(ctx context.Context, redisSentinel *r
 // getBackupRDBPath returns the path to the RDB file based on persistence info
 func (r *RedisBackupReconciler) getBackupRDBPath(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) (string, error) {
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		return "", fmt.Errorf("resolve client TLS config: %w", err)
+	}
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
 
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
 	// Get dir and dbfilename from config

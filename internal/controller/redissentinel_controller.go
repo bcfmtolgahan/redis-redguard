@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ import (
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/builder"
 	"github.com/redguard/redguard/internal/redisclient"
+	"github.com/redguard/redguard/internal/tlsutil"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
 )
 
@@ -311,9 +313,19 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 		rs.Status.Phase = "Running"
 	}
 
+	// Resolved once here; every Redis and Sentinel connection made below and in
+	// the spawned failover handler reuses these. A TLS resolution failure aborts
+	// the status update: falling back to plaintext against TLS-only pods would
+	// misreport the cluster as masterless.
+	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return fmt.Errorf("resolve client TLS config: %w", err)
+	}
+
 	// Try to get current master from Sentinel
 	if sentinelStatefulSet.Status.ReadyReplicas > 0 {
-		masterNode, err := r.getCurrentMaster(ctx, rs)
+		masterNode, err := r.getCurrentMaster(ctx, rs, adminPassword, tlsCfg)
 		if err != nil {
 			logger.Info("Could not determine master node", "error", err)
 		} else {
@@ -327,7 +339,7 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 				custmetrics.RedisFailoverTotal.WithLabelValues(rs.Namespace, rs.Name).Inc()
 
 				// Handle failover - reconfigure old master and verify replicas
-				go r.handleFailover(ctx, rs, rs.Status.MasterNode, masterNode)
+				go r.handleFailover(ctx, rs, rs.Status.MasterNode, masterNode, adminPassword, tlsCfg)
 			}
 			rs.Status.MasterNode = masterNode
 		}
@@ -381,7 +393,7 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	minQuorum := rs.Spec.SentinelConfig.Replicas/2 + 1
 	if sentinelStatefulSet.Status.ReadyReplicas >= minQuorum {
 		// Perform actual quorum health check
-		quorumHealthy, quorumMsg, err := r.checkSentinelQuorum(ctx, rs)
+		quorumHealthy, quorumMsg, err := r.checkSentinelQuorum(ctx, rs, adminPassword, tlsCfg)
 		if err != nil {
 			// Fallback to pod count if quorum check fails
 			logger.V(1).Info("Quorum check failed, using pod count", "error", err)
@@ -416,7 +428,7 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	return nil
 }
 
-func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
+func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (string, error) {
 	// Build list of all sentinel addresses for fallback
 	sentinelAddresses := make([]string, rs.Spec.SentinelConfig.Replicas)
 	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
@@ -424,11 +436,10 @@ func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redi
 			rs.Name, i, rs.Name, rs.Namespace)
 	}
 
-	password := r.getAdminPassword(ctx, rs)
 	masterName := rs.Name + "-master"
 
 	// Use sentinel pool to try multiple sentinels
-	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, nil)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, tlsCfg)
 	masterAddr, err := pool.GetMasterAddrFromPool(ctx, masterName)
 	if err != nil {
 		return "", err
@@ -454,14 +465,16 @@ func (r *RedisSentinelReconciler) getAdminPassword(ctx context.Context, rs *redi
 	return string(secret.Data["password"])
 }
 
-// handleFailover handles post-failover actions to ensure cluster consistency
-func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv1alpha1.RedisSentinel, oldMaster, newMaster string) {
+// handleFailover handles post-failover actions to ensure cluster consistency.
+// Credentials and TLS settings come from the caller so the goroutine never
+// re-reads secrets.
+func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv1alpha1.RedisSentinel, oldMaster, newMaster, adminPassword string, tlsCfg *tls.Config) {
 	logger := log.FromContext(ctx)
 	logger.Info("Handling failover", "oldMaster", oldMaster, "newMaster", newMaster)
 
 	// CRITICAL: Verify quorum health before making any changes
 	// This prevents split-brain scenarios where we might reconfigure nodes incorrectly
-	quorumHealthy, quorumMsg, err := r.checkSentinelQuorum(ctx, rs)
+	quorumHealthy, quorumMsg, err := r.checkSentinelQuorum(ctx, rs, adminPassword, tlsCfg)
 	if err != nil {
 		logger.Error(err, "Failed to check quorum health, aborting failover handling")
 		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverAborted",
@@ -478,8 +491,6 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 	}
 
 	logger.Info("Quorum verified healthy, proceeding with failover handling", "quorumStatus", quorumMsg)
-
-	adminPassword := r.getAdminPassword(ctx, rs)
 
 	// Parse new master address (format: IP:port)
 	newMasterIP, newMasterPort := parseHostPort(newMaster)
@@ -499,7 +510,7 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 
 			// Use a function to ensure proper cleanup with defer
 			func() {
-				oldClient := factoryOrDefault(r.RedisFactory).NewClient(oldMasterAddr, adminPassword, nil)
+				oldClient := factoryOrDefault(r.RedisFactory).NewClient(oldMasterAddr, adminPassword, tlsCfg)
 				defer oldClient.Close()
 
 				err := oldClient.SlaveOf(ctx, newMasterIP, newMasterPort)
@@ -515,13 +526,13 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 	}
 
 	// Ensure all other replicas are pointing to the new master
-	if err := r.ensureReplicasFollowMaster(ctx, rs, newMasterIP, newMasterPort, adminPassword); err != nil {
+	if err := r.ensureReplicasFollowMaster(ctx, rs, newMasterIP, newMasterPort, adminPassword, tlsCfg); err != nil {
 		logger.Error(err, "Failed to ensure all replicas follow new master")
 	}
 }
 
 // ensureReplicasFollowMaster verifies and corrects replication configuration for all replicas
-func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, masterIP, masterPort, adminPassword string) error {
+func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, masterIP, masterPort, adminPassword string, tlsCfg *tls.Config) error {
 	logger := log.FromContext(ctx)
 
 	// List all Redis pods
@@ -546,7 +557,7 @@ func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context
 		// Use a function to ensure proper cleanup with defer
 		func(podIP, podName string) {
 			addr := fmt.Sprintf("%s:6379", podIP)
-			redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+			redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 			defer redisClient.Close()
 
 			info, err := redisClient.GetReplicationInfo(ctx)
@@ -584,7 +595,7 @@ func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context
 }
 
 // checkSentinelQuorum verifies the actual Sentinel quorum health
-func (r *RedisSentinelReconciler) checkSentinelQuorum(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, string, error) {
+func (r *RedisSentinelReconciler) checkSentinelQuorum(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (bool, string, error) {
 	// Build sentinel addresses
 	sentinelAddresses := make([]string, rs.Spec.SentinelConfig.Replicas)
 	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
@@ -592,11 +603,10 @@ func (r *RedisSentinelReconciler) checkSentinelQuorum(ctx context.Context, rs *r
 			rs.Name, i, rs.Name, rs.Namespace)
 	}
 
-	password := r.getAdminPassword(ctx, rs)
 	masterName := rs.Name + "-master"
 
 	// Use pool to check quorum from any available sentinel
-	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, nil)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, tlsCfg)
 	healthy, count, err := pool.CheckQuorumFromPool(ctx, masterName)
 	if err != nil {
 		return false, "Unable to verify quorum", err
@@ -678,9 +688,19 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 	// Update connected replicas
 	custmetrics.RedisConnectedReplicas.WithLabelValues(namespace, name).Set(float64(rs.Status.ReadyReplicas))
 
+	// Resolved once for every connection this collection pass makes. Metrics
+	// are best-effort, so a TLS resolution failure skips collection instead of
+	// failing the reconcile.
+	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		logger.Error(err, "Cannot resolve client TLS config, skipping Redis metrics collection")
+		return
+	}
+
 	// Update sentinel status using real quorum check
 	sentinelHealthy := 0.0
-	quorumOK, message, err := r.checkSentinelQuorum(ctx, rs)
+	quorumOK, message, err := r.checkSentinelQuorum(ctx, rs, adminPassword, tlsCfg)
 	if err == nil && quorumOK {
 		sentinelHealthy = 1.0
 	}
@@ -689,7 +709,7 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 	custmetrics.SentinelMonitoredMasters.WithLabelValues(namespace, name).Set(1.0)
 
 	// Get sentinel master info for additional metrics
-	r.updateSentinelMetrics(ctx, rs)
+	r.updateSentinelMetrics(ctx, rs, adminPassword, tlsCfg)
 
 	// Track failovers (initialized to 0)
 	if rs.Status.LastFailoverTime != nil {
@@ -706,24 +726,21 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 		return
 	}
 
-	adminPassword := r.getAdminPassword(ctx, rs)
-
 	// Collect metrics from each Redis pod
 	for _, pod := range podList.Items {
 		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 			continue
 		}
 
-		r.collectPodMetrics(ctx, rs, &pod, adminPassword)
+		r.collectPodMetrics(ctx, rs, &pod, adminPassword, tlsCfg)
 	}
 
 	logger.V(1).Info("Metrics updated", "quorumHealthy", quorumOK, "quorumMessage", message)
 }
 
 // updateSentinelMetrics collects metrics from Sentinel
-func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs *redisv1alpha1.RedisSentinel) {
+func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs *redisv1alpha1.RedisSentinel, adminPassword string, tlsCfg *tls.Config) {
 	logger := log.FromContext(ctx)
-	adminPassword := r.getAdminPassword(ctx, rs)
 	masterName := rs.Name + "-master"
 
 	// Try to get sentinel info from pool
@@ -734,7 +751,7 @@ func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs 
 		sentinelAddresses = append(sentinelAddresses, addr)
 	}
 
-	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, adminPassword, nil)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, adminPassword, tlsCfg)
 	masterInfo, err := pool.GetMasterFromPool(ctx, masterName)
 	if err != nil {
 		logger.V(1).Info("Failed to get master info from sentinel", "error", err)
@@ -756,14 +773,14 @@ func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs 
 }
 
 // collectPodMetrics collects all metrics from a single Redis pod
-func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *redisv1alpha1.RedisSentinel, pod *corev1.Pod, adminPassword string) {
+func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *redisv1alpha1.RedisSentinel, pod *corev1.Pod, adminPassword string, tlsCfg *tls.Config) {
 	logger := log.FromContext(ctx)
 	namespace := rs.Namespace
 	name := rs.Name
 	podName := pod.Name
 
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
 	// --- Memory Metrics ---

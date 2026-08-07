@@ -34,6 +34,7 @@ import (
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/redisclient"
+	"github.com/redguard/redguard/internal/tlsutil"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
 )
 
@@ -124,12 +125,20 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// Resolved once, reused for every pod below.
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		logger.Error(err, "Failed to resolve client TLS config")
+		r.updateStatus(ctx, redisUser, "Error", nil, err.Error())
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+	}
+
 	// Apply ACL to all Redis pods (master and replicas)
 	// This ensures ACL rules persist after failover
 	appliedTo := []string{}
 	var lastErr error
 	for _, addr := range allAddresses {
-		redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+		redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 		if err := r.applyACL(ctx, redisClient, redisUser, password); err != nil {
 			logger.Error(err, "Failed to apply ACL to pod", "address", addr)
 			lastErr = err
@@ -189,11 +198,19 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 					}
 				}
 
+				// Without the TLS settings no pod is reachable, so retry the
+				// cleanup later rather than dial plaintext.
+				tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+				if err != nil {
+					logger.Error(err, "Cannot resolve client TLS config for ACL cleanup, will retry")
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+
 				// Delete from all pods with proper cleanup
 				failedPods := []string{}
 				for _, addr := range allAddresses {
 					func(address string) {
-						redisClient := factoryOrDefault(r.RedisFactory).NewClient(address, adminPassword, nil)
+						redisClient := factoryOrDefault(r.RedisFactory).NewClient(address, adminPassword, tlsCfg)
 						defer redisClient.Close()
 
 						if err := redisClient.ACLDelUser(ctx, redisUser.Spec.Username); err != nil {

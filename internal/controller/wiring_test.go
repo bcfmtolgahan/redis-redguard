@@ -217,6 +217,95 @@ func TestRecordEventToleratesNilRecorder(t *testing.T) {
 	recordEvent(r.Recorder, &redisv1alpha1.RedisSentinel{}, corev1.EventTypeWarning, "Test", "message")
 }
 
+// protocolClientPackages are the packages whose constructors dial Redis
+// directly. Controllers must go through redisclient.Factory instead, so the
+// TLS settings resolved per reconcile reach every connection.
+var protocolClientPackages = map[string]bool{
+	"github.com/redguard/redguard/pkg/redisutils":    true,
+	"github.com/redguard/redguard/internal/sentinel": true,
+}
+
+// TestNoControllerConstructsProtocolClientsDirectly guards the factory seam:
+// a direct redisutils/sentinel constructor call bypasses the TLS config and
+// silently dials plaintext against a TLS-only pod.
+func TestNoControllerConstructsProtocolClientsDirectly(t *testing.T) {
+	fset := token.NewFileSet()
+	for _, path := range packageSources(t) {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		local := map[string]bool{}
+		for _, imp := range f.Imports {
+			p := strings.Trim(imp.Path.Value, `"`)
+			if !protocolClientPackages[p] {
+				continue
+			}
+			name := p[strings.LastIndex(p, "/")+1:]
+			if imp.Name != nil {
+				name = imp.Name.Name
+			}
+			local[name] = true
+		}
+		if len(local) == 0 {
+			continue
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			id, ok := sel.X.(*ast.Ident)
+			if !ok || !local[id.Name] || !strings.HasPrefix(sel.Sel.Name, "New") {
+				return true
+			}
+			t.Errorf("%s:%d calls %s.%s directly; construct clients through r.RedisFactory so spec.tls is honoured",
+				path, fset.Position(call.Pos()).Line, id.Name, sel.Sel.Name)
+			return true
+		})
+	}
+}
+
+// TestEveryFactoryCallThreadsTLSConfig pins the blind-operator bug: with
+// spec.tls enabled the pods listen on TLS only, so a factory call whose
+// tlsConfig argument is the literal nil hardcodes plaintext no matter what
+// the spec says. Every call site must pass a config resolved from the spec.
+func TestEveryFactoryCallThreadsTLSConfig(t *testing.T) {
+	fset := token.NewFileSet()
+	for _, path := range packageSources(t) {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if sel.Sel.Name != "NewClient" && sel.Sel.Name != "NewSentinelPool" {
+				return true
+			}
+			if len(call.Args) == 0 {
+				return true
+			}
+			last, ok := call.Args[len(call.Args)-1].(*ast.Ident)
+			if ok && last.Name == "nil" {
+				t.Errorf("%s:%d passes a literal nil tlsConfig to %s; thread the config built by tlsutil.BuildClientTLSConfig",
+					path, fset.Position(call.Pos()).Line, sel.Sel.Name)
+			}
+			return true
+		})
+	}
+}
+
 // TestEveryCRDIsShipped guards against a generated CRD that no install path
 // applies, which leaves the matching kind unknown to the API server.
 func TestEveryCRDIsShipped(t *testing.T) {

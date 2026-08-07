@@ -274,6 +274,7 @@ spec:
                     description: |-
                       CASecretRef references a Secret containing CA certificate
                       Secret must have "ca.crt" key
+                      When unset, servers are verified against the system trust store
                     type: string
                   certificateSecretRef:
                     description: |-
@@ -287,6 +288,9 @@ spec:
                     description: MutualTLS enables mutual TLS authentication
                     type: boolean
                 type: object
+                x-kubernetes-validations:
+                - message: certificateSecretRef is required when TLS is enabled
+                  rule: '!(has(self.enabled) && self.enabled) || has(self.certificateSecretRef)'
             required:
             - redisConfig
             - sentinelConfig

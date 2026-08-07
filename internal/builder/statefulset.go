@@ -86,7 +86,7 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName:  rs.Spec.TLS.CertificateSecretRef,
-					DefaultMode: int32Ptr(0400),
+					DefaultMode: int32Ptr(0440),
 				},
 			},
 		})
@@ -103,7 +103,7 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
 						SecretName:  rs.Spec.TLS.CASecretRef,
-						DefaultMode: int32Ptr(0400),
+						DefaultMode: int32Ptr(0440),
 					},
 				},
 			})
@@ -120,7 +120,9 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 
 	// Update probe command for TLS if enabled
 	if tlsEnabled {
-		probeCommand = buildRedisProbeCommandWithTLS(rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "")
+		probeCommand = buildRedisProbeCommandWithTLS(
+			rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "",
+			rs.Spec.TLS.CASecretRef != "")
 	}
 
 	sts := &appsv1.StatefulSet{
@@ -245,7 +247,7 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 	// Build probe command - Sentinel probe (Sentinel itself doesn't require auth to PING)
 	var sentinelProbeCommand []string
 	if tlsEnabled {
-		sentinelProbeCommand = buildSentinelProbeCommandWithTLS(false)
+		sentinelProbeCommand = buildSentinelProbeCommandWithTLS(false, rs.Spec.TLS.CASecretRef != "")
 	} else {
 		sentinelProbeCommand = buildSentinelProbeCommand(false)
 	}
@@ -295,7 +297,7 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName:  rs.Spec.TLS.CertificateSecretRef,
-					DefaultMode: int32Ptr(0400),
+					DefaultMode: int32Ptr(0440),
 				},
 			},
 		})
@@ -312,7 +314,7 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
 						SecretName:  rs.Spec.TLS.CASecretRef,
-						DefaultMode: int32Ptr(0400),
+						DefaultMode: int32Ptr(0440),
 					},
 				},
 			})
@@ -449,34 +451,32 @@ func buildSentinelProbeCommand(authEnabled bool) []string {
 	}
 }
 
-// buildRedisProbeCommandWithTLS creates the probe command for Redis with TLS
-func buildRedisProbeCommandWithTLS(authEnabled bool) []string {
+// buildRedisProbeCommandWithTLS creates the probe command for Redis with TLS.
+// --cacert is passed only when a CA secret is mounted; otherwise redis-cli
+// verifies against the system trust store, and pointing --cacert at a file
+// that is not there would fail every probe.
+func buildRedisProbeCommandWithTLS(authEnabled, caMounted bool) []string {
+	cmd := "redis-cli -h $(hostname) --tls --cert /etc/redis/tls/tls.crt --key /etc/redis/tls/tls.key"
+	if caMounted {
+		cmd += " --cacert /etc/redis/tls/ca.crt"
+	}
+	cmd += " ping | grep -q PONG"
 	if authEnabled {
-		return []string{
-			"sh",
-			"-c",
-			"REDISCLI_AUTH=$REDIS_PASSWORD redis-cli -h $(hostname) --tls --cert /etc/redis/tls/tls.crt --key /etc/redis/tls/tls.key --cacert /etc/redis/tls/ca.crt ping | grep -q PONG",
-		}
+		cmd = "REDISCLI_AUTH=$REDIS_PASSWORD " + cmd
 	}
-	return []string{
-		"sh",
-		"-c",
-		"redis-cli -h $(hostname) --tls --cert /etc/redis/tls/tls.crt --key /etc/redis/tls/tls.key --cacert /etc/redis/tls/ca.crt ping | grep -q PONG",
-	}
+	return []string{"sh", "-c", cmd}
 }
 
-// buildSentinelProbeCommandWithTLS creates the probe command for Sentinel with TLS
-func buildSentinelProbeCommandWithTLS(authEnabled bool) []string {
+// buildSentinelProbeCommandWithTLS creates the probe command for Sentinel with
+// TLS. Same --cacert rule as buildRedisProbeCommandWithTLS.
+func buildSentinelProbeCommandWithTLS(authEnabled, caMounted bool) []string {
+	cmd := "redis-cli -h $(hostname) -p 26379 --tls --cert /etc/sentinel/tls/tls.crt --key /etc/sentinel/tls/tls.key"
+	if caMounted {
+		cmd += " --cacert /etc/sentinel/tls/ca.crt"
+	}
+	cmd += " ping | grep -q PONG"
 	if authEnabled {
-		return []string{
-			"sh",
-			"-c",
-			"REDISCLI_AUTH=$REDIS_PASSWORD redis-cli -h $(hostname) -p 26379 --tls --cert /etc/sentinel/tls/tls.crt --key /etc/sentinel/tls/tls.key --cacert /etc/sentinel/tls/ca.crt ping | grep -q PONG",
-		}
+		cmd = "REDISCLI_AUTH=$REDIS_PASSWORD " + cmd
 	}
-	return []string{
-		"sh",
-		"-c",
-		"redis-cli -h $(hostname) -p 26379 --tls --cert /etc/sentinel/tls/tls.crt --key /etc/sentinel/tls/tls.key --cacert /etc/sentinel/tls/ca.crt ping | grep -q PONG",
-	}
+	return []string{"sh", "-c", cmd}
 }

@@ -282,8 +282,11 @@ func TestBuildRedisStatefulSet_TLSEnabled(t *testing.T) {
 	if vol.Secret == nil || vol.Secret.SecretName != "redis-tls" {
 		t.Errorf("tls-certs volume secret = %+v, want secretName redis-tls", vol.Secret)
 	}
-	if vol.Secret.DefaultMode == nil || *vol.Secret.DefaultMode != 0400 {
-		t.Errorf("tls-certs defaultMode = %v, want 0400", vol.Secret.DefaultMode)
+	// 0440 with fsGroup 1000: the secret files are root:1000, and the redis
+	// process (uid 1000, supplementary gid 1000) reads via the group bit.
+	// 0400 leaves the key readable by root only and TLS never comes up.
+	if vol.Secret.DefaultMode == nil || *vol.Secret.DefaultMode != 0440 {
+		t.Errorf("tls-certs defaultMode = %v, want 0440 so the non-root redis user can read the key", vol.Secret.DefaultMode)
 	}
 	if !hasVolumeMount(c, "tls-certs", "/etc/redis/tls") {
 		t.Errorf("tls-certs not mounted at /etc/redis/tls: %v", c.VolumeMounts)
@@ -296,6 +299,9 @@ func TestBuildRedisStatefulSet_TLSEnabled(t *testing.T) {
 	if caVol.Secret == nil || caVol.Secret.SecretName != "redis-ca" {
 		t.Errorf("tls-ca volume secret = %+v, want secretName redis-ca", caVol.Secret)
 	}
+	if caVol.Secret.DefaultMode == nil || *caVol.Secret.DefaultMode != 0440 {
+		t.Errorf("tls-ca defaultMode = %v, want 0440 so the non-root redis user can read it", caVol.Secret.DefaultMode)
+	}
 	if !hasVolumeMount(c, "tls-ca", "/etc/redis/tls/ca.crt") {
 		t.Errorf("tls-ca not mounted at /etc/redis/tls/ca.crt: %v", c.VolumeMounts)
 	}
@@ -303,6 +309,29 @@ func TestBuildRedisStatefulSet_TLSEnabled(t *testing.T) {
 	cmd := strings.Join(c.LivenessProbe.Exec.Command, " ")
 	if !strings.Contains(cmd, "--tls") {
 		t.Errorf("TLS enabled but probe does not use --tls: %q", cmd)
+	}
+	if !strings.Contains(cmd, "--cacert /etc/redis/tls/ca.crt") {
+		t.Errorf("CA secret configured but probe does not pass --cacert: %q", cmd)
+	}
+}
+
+// Without a CA secret nothing mounts ca.crt, so a probe that passes --cacert
+// points at a file that does not exist and fails on every tick.
+func TestBuildRedisStatefulSet_TLSWithoutCAOmitsCacert(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.TLS = &redisv1alpha1.TLSConfig{
+		Enabled:              true,
+		CertificateSecretRef: "redis-tls",
+	}
+
+	c := BuildRedisStatefulSet(rs).Spec.Template.Spec.Containers[0]
+
+	cmd := strings.Join(c.LivenessProbe.Exec.Command, " ")
+	if !strings.Contains(cmd, "--tls") {
+		t.Errorf("TLS enabled but probe does not use --tls: %q", cmd)
+	}
+	if strings.Contains(cmd, "--cacert") {
+		t.Errorf("no CA secret configured but probe passes --cacert: %q", cmd)
 	}
 }
 
@@ -484,11 +513,36 @@ func TestBuildSentinelStatefulSet_TLS(t *testing.T) {
 	if !hasVolumeMount(c, "tls-certs", "/etc/sentinel/tls") {
 		t.Errorf("tls-certs not mounted at /etc/sentinel/tls: %v", c.VolumeMounts)
 	}
+	if vol, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-certs"); !ok || vol.Secret.DefaultMode == nil || *vol.Secret.DefaultMode != 0440 {
+		t.Errorf("tls-certs defaultMode = %+v, want 0440 so the non-root redis user can read the key", vol.Secret)
+	}
 	if !hasVolumeMount(c, "tls-ca", "/etc/sentinel/tls/ca.crt") {
 		t.Errorf("tls-ca not mounted at /etc/sentinel/tls/ca.crt: %v", c.VolumeMounts)
 	}
-	if cmd := strings.Join(c.LivenessProbe.Exec.Command, " "); !strings.Contains(cmd, "--tls") {
+	cmd := strings.Join(c.LivenessProbe.Exec.Command, " ")
+	if !strings.Contains(cmd, "--tls") {
 		t.Errorf("TLS enabled but sentinel probe does not use --tls: %q", cmd)
+	}
+	if !strings.Contains(cmd, "--cacert /etc/sentinel/tls/ca.crt") {
+		t.Errorf("CA secret configured but sentinel probe does not pass --cacert: %q", cmd)
+	}
+}
+
+func TestBuildSentinelStatefulSet_TLSWithoutCAOmitsCacert(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.TLS = &redisv1alpha1.TLSConfig{
+		Enabled:              true,
+		CertificateSecretRef: "sentinel-tls",
+	}
+
+	c := BuildSentinelStatefulSet(rs).Spec.Template.Spec.Containers[0]
+
+	cmd := strings.Join(c.LivenessProbe.Exec.Command, " ")
+	if !strings.Contains(cmd, "--tls") {
+		t.Errorf("TLS enabled but sentinel probe does not use --tls: %q", cmd)
+	}
+	if strings.Contains(cmd, "--cacert") {
+		t.Errorf("no CA secret configured but sentinel probe passes --cacert: %q", cmd)
 	}
 }
 

@@ -46,6 +46,7 @@ import (
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/redisclient"
+	"github.com/redguard/redguard/internal/tlsutil"
 )
 
 // RedisRestoreReconciler reconciles a RedisRestore object
@@ -227,6 +228,12 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 
 	// Verify data was restored
 	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		logger.Error(err, "Failed to resolve client TLS config")
+		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to verify: "+err.Error(), restore.Status.RestoredDataSize)
+		return ctrl.Result{}, err
+	}
 	masterPod, err := r.getMasterPod(ctx, rs)
 	if err != nil {
 		logger.Error(err, "Failed to get master pod for verification")
@@ -235,7 +242,7 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 	}
 
 	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
 	// Check if Redis is responsive
@@ -271,13 +278,17 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 
 func (r *RedisRestoreReconciler) checkClusterHasData(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
 	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return false, fmt.Errorf("resolve client TLS config: %w", err)
+	}
 	masterPod, err := r.getMasterPod(ctx, rs)
 	if err != nil {
 		return false, err
 	}
 
 	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
 	dbSize, err := redisClient.DBSize(ctx)
@@ -430,6 +441,13 @@ func (r *RedisRestoreReconciler) restartMasterPod(ctx context.Context, rs *redis
 func (r *RedisRestoreReconciler) waitForMasterReady(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
 	logger := log.FromContext(ctx)
 
+	// Resolved once for the whole wait loop instead of on every tick.
+	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return fmt.Errorf("resolve client TLS config: %w", err)
+	}
+
 	// Wait for the new master pod to be ready
 	timeout := time.After(5 * time.Minute)
 	ticker := time.NewTicker(5 * time.Second)
@@ -448,9 +466,8 @@ func (r *RedisRestoreReconciler) waitForMasterReady(ctx context.Context, rs *red
 
 			if masterPod.Status.Phase == corev1.PodRunning {
 				// Check if Redis is responsive
-				adminPassword := r.getAdminPassword(ctx, rs)
 				addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-				redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
+				redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 
 				if err := redisClient.Ping(ctx); err == nil {
 					redisClient.Close()

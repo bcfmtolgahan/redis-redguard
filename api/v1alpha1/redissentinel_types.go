@@ -106,6 +106,7 @@ type AuthConfig struct {
 }
 
 // TLSConfig defines TLS/SSL configuration
+// +kubebuilder:validation:XValidation:rule="!(has(self.enabled) && self.enabled) || has(self.certificateSecretRef)",message="certificateSecretRef is required when TLS is enabled"
 type TLSConfig struct {
 	// Enabled indicates if TLS is enabled
 	// +optional
@@ -118,6 +119,7 @@ type TLSConfig struct {
 
 	// CASecretRef references a Secret containing CA certificate
 	// Secret must have "ca.crt" key
+	// When unset, servers are verified against the system trust store
 	// +optional
 	CASecretRef string `json:"caSecretRef,omitempty"`
 
