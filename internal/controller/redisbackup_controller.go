@@ -48,8 +48,8 @@ import (
 	"github.com/robfig/cron/v3"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	"github.com/redguard/redguard/internal/redisclient"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
-	"github.com/redguard/redguard/pkg/redisutils"
 )
 
 const redisBackupFinalizer = "redis.redguard.io/redisbackup-finalizer"
@@ -59,6 +59,8 @@ type RedisBackupReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
 	RESTConfig *rest.Config
+	// RedisFactory builds Redis clients; nil means DefaultFactory.
+	RedisFactory redisclient.Factory
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisbackups,verbs=get;list;watch;create;update;patch;delete
@@ -316,7 +318,7 @@ func (r *RedisBackupReconciler) getBackupPod(ctx context.Context, redisSentinel 
 
 		// Check role of this pod
 		addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-		redisClient := redisutils.NewRedisClient(addr, adminPassword)
+		redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 		isMaster, err := redisClient.IsMaster(ctx)
 		redisClient.Close()
 
@@ -329,7 +331,7 @@ func (r *RedisBackupReconciler) getBackupPod(ctx context.Context, redisSentinel 
 			masterPod = pod
 		} else {
 			// Check if replica is healthy (master_link_status = up)
-			redisClient = redisutils.NewRedisClient(addr, adminPassword)
+			redisClient = factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 			replInfo, err := redisClient.GetReplicationInfo(ctx)
 			redisClient.Close()
 
@@ -378,7 +380,7 @@ func (r *RedisBackupReconciler) triggerBGSave(ctx context.Context, redisSentinel
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
 
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-	redisClient := redisutils.NewRedisClient(addr, adminPassword)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 	defer redisClient.Close()
 
 	// Check if BGSAVE is already in progress
@@ -411,7 +413,7 @@ func (r *RedisBackupReconciler) waitForBGSave(ctx context.Context, redisSentinel
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
 
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-	redisClient := redisutils.NewRedisClient(addr, adminPassword)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 	defer redisClient.Close()
 
 	// Get the last save time before we started
@@ -534,7 +536,7 @@ func (r *RedisBackupReconciler) getBackupRDBPath(ctx context.Context, redisSenti
 	adminPassword := r.getAdminPassword(ctx, redisSentinel)
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
 
-	redisClient := redisutils.NewRedisClient(addr, adminPassword)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 	defer redisClient.Close()
 
 	// Get dir and dbfilename from config
@@ -745,6 +747,9 @@ func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *r
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RedisFactory == nil {
+		r.RedisFactory = redisclient.DefaultFactory{}
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisBackup{}).
 		Named("redisbackup").

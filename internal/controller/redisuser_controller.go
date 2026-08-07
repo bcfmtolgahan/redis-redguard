@@ -33,8 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	"github.com/redguard/redguard/internal/redisclient"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
-	"github.com/redguard/redguard/pkg/redisutils"
 )
 
 const redisUserFinalizer = "redis.redguard.io/redisuser-finalizer"
@@ -43,6 +43,8 @@ const redisUserFinalizer = "redis.redguard.io/redisuser-finalizer"
 type RedisUserReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// RedisFactory builds Redis clients; nil means DefaultFactory.
+	RedisFactory redisclient.Factory
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisusers,verbs=get;list;watch;create;update;patch;delete
@@ -127,7 +129,7 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	appliedTo := []string{}
 	var lastErr error
 	for _, addr := range allAddresses {
-		redisClient := redisutils.NewRedisClient(addr, adminPassword)
+		redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 		if err := r.applyACL(ctx, redisClient, redisUser, password); err != nil {
 			logger.Error(err, "Failed to apply ACL to pod", "address", addr)
 			lastErr = err
@@ -191,7 +193,7 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 				failedPods := []string{}
 				for _, addr := range allAddresses {
 					func(address string) {
-						redisClient := redisutils.NewRedisClient(address, adminPassword)
+						redisClient := factoryOrDefault(r.RedisFactory).NewClient(address, adminPassword, nil)
 						defer redisClient.Close()
 
 						if err := redisClient.ACLDelUser(ctx, redisUser.Spec.Username); err != nil {
@@ -234,7 +236,7 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 	return ctrl.Result{}, nil
 }
 
-func (r *RedisUserReconciler) applyACL(ctx context.Context, redisClient *redisutils.RedisClient, redisUser *redisv1alpha1.RedisUser, password string) error {
+func (r *RedisUserReconciler) applyACL(ctx context.Context, redisClient redisclient.Client, redisUser *redisv1alpha1.RedisUser, password string) error {
 	rules := []string{"reset"} // Start fresh
 
 	// Set password
@@ -402,6 +404,9 @@ func (r *RedisUserReconciler) updateStatus(ctx context.Context, redisUser *redis
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RedisFactory == nil {
+		r.RedisFactory = redisclient.DefaultFactory{}
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisUser{}).
 		Named("redisuser").

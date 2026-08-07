@@ -37,9 +37,8 @@ import (
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/builder"
-	"github.com/redguard/redguard/internal/sentinel"
+	"github.com/redguard/redguard/internal/redisclient"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
-	"github.com/redguard/redguard/pkg/redisutils"
 )
 
 // RedisSentinelReconciler reconciles a RedisSentinel object
@@ -47,6 +46,17 @@ type RedisSentinelReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+	// RedisFactory builds Redis and Sentinel clients; nil means DefaultFactory.
+	RedisFactory redisclient.Factory
+}
+
+// factoryOrDefault lets a zero-value reconciler dial real Redis without wiring.
+// Shared by all reconcilers in this package.
+func factoryOrDefault(f redisclient.Factory) redisclient.Factory {
+	if f != nil {
+		return f
+	}
+	return redisclient.DefaultFactory{}
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels,verbs=get;list;watch;create;update;patch;delete
@@ -408,7 +418,7 @@ func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redi
 	masterName := rs.Name + "-master"
 
 	// Use sentinel pool to try multiple sentinels
-	pool := sentinel.NewSentinelClientPool(sentinelAddresses, password)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, nil)
 	masterAddr, err := pool.GetMasterAddrFromPool(ctx, masterName)
 	if err != nil {
 		return "", err
@@ -479,7 +489,7 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 
 			// Use a function to ensure proper cleanup with defer
 			func() {
-				oldClient := redisutils.NewRedisClient(oldMasterAddr, adminPassword)
+				oldClient := factoryOrDefault(r.RedisFactory).NewClient(oldMasterAddr, adminPassword, nil)
 				defer oldClient.Close()
 
 				err := oldClient.SlaveOf(ctx, newMasterIP, newMasterPort)
@@ -526,7 +536,7 @@ func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context
 		// Use a function to ensure proper cleanup with defer
 		func(podIP, podName string) {
 			addr := fmt.Sprintf("%s:6379", podIP)
-			redisClient := redisutils.NewRedisClient(addr, adminPassword)
+			redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 			defer redisClient.Close()
 
 			info, err := redisClient.GetReplicationInfo(ctx)
@@ -576,7 +586,7 @@ func (r *RedisSentinelReconciler) checkSentinelQuorum(ctx context.Context, rs *r
 	masterName := rs.Name + "-master"
 
 	// Use pool to check quorum from any available sentinel
-	pool := sentinel.NewSentinelClientPool(sentinelAddresses, password)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, nil)
 	healthy, count, err := pool.CheckQuorumFromPool(ctx, masterName)
 	if err != nil {
 		return false, "Unable to verify quorum", err
@@ -714,7 +724,7 @@ func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs 
 		sentinelAddresses = append(sentinelAddresses, addr)
 	}
 
-	pool := sentinel.NewSentinelClientPool(sentinelAddresses, adminPassword)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, adminPassword, nil)
 	masterInfo, err := pool.GetMasterFromPool(ctx, masterName)
 	if err != nil {
 		logger.V(1).Info("Failed to get master info from sentinel", "error", err)
@@ -743,7 +753,7 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 	podName := pod.Name
 
 	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-	redisClient := redisutils.NewRedisClient(addr, adminPassword)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 	defer redisClient.Close()
 
 	// --- Memory Metrics ---
@@ -900,6 +910,9 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RedisFactory == nil {
+		r.RedisFactory = redisclient.DefaultFactory{}
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisSentinel{}).
 		Owns(&appsv1.StatefulSet{}).

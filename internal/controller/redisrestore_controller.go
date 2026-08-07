@@ -44,7 +44,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	"github.com/redguard/redguard/pkg/redisutils"
+	"github.com/redguard/redguard/internal/redisclient"
 )
 
 // RedisRestoreReconciler reconciles a RedisRestore object
@@ -52,6 +52,8 @@ type RedisRestoreReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
 	RESTConfig *rest.Config
+	// RedisFactory builds Redis clients; nil means DefaultFactory.
+	RedisFactory redisclient.Factory
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores,verbs=get;list;watch;create;update;patch;delete
@@ -229,7 +231,7 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 	}
 
 	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-	redisClient := redisutils.NewRedisClient(addr, adminPassword)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 	defer redisClient.Close()
 
 	// Check if Redis is responsive
@@ -271,7 +273,7 @@ func (r *RedisRestoreReconciler) checkClusterHasData(ctx context.Context, rs *re
 	}
 
 	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-	redisClient := redisutils.NewRedisClient(addr, adminPassword)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 	defer redisClient.Close()
 
 	dbSize, err := redisClient.DBSize(ctx)
@@ -444,7 +446,7 @@ func (r *RedisRestoreReconciler) waitForMasterReady(ctx context.Context, rs *red
 				// Check if Redis is responsive
 				adminPassword := r.getAdminPassword(ctx, rs)
 				addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-				redisClient := redisutils.NewRedisClient(addr, adminPassword)
+				redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, nil)
 
 				if err := redisClient.Ping(ctx); err == nil {
 					redisClient.Close()
@@ -524,6 +526,9 @@ func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redi
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.RedisFactory == nil {
+		r.RedisFactory = redisclient.DefaultFactory{}
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisRestore{}).
 		Named("redisrestore").

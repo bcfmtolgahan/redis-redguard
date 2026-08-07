@@ -28,13 +28,13 @@ type MasterInfo struct {
 
 // ReplicaInfo contains information about a replica
 type ReplicaInfo struct {
-	Name            string
-	IP              string
-	Port            string
-	Flags           string
+	Name             string
+	IP               string
+	Port             string
+	Flags            string
 	MasterLinkStatus string
-	MasterHost      string
-	MasterPort      string
+	MasterHost       string
+	MasterPort       string
 }
 
 // NewSentinelClient creates a new Sentinel client
