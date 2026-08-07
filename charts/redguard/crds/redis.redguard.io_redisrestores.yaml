@@ -80,14 +80,21 @@ spec:
                           etc.)
                         type: string
                       prefix:
-                        description: Prefix is the path prefix for backups
+                        description: |-
+                          Prefix is the path prefix for backups. RedisBackup writes objects
+                          under <prefix>/<namespace>/<clusterName>/ and retention only ever
+                          deletes objects under that exact prefix.
                         type: string
                       region:
                         description: Region is the AWS region
                         type: string
                       useIAMRole:
-                        description: UseIAMRole indicates whether to use IAM role
-                          instead of credentials
+                        description: |-
+                          UseIAMRole indicates whether to use IAM role instead of credentials.
+                          The request then runs under the operator's own AWS identity;
+                          RedisBackup rejects destinations whose bucket is not listed in the
+                          operator's --allowed-backup-buckets or whose custom endpoint is not
+                          in --allowed-backup-endpoints.
                         type: boolean
                     required:
                     - bucket

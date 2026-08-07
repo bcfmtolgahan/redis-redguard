@@ -45,6 +45,17 @@ operator:
   # Affinity
   affinity: {}
 
+# Backup destination policy. Backups with spec.s3.useIAMRole run under the
+# operator's own AWS identity (IRSA), so the destination must be allowlisted
+# here; backups using spec.s3.credentialsSecretRef are not restricted.
+backup:
+  # S3 buckets IAM-role backups may target. Empty disables the IAM-role path
+  # entirely: RedisBackups must then supply credentialsSecretRef.
+  allowedBuckets: []
+  # Custom S3 endpoints (for example a VPC endpoint URL) permitted for
+  # IAM-role backups. Empty permits only the default AWS endpoint.
+  allowedEndpoints: []
+
 # ServiceAccount configuration
 serviceAccount:
   # Create service account

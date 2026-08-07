@@ -20,8 +20,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -46,6 +49,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/robfig/cron/v3"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
@@ -66,6 +70,32 @@ type RedisBackupReconciler struct {
 	Recorder   record.EventRecorder
 	// RedisFactory builds Redis clients; nil means DefaultFactory.
 	RedisFactory redisclient.Factory
+	// AllowedBuckets restricts which S3 buckets a RedisBackup may target with
+	// the operator's ambient IAM identity (spec.s3.useIAMRole). Empty disables
+	// the IAM-role path entirely; tenant-supplied credentialsSecretRef backups
+	// are unaffected.
+	AllowedBuckets []string
+	// AllowedEndpoints lists custom S3 endpoints permitted together with
+	// useIAMRole. Empty permits only the SDK's default AWS endpoint.
+	AllowedEndpoints []string
+	// newS3Client replaces S3 client construction in tests.
+	newS3Client func(ctx context.Context, backup *redisv1alpha1.RedisBackup) (s3API, error)
+}
+
+// s3API is the subset of the AWS S3 client the backup controller uses.
+// *s3.Client satisfies it; tests substitute an in-memory implementation.
+type s3API interface {
+	PutObject(ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+}
+
+// s3ClientFor returns the S3 client for a backup, honouring the test override.
+func (r *RedisBackupReconciler) s3ClientFor(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (s3API, error) {
+	if r.newS3Client != nil {
+		return r.newS3Client(ctx, redisBackup)
+	}
+	return r.createS3Client(ctx, redisBackup)
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisbackups,verbs=get;list;watch;create;update;patch;delete
@@ -109,6 +139,16 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 1 * time.Hour}, nil
 	}
 
+	// Refuse disallowed destinations before any Redis or S3 side effect. The
+	// check runs at the start of every reconcile, so a violating CR never
+	// starts a run, scheduled or one-time; an in-flight run is never aborted
+	// because the policy is evaluated before the run begins.
+	if err := r.validateBackupDestination(redisBackup); err != nil {
+		logger.Error(err, "Backup destination not allowed")
+		r.markDestinationRejected(ctx, redisBackup, err)
+		return ctrl.Result{RequeueAfter: 1 * time.Hour}, nil
+	}
+
 	// Check if it's time to backup
 	shouldBackup, nextBackupTime := r.shouldBackup(redisBackup)
 	if !shouldBackup {
@@ -130,9 +170,11 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 30 * time.Minute}, err
 	}
 
-	// Cleanup old backups based on retention policy
+	// The backup itself succeeded; a retention failure deletes nothing and is
+	// surfaced on the CR rather than failing the run.
 	if err := r.cleanupOldBackups(ctx, redisBackup); err != nil {
 		logger.Error(err, "Failed to cleanup old backups")
+		recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "RetentionFailed", err.Error())
 	}
 
 	// Update status
@@ -153,6 +195,47 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// One-time backup
 	return ctrl.Result{}, nil
+}
+
+// validateBackupDestination enforces the operator-level destination policy on
+// the confused-deputy path: with useIAMRole the request runs under the
+// operator's own AWS identity, so any namespace user could otherwise aim that
+// identity at an arbitrary bucket or endpoint. Tenant-supplied credentials
+// (credentialsSecretRef) carry only privileges the tenant already holds and
+// are not restricted.
+func (r *RedisBackupReconciler) validateBackupDestination(redisBackup *redisv1alpha1.RedisBackup) error {
+	if !redisBackup.Spec.S3.UseIAMRole {
+		return nil
+	}
+	if len(r.AllowedBuckets) == 0 {
+		return fmt.Errorf("spec.s3.useIAMRole is set but the operator runs without --allowed-backup-buckets; the IAM-role path is disabled, use spec.s3.credentialsSecretRef instead")
+	}
+	if !slices.Contains(r.AllowedBuckets, redisBackup.Spec.S3.Bucket) {
+		return fmt.Errorf("bucket %q is not in the operator's --allowed-backup-buckets", redisBackup.Spec.S3.Bucket)
+	}
+	if ep := redisBackup.Spec.S3.Endpoint; ep != "" && !slices.Contains(r.AllowedEndpoints, ep) {
+		return fmt.Errorf("endpoint %q is not in the operator's --allowed-backup-endpoints; a custom endpoint would redirect requests signed with the operator's identity", ep)
+	}
+	return nil
+}
+
+// markDestinationRejected surfaces a destination-policy refusal in status and
+// events under its own reason, distinguishable from a run that failed.
+func (r *RedisBackupReconciler) markDestinationRejected(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, cause error) {
+	redisBackup.Status.Phase = "Failed"
+	redisBackup.Status.Conditions = []metav1.Condition{
+		{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "DestinationNotAllowed",
+			Message:            cause.Error(),
+		},
+	}
+	recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "DestinationNotAllowed", cause.Error())
+	if err := r.Status().Update(ctx, redisBackup); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update RedisBackup status")
+	}
 }
 
 func (r *RedisBackupReconciler) handleDeletion(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (ctrl.Result, error) {
@@ -614,19 +697,18 @@ func (r *RedisBackupReconciler) getBackupRDBPath(ctx context.Context, redisSenti
 
 func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, data []byte) (string, error) {
 	// Create S3 client
-	s3Client, err := r.createS3Client(ctx, redisBackup)
+	s3Client, err := r.s3ClientFor(ctx, redisBackup)
 	if err != nil {
 		return "", err
 	}
 
-	// Generate backup key
-	timestamp := time.Now().Format("20060102-150405")
-	key := filepath.Join(
-		redisBackup.Spec.S3.Prefix,
-		redisBackup.Spec.RedisClusterRef,
-		fmt.Sprintf("backup-%s.rdb", timestamp),
-	)
+	prefix, err := backupObjectPrefix(redisBackup)
+	if err != nil {
+		return "", err
+	}
 
+	timestamp := time.Now().Format("20060102-150405")
+	key := prefix + fmt.Sprintf("backup-%s.rdb", timestamp)
 	if redisBackup.Spec.Compression {
 		key += ".gz"
 	}
@@ -647,6 +729,12 @@ func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *red
 }
 
 func (r *RedisBackupReconciler) createS3Client(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (*s3.Client, error) {
+	// Re-checked here so no future call site can reach AWS with the operator's
+	// identity without passing the destination policy.
+	if err := r.validateBackupDestination(redisBackup); err != nil {
+		return nil, err
+	}
+
 	var cfg aws.Config
 	var err error
 
@@ -701,49 +789,87 @@ func (r *RedisBackupReconciler) createS3Client(ctx context.Context, redisBackup 
 	return s3Client, nil
 }
 
+// backupObjectPrefix is the exact key prefix this backup reads and writes:
+// <spec.prefix>/<namespace>/<clusterName>/. Namespace and cluster name are
+// always included so two clusters can never share a prefix, and the trailing
+// slash stops "cluster-a" matching "cluster-a-canary". Both segments are DNS
+// labels by API validation; anything else is refused rather than joined into
+// an ambiguous prefix.
+func backupObjectPrefix(redisBackup *redisv1alpha1.RedisBackup) (string, error) {
+	for _, seg := range []string{redisBackup.Namespace, redisBackup.Spec.RedisClusterRef} {
+		if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "/*") {
+			return "", fmt.Errorf("cannot compute an unambiguous S3 prefix from namespace %q and cluster %q",
+				redisBackup.Namespace, redisBackup.Spec.RedisClusterRef)
+		}
+	}
+	return path.Join(redisBackup.Spec.S3.Prefix, redisBackup.Namespace, redisBackup.Spec.RedisClusterRef) + "/", nil
+}
+
+// isBackupObject reports whether key is an object this controller writes for
+// this cluster: a direct child of prefix named backup-<timestamp>.rdb or
+// .rdb.gz. Anything else under the prefix is left alone.
+func isBackupObject(prefix, key string) bool {
+	rest, ok := strings.CutPrefix(key, prefix)
+	if !ok || rest == "" || strings.Contains(rest, "/") {
+		return false
+	}
+	return strings.HasPrefix(rest, "backup-") &&
+		(strings.HasSuffix(rest, ".rdb") || strings.HasSuffix(rest, ".rdb.gz"))
+}
+
+// cleanupOldBackups prunes this cluster's backups down to the retention count.
+// It walks the scoped prefix with a paginator, considers only objects this
+// controller writes, and returns every failed delete instead of dropping it.
 func (r *RedisBackupReconciler) cleanupOldBackups(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) error {
 	if redisBackup.Spec.RetentionPolicy <= 0 {
 		return nil
 	}
 
-	s3Client, err := r.createS3Client(ctx, redisBackup)
+	prefix, err := backupObjectPrefix(redisBackup)
+	if err != nil {
+		return fmt.Errorf("retention refused: %w", err)
+	}
+
+	s3Client, err := r.s3ClientFor(ctx, redisBackup)
 	if err != nil {
 		return err
 	}
 
-	prefix := filepath.Join(redisBackup.Spec.S3.Prefix, redisBackup.Spec.RedisClusterRef) + "/"
-
-	// List all backups
-	result, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	var backups []s3types.Object
+	paginator := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(redisBackup.Spec.S3.Bucket),
 		Prefix: aws.String(prefix),
 	})
-
-	if err != nil {
-		return err
-	}
-
-	// Sort by last modified (oldest first)
-	objects := result.Contents
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].LastModified.Before(*objects[j].LastModified)
-	})
-
-	// Delete old backups
-	toDelete := len(objects) - int(redisBackup.Spec.RetentionPolicy)
-	if toDelete > 0 {
-		for i := 0; i < toDelete; i++ {
-			_, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-				Bucket: aws.String(redisBackup.Spec.S3.Bucket),
-				Key:    objects[i].Key,
-			})
-			if err != nil {
-				log.FromContext(ctx).Error(err, "Failed to delete old backup", "key", *objects[i].Key)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("list backups under %s: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			if isBackupObject(prefix, aws.ToString(obj.Key)) {
+				backups = append(backups, obj)
 			}
 		}
 	}
 
-	return nil
+	// Oldest first; key order breaks LastModified ties deterministically.
+	sort.Slice(backups, func(i, j int) bool {
+		if backups[i].LastModified.Equal(*backups[j].LastModified) {
+			return aws.ToString(backups[i].Key) < aws.ToString(backups[j].Key)
+		}
+		return backups[i].LastModified.Before(*backups[j].LastModified)
+	})
+
+	var deleteErrs []error
+	for i := 0; i < len(backups)-int(redisBackup.Spec.RetentionPolicy); i++ {
+		if _, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(redisBackup.Spec.S3.Bucket),
+			Key:    backups[i].Key,
+		}); err != nil {
+			deleteErrs = append(deleteErrs, fmt.Errorf("delete %s: %w", aws.ToString(backups[i].Key), err))
+		}
+	}
+	return errors.Join(deleteErrs...)
 }
 
 func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, phase, location string, size int64, duration string, err error) {

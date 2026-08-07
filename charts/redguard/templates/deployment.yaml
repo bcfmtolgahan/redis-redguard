@@ -34,6 +34,12 @@ spec:
         - --metrics-bind-address=:{{ .Values.metrics.port }}
         {{- end }}
         - --health-probe-bind-address=:{{ .Values.health.port }}
+        {{- with .Values.backup.allowedBuckets }}
+        - --allowed-backup-buckets={{ join "," . }}
+        {{- end }}
+        {{- with .Values.backup.allowedEndpoints }}
+        - --allowed-backup-endpoints={{ join "," . }}
+        {{- end }}
         securityContext:
           {{- toYaml .Values.operator.containerSecurityContext | nindent 10 }}
         livenessProbe:

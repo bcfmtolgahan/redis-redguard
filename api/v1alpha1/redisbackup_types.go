@@ -34,7 +34,9 @@ type S3Config struct {
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
-	// Prefix is the path prefix for backups
+	// Prefix is the path prefix for backups. RedisBackup writes objects
+	// under <prefix>/<namespace>/<clusterName>/ and retention only ever
+	// deletes objects under that exact prefix.
 	// +optional
 	Prefix string `json:"prefix,omitempty"`
 
@@ -43,7 +45,11 @@ type S3Config struct {
 	// +optional
 	CredentialsSecretRef string `json:"credentialsSecretRef,omitempty"`
 
-	// UseIAMRole indicates whether to use IAM role instead of credentials
+	// UseIAMRole indicates whether to use IAM role instead of credentials.
+	// The request then runs under the operator's own AWS identity;
+	// RedisBackup rejects destinations whose bucket is not listed in the
+	// operator's --allowed-backup-buckets or whose custom endpoint is not
+	// in --allowed-backup-endpoints.
 	// +optional
 	UseIAMRole bool `json:"useIAMRole,omitempty"`
 }

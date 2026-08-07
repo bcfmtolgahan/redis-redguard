@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -52,6 +53,17 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// splitCommaList parses a comma-separated flag value, dropping empty entries.
+func splitCommaList(s string) []string {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -61,6 +73,8 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var allowedBackupBuckets string
+	var allowedBackupEndpoints string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +93,13 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&allowedBackupBuckets, "allowed-backup-buckets", "",
+		"Comma-separated S3 buckets a RedisBackup may target with the operator's IAM role "+
+			"(spec.s3.useIAMRole). Empty disables the IAM-role path entirely; backups must then "+
+			"supply spec.s3.credentialsSecretRef. Backups using credentialsSecretRef are not restricted.")
+	flag.StringVar(&allowedBackupEndpoints, "allowed-backup-endpoints", "",
+		"Comma-separated custom S3 endpoints permitted for IAM-role backups, for example a VPC "+
+			"endpoint URL. Empty permits only the default AWS endpoint.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -194,10 +215,12 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.RedisBackupReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		RESTConfig: mgr.GetConfig(),
-		Recorder:   mgr.GetEventRecorderFor("redisbackup-controller"),
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		RESTConfig:       mgr.GetConfig(),
+		Recorder:         mgr.GetEventRecorderFor("redisbackup-controller"),
+		AllowedBuckets:   splitCommaList(allowedBackupBuckets),
+		AllowedEndpoints: splitCommaList(allowedBackupEndpoints),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisBackup")
 		os.Exit(1)
