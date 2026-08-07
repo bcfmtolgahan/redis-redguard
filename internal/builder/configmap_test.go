@@ -2,6 +2,8 @@ package builder
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -694,6 +696,108 @@ func TestCustomConfigAllowsTuningDirectives(t *testing.T) {
 		if err := ValidateCustomConfig(map[string]string{k: v}); err != nil {
 			t.Errorf("ValidateCustomConfig rejected legitimate entry %q=%q: %v", k, v, err)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// render determinism
+// ---------------------------------------------------------------------------
+
+// determinismSentinel returns a CR whose customConfig maps are large enough that
+// an unordered renderer emits a different directive order on almost every call.
+func determinismSentinel() *redisv1alpha1.RedisSentinel {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.CustomConfig = map[string]string{
+		"maxmemory":           "256mb",
+		"maxmemory-policy":    "allkeys-lru",
+		"timeout":             "300",
+		"tcp-keepalive":       "60",
+		"maxclients":          "1000",
+		"lazyfree-lazy-evict": "yes",
+	}
+	rs.Spec.SentinelConfig.CustomConfig = map[string]string{
+		"sentinel deny-scripts-reconfig": "yes",
+		"sentinel notification-script":   "/dev/null",
+		"maxclients":                     "1000",
+		"tcp-keepalive":                  "60",
+		"timeout":                        "0",
+		"loglevel":                       "notice",
+	}
+	return rs
+}
+
+// TestConfigMapRenderingIsDeterministic pins the rendered config files against
+// Go's randomized map iteration. The reconciler compares the freshly rendered
+// Data against the live ConfigMap, so a render that merely reorders directives
+// makes every pass issue an Update, and the Owns(&corev1.ConfigMap{}) watch
+// turns that Update back into a reconcile: an unbounded write loop against the
+// API server for any spec with two or more customConfig keys.
+//
+// Go re-randomizes the iteration start on every range statement, so with six
+// keys an unordered renderer repeats the reference order with probability well
+// under 1/2 per call. 200 renders therefore let a regression pass with
+// probability below 2^-199: the count is a bound, not a guess. Two keys would
+// give only a coin flip per render and make the test itself flaky.
+func TestConfigMapRenderingIsDeterministic(t *testing.T) {
+	rs := determinismSentinel()
+
+	wantRedis := BuildRedisConfigMap(rs).Data
+	wantSentinel := BuildSentinelConfigMap(rs).Data
+
+	const renders = 200
+	for i := range renders {
+		assertSameData(t, i, "redis", wantRedis, BuildRedisConfigMap(rs).Data)
+		assertSameData(t, i, "sentinel", wantSentinel, BuildSentinelConfigMap(rs).Data)
+	}
+}
+
+// assertSameData fails on the first key whose rendered bytes drifted.
+func assertSameData(t *testing.T, render int, component string, want, got map[string]string) {
+	t.Helper()
+	if len(want) != len(got) {
+		t.Fatalf("%s render %d produced %d keys, want %d", component, render, len(got), len(want))
+	}
+	for _, key := range slices.Sorted(maps.Keys(want)) {
+		if got[key] != want[key] {
+			t.Fatalf("%s render %d changed %s:\nfirst render:\n%s\nthis render:\n%s",
+				component, render, key, want[key], got[key])
+		}
+	}
+}
+
+// TestCustomConfigRendersInSortedKeyOrder pins the order itself, so a future
+// renderer cannot become deterministic by accident of map layout.
+func TestCustomConfigRendersInSortedKeyOrder(t *testing.T) {
+	rs := determinismSentinel()
+
+	tests := []struct {
+		name string
+		conf string
+		cfg  map[string]string
+	}{
+		{"redis", BuildRedisConfigMap(rs).Data["redis.conf"], rs.Spec.RedisConfig.CustomConfig},
+		{"sentinel", BuildSentinelConfigMap(rs).Data["sentinel.conf"], rs.Spec.SentinelConfig.CustomConfig},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var want []string
+			for _, key := range slices.Sorted(maps.Keys(tc.cfg)) {
+				want = append(want, key+" "+tc.cfg[key])
+			}
+
+			lines := configLines(tc.conf)
+			var got []string
+			for _, l := range lines {
+				if slices.Contains(want, l) {
+					got = append(got, l)
+				}
+			}
+
+			if !slices.Equal(got, want) {
+				t.Errorf("custom directives rendered as %v, want %v\nfull config:\n%s", got, want, tc.conf)
+			}
+		})
 	}
 }
 

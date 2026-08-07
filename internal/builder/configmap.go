@@ -31,10 +31,7 @@ func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 		"save 60 10000",
 	}
 
-	// Add custom config
-	for key, value := range rs.Spec.RedisConfig.CustomConfig {
-		config = append(config, fmt.Sprintf("%s %s", key, value))
-	}
+	config = append(config, renderCustomConfig(rs.Spec.RedisConfig.CustomConfig)...)
 
 	// Add auth if configured
 	if rs.Spec.RedisConfig.Auth != nil && rs.Spec.RedisConfig.Auth.SecretName != "" {
@@ -93,6 +90,21 @@ func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 			"init.sh":    initScript,
 		},
 	}
+}
+
+// renderCustomConfig turns customConfig into directive lines in sorted key
+// order. Go randomizes map iteration, so an unordered render emits a different
+// byte sequence on every call: the reconciler would see changed ConfigMap Data
+// on every pass, Update it, and the Owns watch would turn that Update straight
+// back into a reconcile. The order chosen is arbitrary and only has to be
+// stable, because customConfig directives do not constrain each other the way
+// the operator-owned lines do.
+func renderCustomConfig(cfg map[string]string) []string {
+	lines := make([]string, 0, len(cfg))
+	for _, key := range slices.Sorted(maps.Keys(cfg)) {
+		lines = append(lines, fmt.Sprintf("%s %s", key, cfg[key]))
+	}
+	return lines
 }
 
 // buildRedisInitScript creates the init script that queries Sentinel for master.
@@ -287,10 +299,7 @@ func BuildSentinelConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 		}
 	}
 
-	// Add custom config
-	for key, value := range rs.Spec.SentinelConfig.CustomConfig {
-		config = append(config, fmt.Sprintf("%s %s", key, value))
-	}
+	config = append(config, renderCustomConfig(rs.Spec.SentinelConfig.CustomConfig)...)
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
