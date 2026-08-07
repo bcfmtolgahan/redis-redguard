@@ -161,7 +161,18 @@ spec:
                         description: StorageClassName is the storage class name
                         type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: 'redisConfig.storage is immutable: a StatefulSet volumeClaimTemplate
+                        cannot be resized or moved to another storage class after
+                        creation. Resize the PersistentVolumeClaims directly, or recreate
+                        the RedisSentinel.'
+                      rule: self == oldSelf
                 type: object
+                x-kubernetes-validations:
+                - message: 'redisConfig.storage is immutable: adding or removing it
+                    would change the StatefulSet volumeClaimTemplates, which Kubernetes
+                    forbids. Recreate the RedisSentinel instead.'
+                  rule: has(self.storage) == has(oldSelf.storage)
               sentinelConfig:
                 description: SentinelConfig defines Sentinel configuration
                 properties:

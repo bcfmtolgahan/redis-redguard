@@ -551,7 +551,9 @@ func expectMasterLabelOnlyOn(ctx context.Context, podNames []string, master stri
 
 // reconcileUntilSettled drives a spec-owned reconciler until it returns without
 // error. The same reconciler also runs inside the Manager, so a single manual
-// call can lose an optimistic-concurrency race (409 Conflict / AlreadyExists).
+// call can lose an optimistic-concurrency race on the RedisSentinel itself, on
+// the finalizer or the status write. Races on owned objects are retried inside
+// createOrUpdate and never reach here.
 func reconcileUntilSettled(ctx context.Context, r *RedisSentinelReconciler, key types.NamespacedName) reconcile.Result {
 	GinkgoHelper()
 

@@ -26,6 +26,7 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // RedisConfig defines Redis server configuration
+// +kubebuilder:validation:XValidation:rule="has(self.storage) == has(oldSelf.storage)",message="redisConfig.storage is immutable: adding or removing it would change the StatefulSet volumeClaimTemplates, which Kubernetes forbids. Recreate the RedisSentinel instead."
 type RedisConfig struct {
 	// Replicas is the number of Redis replicas
 	// +kubebuilder:validation:Minimum=1
@@ -93,6 +94,7 @@ type SentinelConfig struct {
 }
 
 // StorageSpec defines persistent storage configuration
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="redisConfig.storage is immutable: a StatefulSet volumeClaimTemplate cannot be resized or moved to another storage class after creation. Resize the PersistentVolumeClaims directly, or recreate the RedisSentinel."
 type StorageSpec struct {
 	// Size is the storage size
 	// +kubebuilder:default="1Gi"

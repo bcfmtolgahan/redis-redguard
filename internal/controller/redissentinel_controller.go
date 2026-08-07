@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -804,37 +805,77 @@ func parseHostPort(addr string) (string, string) {
 	return parts[0], parts[1]
 }
 
-func (r *RedisSentinelReconciler) createOrUpdate(ctx context.Context, obj client.Object) error {
-	key := client.ObjectKeyFromObject(obj)
-	existing := obj.DeepCopyObject().(client.Object)
+// createOrUpdate creates desired or converges the live object towards it.
+// Every attempt re-reads the live object, so a lost optimistic-concurrency
+// race against another writer of the same object is retried here instead of
+// failing the whole reconcile pass.
+func (r *RedisSentinelReconciler) createOrUpdate(ctx context.Context, desired client.Object) error {
+	key := client.ObjectKeyFromObject(desired)
 
-	err := r.Get(ctx, key, existing)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// Create
-			return r.Create(ctx, obj)
+	return retry.OnError(retry.DefaultRetry, isRaceError, func() error {
+		existing := desired.DeepCopyObject().(client.Object)
+		if err := r.Get(ctx, key, existing); err != nil {
+			if errors.IsNotFound(err) {
+				// A fresh copy per attempt: Create stamps resourceVersion and
+				// UID onto the object it is given, which a retry would reject.
+				return r.Create(ctx, desired.DeepCopyObject().(client.Object))
+			}
+			return err
 		}
-		return err
-	}
 
-	// Update (preserve some fields like ClusterIP for Services)
-	switch obj := obj.(type) {
-	case *corev1.Service:
-		existingSvc := existing.(*corev1.Service)
-		obj.Spec.ClusterIP = existingSvc.Spec.ClusterIP
-		obj.ResourceVersion = existingSvc.ResourceVersion
+		merged, err := mergeForUpdate(existing, desired)
+		if err != nil {
+			return err
+		}
+		return r.Update(ctx, merged)
+	})
+}
+
+// isRaceError reports whether err is another writer winning: a stale
+// resourceVersion, or the object appearing between the Get and the Create.
+func isRaceError(err error) bool {
+	return errors.IsConflict(err) || errors.IsAlreadyExists(err)
+}
+
+// mergeForUpdate applies the desired state onto the live object, restricted to
+// the fields the API server allows an update to change. A StatefulSet rejects
+// any spec change outside replicas, ordinals, template, updateStrategy,
+// persistentVolumeClaimRetentionPolicy and minReadySeconds, so PUTting a full
+// desired spec whose volumeClaimTemplates or selector drifted from what is
+// running wedges every later reconcile of that CR, status included.
+func mergeForUpdate(existing, desired client.Object) (client.Object, error) {
+	merged := existing.DeepCopyObject().(client.Object)
+	merged.SetLabels(desired.GetLabels())
+	merged.SetAnnotations(desired.GetAnnotations())
+	merged.SetOwnerReferences(desired.GetOwnerReferences())
+
+	switch m := merged.(type) {
 	case *appsv1.StatefulSet:
-		existingSts := existing.(*appsv1.StatefulSet)
-		obj.ResourceVersion = existingSts.ResourceVersion
+		d := desired.(*appsv1.StatefulSet)
+		m.Spec.Replicas = d.Spec.Replicas
+		m.Spec.Ordinals = d.Spec.Ordinals
+		m.Spec.Template = d.Spec.Template
+		m.Spec.UpdateStrategy = d.Spec.UpdateStrategy
+		m.Spec.MinReadySeconds = d.Spec.MinReadySeconds
+		m.Spec.PersistentVolumeClaimRetentionPolicy = d.Spec.PersistentVolumeClaimRetentionPolicy
+	case *corev1.Service:
+		d := desired.(*corev1.Service)
+		clusterIP := m.Spec.ClusterIP
+		m.Spec = d.Spec
+		// Allocated by the API server on create and immutable afterwards.
+		m.Spec.ClusterIP = clusterIP
 	case *corev1.ConfigMap:
-		existingCm := existing.(*corev1.ConfigMap)
-		obj.ResourceVersion = existingCm.ResourceVersion
+		d := desired.(*corev1.ConfigMap)
+		m.Data = d.Data
+		m.BinaryData = d.BinaryData
 	case *networkingv1.NetworkPolicy:
-		existingNetPol := existing.(*networkingv1.NetworkPolicy)
-		obj.ResourceVersion = existingNetPol.ResourceVersion
+		d := desired.(*networkingv1.NetworkPolicy)
+		m.Spec = d.Spec
+	default:
+		return nil, fmt.Errorf("createOrUpdate does not know how to update %T", desired)
 	}
 
-	return r.Update(ctx, obj)
+	return merged, nil
 }
 
 func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1alpha1.RedisSentinel) {
