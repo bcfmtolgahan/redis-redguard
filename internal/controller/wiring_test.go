@@ -306,6 +306,29 @@ func TestEveryFactoryCallThreadsTLSConfig(t *testing.T) {
 	}
 }
 
+// TestFailoverHandlingRunsInReconcileNotBareGoroutine forbids fire-and-forget
+// goroutines in the controllers: work spawned outside the reconcile acts on a
+// topology snapshot that may be stale by the time it runs, a panic inside it
+// kills the operator process, and a shutdown truncates it midway.
+func TestFailoverHandlingRunsInReconcileNotBareGoroutine(t *testing.T) {
+	fset := token.NewFileSet()
+	for _, path := range packageSources(t) {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			g, ok := n.(*ast.GoStmt)
+			if !ok {
+				return true
+			}
+			t.Errorf("%s:%d starts a goroutine; do the work inline in the reconcile so it is bounded by the request context, survives no panic alone, and acts on freshly verified state",
+				path, fset.Position(g.Pos()).Line)
+			return true
+		})
+	}
+}
+
 // TestEveryCRDIsShipped guards against a generated CRD that no install path
 // applies, which leaves the matching kind unknown to the API server.
 func TestEveryCRDIsShipped(t *testing.T) {

@@ -18,6 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,11 +30,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	"github.com/redguard/redguard/internal/builder"
+	"github.com/redguard/redguard/internal/redisclient"
+	"github.com/redguard/redguard/internal/redisclient/fake"
 )
 
 var _ = Describe("RedisSentinel Controller", func() {
@@ -46,6 +54,7 @@ var _ = Describe("RedisSentinel Controller", func() {
 
 			redisHeadlessServiceName    = resourceName + "-redis-headless"
 			redisServiceName            = resourceName + "-redis"
+			redisReplicasServiceName    = resourceName + "-redis-replicas"
 			sentinelHeadlessServiceName = resourceName + "-sentinel-headless"
 			sentinelServiceName         = resourceName + "-sentinel"
 
@@ -126,6 +135,7 @@ var _ = Describe("RedisSentinel Controller", func() {
 			for _, name := range []string{
 				redisHeadlessServiceName,
 				redisServiceName,
+				redisReplicasServiceName,
 				sentinelHeadlessServiceName,
 				sentinelServiceName,
 			} {
@@ -223,9 +233,320 @@ var _ = Describe("RedisSentinel Controller", func() {
 	})
 })
 
+var _ = Describe("RedisSentinel master labeling", func() {
+	const resourceName = "labeling-rs"
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: "default"}
+	podIPs := []string{"10.244.9.10", "10.244.9.11", "10.244.9.12"}
+
+	var (
+		fakeFactory *fake.Factory
+		reconciler  *RedisSentinelReconciler
+		podNames    []string
+	)
+
+	BeforeEach(func() {
+		fakeFactory = fake.NewFactory()
+		reconciler = &RedisSentinelReconciler{
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: fakeFactory,
+		}
+
+		Expect(k8sClient.Create(ctx, newTestSentinel(resourceName, "default"))).To(Succeed())
+		reconcileUntilSettled(ctx, reconciler, key)
+
+		rs := &redisv1alpha1.RedisSentinel{}
+		Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+
+		// envtest runs no kubelet or StatefulSet controller, so the pods and
+		// the StatefulSet statuses that would exist in a live cluster are
+		// created by hand.
+		markStatefulSetReady(ctx, inDefault(resourceName+"-redis"), 3)
+		markStatefulSetReady(ctx, inDefault(resourceName+"-sentinel"), 3)
+
+		template := builder.BuildRedisStatefulSet(rs).Spec.Template
+		podNames = nil
+		for i, ip := range podIPs {
+			name := fmt.Sprintf("%s-redis-%d", resourceName, i)
+			createRunningPod(ctx, name, template.Labels, ip)
+			podNames = append(podNames, name)
+		}
+	})
+
+	AfterEach(func() {
+		for _, name := range podNames {
+			pod := &corev1.Pod{}
+			pod.Name, pod.Namespace = name, "default"
+			_ = k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))
+		}
+
+		rs := &redisv1alpha1.RedisSentinel{}
+		Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(errors.IsNotFound(k8sClient.Get(ctx, key, rs))).To(BeTrue())
+		}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+	})
+
+	It("stamps the master pod and moves the label after a failover", func() {
+		By("labeling the pod Sentinel reports as master")
+		fakeFactory.SetMaster(podIPs[0] + ":6379")
+		result := reconcileUntilSettled(ctx, reconciler, key)
+		expectMasterLabelOnlyOn(ctx, podNames, podNames[0])
+		Expect(result.RequeueAfter).To(Equal(30*time.Second),
+			"a labeled master needs no fast requeue")
+
+		By("moving the label when Sentinel promotes another pod")
+		fakeFactory.SetMaster(podIPs[1] + ":6379")
+		reconcileUntilSettled(ctx, reconciler, key)
+		expectMasterLabelOnlyOn(ctx, podNames, podNames[1])
+
+		rs := &redisv1alpha1.RedisSentinel{}
+		Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+		Expect(rs.Status.MasterNode).To(Equal(podIPs[1] + ":6379"))
+		Expect(rs.Status.LastFailoverTime).NotTo(BeNil(),
+			"the master change was not detected as a failover")
+	})
+
+	It("requeues fast while the reported master matches no running pod", func() {
+		// The state mid-failover: Sentinel still names the dead pod's IP. The
+		// label must not sit on the 30s periodic pass, or the write Service
+		// points nowhere for up to 30s after Sentinel has already promoted.
+		fakeFactory.SetMaster("10.255.0.99:6379")
+		result := reconcileUntilSettled(ctx, reconciler, key)
+
+		Expect(result.RequeueAfter).To(Equal(5*time.Second),
+			"an unresolvable master must be retried quickly, not on the periodic pass")
+		expectMasterLabelOnlyOn(ctx, podNames, "")
+	})
+
+	It("requeues fast while Sentinel cannot name a master", func() {
+		result := reconcileUntilSettled(ctx, reconciler, key)
+
+		Expect(result.RequeueAfter).To(Equal(5 * time.Second))
+		expectMasterLabelOnlyOn(ctx, podNames, "")
+	})
+})
+
+var _ = Describe("RedisSentinel failover handling", func() {
+	const resourceName = "failover-rs"
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: "default"}
+	podIPs := []string{"10.244.11.10", "10.244.11.11", "10.244.11.12"}
+
+	var (
+		fakeFactory *fake.Factory
+		factory     *flippingFactory
+		reconciler  *RedisSentinelReconciler
+		podNames    []string
+	)
+
+	BeforeEach(func() {
+		fakeFactory = fake.NewFactory()
+		factory = &flippingFactory{Factory: fakeFactory}
+		reconciler = &RedisSentinelReconciler{
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: factory,
+		}
+
+		Expect(k8sClient.Create(ctx, newTestSentinel(resourceName, "default"))).To(Succeed())
+		reconcileUntilSettled(ctx, reconciler, key)
+
+		rs := &redisv1alpha1.RedisSentinel{}
+		Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+
+		markStatefulSetReady(ctx, inDefault(resourceName+"-redis"), 3)
+		markStatefulSetReady(ctx, inDefault(resourceName+"-sentinel"), 3)
+
+		template := builder.BuildRedisStatefulSet(rs).Spec.Template
+		podNames = nil
+		for i, ip := range podIPs {
+			name := fmt.Sprintf("%s-redis-%d", resourceName, i)
+			createRunningPod(ctx, name, template.Labels, ip)
+			podNames = append(podNames, name)
+		}
+	})
+
+	AfterEach(func() {
+		for _, name := range podNames {
+			pod := &corev1.Pod{}
+			pod.Name, pod.Namespace = name, "default"
+			_ = k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))
+		}
+
+		rs := &redisv1alpha1.RedisSentinel{}
+		Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(errors.IsNotFound(k8sClient.Get(ctx, key, rs))).To(BeTrue())
+		}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+	})
+
+	It("abandons the reconfiguration when the master moves again mid-handling", func() {
+		By("establishing the initial master")
+		fakeFactory.SetMaster(podIPs[0] + ":6379")
+		reconcileUntilSettled(ctx, reconciler, key)
+		expectMasterLabelOnlyOn(ctx, podNames, podNames[0])
+
+		By("failing over to pod 1 with a second failover to pod 2 landing after detection")
+		var result reconcile.Result
+		Eventually(func() error {
+			// Re-armed on every attempt so a conflict retry sees the same
+			// sequence: detection answers pod 1, the re-check answers pod 2.
+			fakeFactory.SetMaster(podIPs[1] + ":6379")
+			factory.armFlip(podIPs[2] + ":6379")
+			var err error
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			return err
+		}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+
+		By("verifying no node was reconfigured from the stale snapshot")
+		Consistently(func() []string { return slaveOfCalls(fakeFactory) },
+			2*time.Second, 100*time.Millisecond).Should(BeEmpty(),
+			"a SLAVEOF issued mid-failover can demote the freshly promoted master")
+
+		Expect(result.RequeueAfter).To(Equal(failoverRequeue),
+			"an abandoned reconfiguration must be retried on the fast requeue")
+
+		By("converging on the final master on the next pass")
+		reconcileUntilSettled(ctx, reconciler, key)
+		expectMasterLabelOnlyOn(ctx, podNames, podNames[2])
+		Expect(slaveOfCalls(fakeFactory)).NotTo(ContainElement(podIPs[2]+":6379:SlaveOf"),
+			"the promoted master must never be demoted; that discards its acknowledged writes")
+	})
+
+	It("demotes the stale master inline once Sentinel confirms the promotion", func() {
+		By("establishing the initial master")
+		fakeFactory.SetMaster(podIPs[0] + ":6379")
+		reconcileUntilSettled(ctx, reconciler, key)
+
+		By("failing over to pod 1 and reconciling")
+		fakeFactory.SetMaster(podIPs[1] + ":6379")
+		reconcileUntilSettled(ctx, reconciler, key)
+
+		// Inline handling: the demotion is already recorded when Reconcile
+		// returns. Nothing here waits on a goroutine.
+		calls := slaveOfCalls(fakeFactory)
+		Expect(calls).NotTo(BeEmpty(),
+			"the stale master was never told to follow the promoted one")
+		Expect(calls).To(HaveEach(Equal(podIPs[0]+":6379:SlaveOf")),
+			"only the stale master may be reconfigured after a confirmed failover")
+		expectMasterLabelOnlyOn(ctx, podNames, podNames[1])
+	})
+})
+
+// flippingFactory wraps the fake factory and moves the master to the armed
+// address right after the next GetMasterAddrFromPool answer, reproducing a
+// second failover landing between detection and reconfiguration.
+type flippingFactory struct {
+	*fake.Factory
+	mu     sync.Mutex
+	flipTo string
+}
+
+func (f *flippingFactory) armFlip(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flipTo = addr
+}
+
+func (f *flippingFactory) NewSentinelPool(addrs []string, password string, tlsConfig *tls.Config) redisclient.Sentinel {
+	return &flippingPool{Sentinel: f.Factory.NewSentinelPool(addrs, password, tlsConfig), f: f}
+}
+
+type flippingPool struct {
+	redisclient.Sentinel
+	f *flippingFactory
+}
+
+func (p *flippingPool) GetMasterAddrFromPool(ctx context.Context, masterName string) (string, error) {
+	addr, err := p.Sentinel.GetMasterAddrFromPool(ctx, masterName)
+	p.f.mu.Lock()
+	to := p.f.flipTo
+	p.f.flipTo = ""
+	p.f.mu.Unlock()
+	if to != "" {
+		p.f.Factory.SetMaster(to)
+	}
+	return addr, err
+}
+
+// slaveOfCalls filters the factory call log down to SlaveOf entries.
+func slaveOfCalls(f *fake.Factory) []string {
+	var out []string
+	for _, c := range f.Calls() {
+		if strings.HasSuffix(c, ":SlaveOf") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // inDefault builds a key in the namespace the sentinel specs use.
 func inDefault(name string) types.NamespacedName {
 	return types.NamespacedName{Name: name, Namespace: "default"}
+}
+
+// markStatefulSetReady fakes the status a StatefulSet controller would report
+// for a fully available StatefulSet.
+func markStatefulSetReady(ctx context.Context, key types.NamespacedName, replicas int32) {
+	GinkgoHelper()
+
+	Eventually(func(g Gomega) {
+		sts := &appsv1.StatefulSet{}
+		g.Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+		sts.Status.ObservedGeneration = sts.Generation
+		sts.Status.Replicas = replicas
+		sts.Status.ReadyReplicas = replicas
+		sts.Status.AvailableReplicas = replicas
+		g.Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+	}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+}
+
+// createRunningPod creates a pod carrying the given labels and forces its
+// status to Running with the given IP, standing in for a kubelet.
+func createRunningPod(ctx context.Context, name string, labels map[string]string, ip string) {
+	GinkgoHelper()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "redis", Image: "redis:7-alpine"}},
+		},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIP = ip
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// expectMasterLabelOnlyOn asserts exactly one pod (or none, for master == "")
+// carries the master role label.
+func expectMasterLabelOnlyOn(ctx context.Context, podNames []string, master string) {
+	GinkgoHelper()
+
+	for _, name := range podNames {
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, inDefault(name), pod)).To(Succeed())
+		if name == master {
+			Expect(pod.Labels).To(HaveKeyWithValue(builder.RoleLabelKey, builder.RoleMaster),
+				"%s is the master but does not carry the role label; the write Service has no endpoints", name)
+		} else {
+			Expect(pod.Labels).NotTo(HaveKey(builder.RoleLabelKey),
+				"%s is not the master but still carries the role label; writes would reach a replica", name)
+		}
+	}
 }
 
 // reconcileUntilSettled drives a spec-owned reconciler until it returns without

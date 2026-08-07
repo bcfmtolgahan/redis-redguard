@@ -78,12 +78,24 @@ func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 const (
 	finalizerName = "redis.redguard.io/finalizer"
+
+	// steadyRequeue paces the periodic health pass. failoverRequeue is used
+	// while Sentinel and the write Service disagree on the master, so the
+	// role label follows a promotion within seconds instead of waiting for
+	// the periodic pass.
+	steadyRequeue   = 30 * time.Second
+	failoverRequeue = 5 * time.Second
+
+	// failoverHandleTimeout bounds the inline post-failover reconfiguration
+	// so one unreachable node cannot stall the reconcile worker; unfinished
+	// work is retried on the fast requeue.
+	failoverHandleTimeout = 15 * time.Second
 )
 
 // Reconcile reconciles a RedisSentinel object
@@ -150,7 +162,8 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Update status
-	if err := r.updateStatus(ctx, rs); err != nil {
+	writeReady, err := r.updateStatus(ctx, rs)
+	if err != nil {
 		logger.Error(err, "Failed to update status")
 		return ctrl.Result{}, err
 	}
@@ -158,8 +171,10 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Update Prometheus metrics
 	r.updateMetrics(ctx, rs)
 
-	// Requeue after 30 seconds to check for failovers
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	if !writeReady {
+		return ctrl.Result{RequeueAfter: failoverRequeue}, nil
+	}
+	return ctrl.Result{RequeueAfter: steadyRequeue}, nil
 }
 
 func (r *RedisSentinelReconciler) handleDeletion(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
@@ -238,6 +253,7 @@ func (r *RedisSentinelReconciler) reconcileServices(ctx context.Context, rs *red
 	services := []*corev1.Service{
 		builder.BuildRedisHeadlessService(rs),
 		builder.BuildRedisService(rs),
+		builder.BuildRedisReplicasService(rs),
 		builder.BuildSentinelHeadlessService(rs),
 		builder.BuildSentinelService(rs),
 	}
@@ -309,7 +325,11 @@ func (r *RedisSentinelReconciler) reconcileNetworkPolicies(ctx context.Context, 
 	return nil
 }
 
-func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
+// updateStatus refreshes the status subresource and maintains the master role
+// label. The returned bool reports whether a running pod currently backs the
+// write Service; false asks the caller for a fast requeue so the label chases
+// an in-flight failover instead of waiting for the periodic pass.
+func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	// Get Redis StatefulSet
@@ -319,9 +339,9 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 		Namespace: rs.Namespace,
 	}, redisStatefulSet); err != nil {
 		if errors.IsNotFound(err) {
-			return nil // Not created yet
+			return true, nil // Not created yet
 		}
-		return err
+		return false, err
 	}
 
 	// Get Sentinel StatefulSet
@@ -331,9 +351,9 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 		Namespace: rs.Namespace,
 	}, sentinelStatefulSet); err != nil {
 		if errors.IsNotFound(err) {
-			return nil // Not created yet
+			return true, nil // Not created yet
 		}
-		return err
+		return false, err
 	}
 
 	// Update status
@@ -358,15 +378,20 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	adminPassword := r.getAdminPassword(ctx, rs)
 	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
 	if err != nil {
-		return fmt.Errorf("resolve client TLS config: %w", err)
+		return false, fmt.Errorf("resolve client TLS config: %w", err)
 	}
 
-	// Try to get current master from Sentinel
+	// Try to get current master from Sentinel. Before any sentinel is ready
+	// there is no master to label; the StatefulSet watch fires when that
+	// changes, so no fast requeue is requested for that state.
+	writeReady := true
 	if sentinelStatefulSet.Status.ReadyReplicas > 0 {
 		masterNode, err := r.getCurrentMaster(ctx, rs, adminPassword, tlsCfg)
 		if err != nil {
 			logger.Info("Could not determine master node", "error", err)
+			writeReady = false
 		} else {
+			failoverSettled := true
 			if rs.Status.MasterNode != "" && rs.Status.MasterNode != masterNode {
 				// Failover detected
 				logger.Info("Failover detected", "old", rs.Status.MasterNode, "new", masterNode)
@@ -376,10 +401,28 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 				rs.Status.LastFailoverTime = &now
 				custmetrics.RedisFailoverTotal.WithLabelValues(rs.Namespace, rs.Name).Inc()
 
-				// Handle failover - reconfigure old master and verify replicas
-				go r.handleFailover(ctx, rs, rs.Status.MasterNode, masterNode, adminPassword, tlsCfg)
+				// Reconfiguration runs inline, never in a goroutine: a
+				// detached handler acts on a snapshot that another failover
+				// can invalidate, dies with the operator mid-write, and a
+				// panic inside it would take down the whole process.
+				handleCtx, cancel := context.WithTimeout(ctx, failoverHandleTimeout)
+				failoverSettled = r.handleFailover(handleCtx, rs, rs.Status.MasterNode, masterNode, adminPassword, tlsCfg)
+				cancel()
 			}
 			rs.Status.MasterNode = masterNode
+
+			labeled, err := r.reconcileMasterLabel(ctx, rs, masterNode)
+			if err != nil {
+				// Label errors are retried on the fast requeue rather than
+				// failing the pass: the status update below must still land.
+				logger.Error(err, "Failed to reconcile the master role label")
+				writeReady = false
+			} else {
+				writeReady = labeled
+			}
+			if !failoverSettled {
+				writeReady = false
+			}
 		}
 	}
 
@@ -459,11 +502,71 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	rs.Status.Conditions = conditions
 
 	if err := r.Status().Update(ctx, rs); err != nil {
-		return err
+		return false, err
 	}
 
 	logger.Info("Updated status", "phase", rs.Status.Phase, "master", rs.Status.MasterNode)
-	return nil
+	return writeReady, nil
+}
+
+// reconcileMasterLabel stamps the role label on the pod Sentinel reports as
+// master and strips it from every other Redis pod, so the write Service
+// endpoints follow a failover. Returns whether a running pod carries the
+// label. While the operator is down the label cannot move, so the write
+// Service keeps selecting the demoted pod until the next reconcile; only a
+// controller can make a Service track a Sentinel promotion.
+func (r *RedisSentinelReconciler) reconcileMasterLabel(ctx context.Context, rs *redisv1alpha1.RedisSentinel, masterAddr string) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	masterIP, _ := parseHostPort(masterAddr)
+	if masterIP == "" {
+		return false, nil
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/component": "redis",
+		"app.kubernetes.io/instance":  rs.Name,
+	}); err != nil {
+		return false, err
+	}
+
+	labeled := false
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+
+		// A terminating or non-running pod gets no label even when Sentinel
+		// still names its IP: its endpoints are gone anyway, and holding the
+		// label would delay the fast requeue that chases the promotion.
+		isMaster := pod.Status.PodIP == masterIP &&
+			pod.Status.Phase == corev1.PodRunning &&
+			pod.DeletionTimestamp.IsZero()
+		hasLabel := pod.Labels[builder.RoleLabelKey] == builder.RoleMaster
+
+		if isMaster {
+			labeled = true
+		}
+		if isMaster == hasLabel {
+			continue
+		}
+
+		patch := client.MergeFrom(pod.DeepCopy())
+		if isMaster {
+			if pod.Labels == nil {
+				pod.Labels = map[string]string{}
+			}
+			pod.Labels[builder.RoleLabelKey] = builder.RoleMaster
+			logger.Info("Labeling pod as master", "pod", pod.Name, "ip", masterIP)
+		} else {
+			delete(pod.Labels, builder.RoleLabelKey)
+			logger.Info("Removing master label", "pod", pod.Name)
+		}
+		if err := r.Patch(ctx, pod, patch); err != nil {
+			return false, err
+		}
+	}
+
+	return labeled, nil
 }
 
 func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (string, error) {
@@ -503,10 +606,13 @@ func (r *RedisSentinelReconciler) getAdminPassword(ctx context.Context, rs *redi
 	return string(secret.Data["password"])
 }
 
-// handleFailover handles post-failover actions to ensure cluster consistency.
-// Credentials and TLS settings come from the caller so the goroutine never
-// re-reads secrets.
-func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv1alpha1.RedisSentinel, oldMaster, newMaster, adminPassword string, tlsCfg *tls.Config) {
+// handleFailover reconfigures replication after a detected master change and
+// reports whether the work completed against a confirmed-stable master; false
+// asks the caller for a fast requeue. The newMaster snapshot can already be
+// stale by the time this runs, so Sentinel is re-queried before any SLAVEOF:
+// demoting from an outdated address hits the freshly promoted master and
+// discards its acknowledged writes.
+func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv1alpha1.RedisSentinel, oldMaster, newMaster, adminPassword string, tlsCfg *tls.Config) bool {
 	logger := log.FromContext(ctx)
 	logger.Info("Handling failover", "oldMaster", oldMaster, "newMaster", newMaster)
 
@@ -517,7 +623,7 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 		logger.Error(err, "Failed to check quorum health, aborting failover handling")
 		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverAborted",
 			"Cannot verify sentinel quorum, failover handling aborted for safety")
-		return
+		return false
 	}
 
 	if !quorumHealthy {
@@ -525,16 +631,35 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 			"quorumStatus", quorumMsg)
 		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverAborted",
 			fmt.Sprintf("Sentinel quorum not healthy: %s", quorumMsg))
-		return
+		return false
 	}
 
 	logger.Info("Quorum verified healthy, proceeding with failover handling", "quorumStatus", quorumMsg)
+
+	// A different answer than the one that triggered this handling means
+	// another failover completed (or is running) since detection. The cluster
+	// is Sentinel's to converge; reconfiguring anyone from the stale snapshot
+	// could demote the legitimate master.
+	currentMaster, err := r.getCurrentMaster(ctx, rs, adminPassword, tlsCfg)
+	if err != nil {
+		logger.Error(err, "Cannot re-verify the master before reconfiguration, aborting failover handling")
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverAborted",
+			"Cannot re-verify the current master with Sentinel, failover handling aborted for safety")
+		return false
+	}
+	if currentMaster != newMaster {
+		logger.Info("Master changed again since detection, abandoning reconfiguration",
+			"detected", newMaster, "current", currentMaster)
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverSuperseded",
+			fmt.Sprintf("Master moved from %s to %s during handling; deferring to Sentinel", newMaster, currentMaster))
+		return false
+	}
 
 	// Parse new master address (format: IP:port)
 	newMasterIP, newMasterPort := parseHostPort(newMaster)
 	if newMasterIP == "" {
 		logger.Error(nil, "Failed to parse new master address", "address", newMaster)
-		return
+		return false
 	}
 
 	// Try to reconfigure old master as replica of new master
@@ -566,7 +691,9 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 	// Ensure all other replicas are pointing to the new master
 	if err := r.ensureReplicasFollowMaster(ctx, rs, newMasterIP, newMasterPort, adminPassword, tlsCfg); err != nil {
 		logger.Error(err, "Failed to ensure all replicas follow new master")
+		return false
 	}
+	return true
 }
 
 // ensureReplicasFollowMaster verifies and corrects replication configuration for all replicas
