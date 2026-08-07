@@ -45,6 +45,8 @@ type Sentinel interface {
 	GetMasterFromPool(ctx context.Context, masterName string) (*sentinel.MasterInfo, error)
 	CheckQuorumFromPool(ctx context.Context, masterName string) (bool, int, error)
 	SetMasterOptionAll(ctx context.Context, masterName, option, value string) error
+	FailoverFromPool(ctx context.Context, masterName string) error
+	ResetMasterAll(ctx context.Context, masterName string) error
 }
 
 // Factory constructs protocol clients. A nil tlsConfig selects the plaintext

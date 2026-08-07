@@ -87,6 +87,48 @@ func managedContainerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
+// applyPlacement writes one component's scheduling rules onto its pod spec.
+// Redis and Sentinel read their own block: they are scheduled independently,
+// and a node pool sized for Redis is rarely where the Sentinels belong.
+func applyPlacement(spec *corev1.PodSpec, p redisv1alpha1.Placement, labels map[string]string) {
+	spec.NodeSelector = p.NodeSelector
+	spec.Tolerations = p.Tolerations
+	spec.TopologySpreadConstraints = p.TopologySpreadConstraints
+	spec.PriorityClassName = p.PriorityClassName
+	spec.Affinity = affinityWithDefaultSpread(p.Affinity, labels)
+}
+
+// affinityWithDefaultSpread supplies anti-affinity when the spec sets none.
+// Without it the scheduler is free to place every Redis pod and every Sentinel
+// on one node, so a single node failure ends the cluster.
+//
+// The default is preferred rather than required: a required term leaves two of
+// three pods Pending forever on a single-node cluster, which is where the
+// operator is first run. A cluster that must not co-locate sets its own
+// required term; podAntiAffinity: {} opts out of spreading altogether.
+func affinityWithDefaultSpread(affinity *corev1.Affinity, labels map[string]string) *corev1.Affinity {
+	if affinity != nil && affinity.PodAntiAffinity != nil {
+		return affinity
+	}
+
+	out := &corev1.Affinity{}
+	if affinity != nil {
+		out = affinity.DeepCopy()
+	}
+	out.PodAntiAffinity = &corev1.PodAntiAffinity{
+		PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+			Weight: 100,
+			PodAffinityTerm: corev1.PodAffinityTerm{
+				// Only this CR's own component: repelling another cluster's
+				// pods would spread the two against each other for no reason.
+				LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+				TopologyKey:   "kubernetes.io/hostname",
+			},
+		}},
+	}
+	return out
+}
+
 // tmpVolume backs /tmp, the one writable path outside /data that busybox and
 // redis-cli can fall back to once the root filesystem is read-only.
 func tmpVolume() corev1.Volume {
@@ -300,6 +342,8 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 		},
 	}
 
+	applyPlacement(&sts.Spec.Template.Spec, rs.Spec.RedisConfig.Placement, labels)
+
 	// Add storage class if specified
 	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != "" {
 		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = &rs.Spec.RedisConfig.Storage.StorageClassName
@@ -510,6 +554,8 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 			},
 		},
 	}
+
+	applyPlacement(&sts.Spec.Template.Spec, rs.Spec.SentinelConfig.Placement, labels)
 
 	// The state is one small file; only the storage class follows Redis.
 	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != "" {

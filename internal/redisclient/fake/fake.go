@@ -32,6 +32,11 @@ type Factory struct {
 	masterOptions map[string]string
 	errs          map[string]error
 	calls         []string
+	failovers     []string
+	resets        []string
+	// knownSentinels overrides the peer count the pool reports. Zero means
+	// derive it from the pool size, which is a set that agrees with itself.
+	knownSentinels int
 }
 
 // node is the state of one fake Redis instance, keyed by dial address.
@@ -133,6 +138,31 @@ func (f *Factory) Configs(addr string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// Failovers returns the master names a forced failover was requested for, in
+// order.
+func (f *Factory) Failovers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.failovers...)
+}
+
+// SetKnownSentinels declares how many sentinels the pool reports as monitoring
+// the master, itself included. A count above the number of pods that exist is
+// what a scale-down leaves behind: the survivors keep the removed peers until
+// a SENTINEL RESET.
+func (f *Factory) SetKnownSentinels(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.knownSentinels = n
+}
+
+// Resets returns the master names SENTINEL RESET was issued for, in order.
+func (f *Factory) Resets() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.resets...)
 }
 
 // MasterOptions returns the last value written per option through
@@ -467,15 +497,33 @@ func (p *pool) GetMasterFromPool(ctx context.Context, masterName string) (*senti
 			slaves++
 		}
 	}
+	others := max(len(p.addrs)-1, 0)
+	if p.f.knownSentinels > 0 {
+		others = p.f.knownSentinels - 1
+	}
 	return &sentinel.MasterInfo{
 		Name:              masterName,
 		IP:                host,
 		Port:              port,
 		Flags:             "master",
 		NumSlaves:         strconv.Itoa(slaves),
-		NumOtherSentinels: strconv.Itoa(max(len(p.addrs)-1, 0)),
+		NumOtherSentinels: strconv.Itoa(others),
 		Quorum:            "2",
 	}, nil
+}
+
+// ResetMasterAll records the call. The real command makes every sentinel forget
+// the master's replicas and peers and rediscover them, which no in-memory state
+// here can usefully model.
+func (p *pool) ResetMasterAll(ctx context.Context, masterName string) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.f.record(p.key(), "ResetMasterAll")
+	if err := p.f.errorFor(p.key(), "ResetMasterAll"); err != nil {
+		return err
+	}
+	p.f.resets = append(p.f.resets, masterName)
+	return nil
 }
 
 func (p *pool) CheckQuorumFromPool(ctx context.Context, masterName string) (bool, int, error) {
@@ -483,6 +531,21 @@ func (p *pool) CheckQuorumFromPool(ctx context.Context, masterName string) (bool
 	defer p.f.mu.Unlock()
 	p.f.record(p.key(), "CheckQuorumFromPool")
 	return true, len(p.addrs), nil
+}
+
+// FailoverFromPool records the request but does not move the master. Which
+// replica a real Sentinel promotes is its own decision and takes seconds, so a
+// test drives the outcome with SetMaster and can assert on the state in
+// between: the request made and the promotion not yet done.
+func (p *pool) FailoverFromPool(ctx context.Context, masterName string) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.f.record(p.key(), "FailoverFromPool")
+	if err := p.f.errorFor(p.key(), "FailoverFromPool"); err != nil {
+		return err
+	}
+	p.f.failovers = append(p.f.failovers, masterName)
+	return nil
 }
 
 func (p *pool) SetMasterOptionAll(ctx context.Context, masterName, option, value string) error {

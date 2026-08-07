@@ -462,6 +462,158 @@ var _ = Describe("Redguard", Ordered, func() {
 		}, 5*time.Minute, 5*time.Second).Should(Succeed())
 	})
 
+	// A single-node kind cluster is the check that matters: a required
+	// anti-affinity would leave two of three pods Pending forever, and every
+	// spec above would have failed instead of reaching here.
+	It("spreads each component with a preference one node can still satisfy", func() {
+		for _, component := range []string{"redis", "sentinel"} {
+			affinity, err := podTemplateAffinity(clusterNamespace, sentinelName+"-"+component)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(affinity).NotTo(BeEmpty(),
+				"%s pods carry no affinity, so the scheduler may stack them on one node", component)
+
+			var parsed struct {
+				PodAntiAffinity struct {
+					Preferred []struct {
+						PodAffinityTerm struct {
+							TopologyKey   string `json:"topologyKey"`
+							LabelSelector struct {
+								MatchLabels map[string]string `json:"matchLabels"`
+							} `json:"labelSelector"`
+						} `json:"podAffinityTerm"`
+					} `json:"preferredDuringSchedulingIgnoredDuringExecution"`
+					Required []any `json:"requiredDuringSchedulingIgnoredDuringExecution"`
+				} `json:"podAntiAffinity"`
+			}
+			Expect(json.Unmarshal([]byte(affinity), &parsed)).To(Succeed())
+
+			Expect(parsed.PodAntiAffinity.Required).To(BeEmpty(),
+				"%s anti-affinity is required, which this single-node cluster cannot satisfy", component)
+			Expect(parsed.PodAntiAffinity.Preferred).To(HaveLen(1))
+			term := parsed.PodAntiAffinity.Preferred[0].PodAffinityTerm
+			Expect(term.TopologyKey).To(Equal("kubernetes.io/hostname"))
+			Expect(term.LabelSelector.MatchLabels).To(HaveKeyWithValue("app.kubernetes.io/component", component))
+			Expect(term.LabelSelector.MatchLabels).To(HaveKeyWithValue("app.kubernetes.io/instance", sentinelName))
+		}
+
+		pods, err := listPods(clusterNamespace, redisSelector)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(readyPods(pods)).To(HaveLen(3),
+			"the anti-affinity left pods unscheduled on a single node: %v", pods)
+	})
+
+	It("refuses to let a drain take a second Redis pod", func() {
+		By("waiting for the budget to report a full allowance")
+		Eventually(func(g Gomega) {
+			allowed, err := allowedDisruptions(clusterNamespace, sentinelName+"-redis-pdb")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(allowed).To(Equal(1), "the budget does not allow the one disruption a drain needs")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		pods, err := listPods(clusterNamespace, redisSelector)
+		Expect(err).NotTo(HaveOccurred())
+		ready := readyPods(pods)
+		Expect(ready).To(HaveLen(3), "pods: %v", pods)
+
+		By("evicting one pod, which a drain is allowed to do")
+		_, err = evictPod(clusterNamespace, ready[2].Name)
+		Expect(err).NotTo(HaveOccurred(), "the first eviction was refused, so no node could ever be drained")
+
+		By("evicting a second pod, which would leave one data node behind")
+		_, err = evictPod(clusterNamespace, ready[1].Name)
+		Expect(err).To(HaveOccurred(),
+			"the eviction API took a second Redis pod; a node drain would take all three at once")
+		Expect(err.Error()).To(ContainSubstring("disruption budget"),
+			"the second eviction failed for a reason other than the budget: %v", err)
+
+		By("checking the Sentinel pods are budgeted too")
+		Eventually(func(g Gomega) {
+			allowed, err := allowedDisruptions(clusterNamespace, sentinelName+"-sentinel-pdb")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(allowed).To(Equal(1),
+				"without a budget a drain evicts every Sentinel at once and no failover can be elected")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for the cluster to come back to three synced pods")
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(states).To(HaveLen(3), "not all pods are back: %v", states)
+			masters, replicas := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "exactly one master expected: %v", states)
+			for _, replica := range replicas {
+				g.Expect(replica.MasterLinkStatus).To(Equal("up"), "replica did not resync: %s", replica)
+				g.Expect(replica.MasterHost).To(Equal(masters[0].IP), "replica follows a stale master: %s", replica)
+			}
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	// Scaling down removes the highest ordinals. Deleting the master among them
+	// leaves the write Service without endpoints until Sentinel has noticed and
+	// promoted; the operator promotes first instead.
+	It("moves the master off an ordinal before scaling it away", func() {
+		By("putting the master on the highest ordinal")
+		highest := sentinelName + "-redis-2"
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			masters, _ := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "no single master: %v", states)
+			if masters[0].Pod == highest {
+				return
+			}
+			_, err = redisCLI(clusterNamespace, sentinelName+"-sentinel-0", "-p", "26379",
+				"SENTINEL", "FAILOVER", sentinelName+"-master")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(masters[0].Pod).To(Equal(highest), "master is still %s", masters[0].Pod)
+		}, 5*time.Minute, 15*time.Second).Should(Succeed())
+
+		By("asking for two replicas while the master sits on ordinal 2")
+		_, err := kubectl("patch", "redissentinel", sentinelName, "-n", clusterNamespace, "--type=merge",
+			"-p", `{"spec":{"redisConfig":{"replicas":2}}}`)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the operator to promote a surviving ordinal and then shrink")
+		Eventually(func(g Gomega) {
+			replicas, err := statefulSetReplicas(clusterNamespace, sentinelName+"-redis")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(replicas).To(Equal(2), "the StatefulSet was never scaled down")
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		events, err := warningEvents(clusterNamespace, "ScaleDownDeferred")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(events).To(ContainSubstring("Warning"),
+			"the scale-down never waited: the master's ordinal was deleted while it was still master")
+		Expect(events).To(ContainSubstring("is master"))
+
+		By("checking the surviving pods form a healthy cluster")
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(states).To(HaveLen(2), "unexpected pod count after the scale-down: %v", states)
+			masters, replicas := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "the scale-down left no master: %v", states)
+			g.Expect(masters[0].Pod).NotTo(Equal(highest), "the removed ordinal is still reported as master")
+			g.Expect(replicas).To(HaveLen(1))
+			g.Expect(replicas[0].MasterLinkStatus).To(Equal("up"), "replica lost its link: %s", replicas[0])
+
+			writeIPs, err := serviceEndpointIPs(clusterNamespace, sentinelName+"-redis")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(writeIPs).To(ConsistOf(masters[0].IP),
+				"the write Service does not point at the surviving master")
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("restoring three replicas")
+		_, err = kubectl("patch", "redissentinel", sentinelName, "-n", clusterNamespace, "--type=merge",
+			"-p", `{"spec":{"redisConfig":{"replicas":3}}}`)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func(g Gomega) {
+			pods, err := listPods(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(readyPods(pods)).To(HaveLen(3), "pods: %v", pods)
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
 	// The startup check in the first spec only covers the watches the manager
 	// opens before it has reconciled anything. Every permission the operator
 	// needs to build, watch and repair a cluster is only exercised by the specs

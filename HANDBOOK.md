@@ -674,20 +674,42 @@ spec:
 
 ### High Availability
 
-Spread pods across nodes/zones:
+Each component is spread across nodes by default with a preferred pod
+anti-affinity, so no configuration is needed to avoid stacking a cluster on one
+node. The preference degrades to co-location on a cluster with fewer nodes than
+replicas rather than leaving pods unschedulable.
+
+To require separate nodes instead, set `affinity` on either component. Setting
+it replaces the default only for `podAntiAffinity`; `nodeAffinity` alone leaves
+the default spreading in place.
 
 ```yaml
 spec:
   redisConfig:
-    podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          labelSelector:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
             matchLabels:
-              app: redis
+              app.kubernetes.io/instance: redis-cluster
+              app.kubernetes.io/component: redis
           topologyKey: kubernetes.io/hostname
+  sentinelConfig:
+    topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/instance: redis-cluster
+          app.kubernetes.io/component: sentinel
 ```
+
+`nodeSelector`, `tolerations` and `priorityClassName` are available on both
+`redisConfig` and `sentinelConfig` and are applied to that component only.
+
+The operator also creates one PodDisruptionBudget per component with
+`maxUnavailable: 1`, so a node drain cannot evict a whole component at once.
 
 ### Security
 

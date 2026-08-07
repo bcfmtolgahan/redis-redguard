@@ -20,12 +20,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,6 +87,7 @@ func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 const (
 	finalizerName = "redis.redguard.io/finalizer"
@@ -159,7 +162,14 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcileStatefulSets(ctx, rs); err != nil {
+	if err := r.reconcilePodDisruptionBudgets(ctx, rs); err != nil {
+		logger.Error(err, "Failed to reconcile PodDisruptionBudgets")
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "PodDisruptionBudgetReconcileFailed", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	scaleDownDeferred, err := r.reconcileStatefulSets(ctx, rs)
+	if err != nil {
 		logger.Error(err, "Failed to reconcile StatefulSets")
 		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "StatefulSetReconcileFailed", err.Error())
 		return ctrl.Result{}, err
@@ -175,7 +185,7 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Update Prometheus metrics
 	r.updateMetrics(ctx, rs)
 
-	if !writeReady {
+	if !writeReady || scaleDownDeferred {
 		return ctrl.Result{RequeueAfter: failoverRequeue}, nil
 	}
 	return ctrl.Result{RequeueAfter: steadyRequeue}, nil
@@ -275,25 +285,29 @@ func (r *RedisSentinelReconciler) reconcileServices(ctx context.Context, rs *red
 	return nil
 }
 
-func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
+// reconcileStatefulSets converges both StatefulSets. The bool reports that a
+// Redis scale-down was held back because the master would have been deleted;
+// the caller retries on the fast requeue until the promotion has happened.
+func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	authVersion, err := r.authSecretVersion(ctx, rs)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Redis StatefulSet
 	redisStatefulSet := builder.BuildRedisStatefulSet(rs)
 	stampAuthSecretVersion(redisStatefulSet, authVersion)
 	if err := controllerutil.SetControllerReference(rs, redisStatefulSet, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
+	scaleDownDeferred := r.holdScaleDownUntilMasterMoves(ctx, rs, redisStatefulSet)
 	r.warnOnRollout(ctx, rs, redisStatefulSet,
 		"Redis pods restart in descending ordinal order to apply the new configuration; "+
 			"Sentinel promotes a replica when the master restarts")
 	if err := r.createOrUpdate(ctx, redisStatefulSet); err != nil {
-		return fmt.Errorf("failed to reconcile Redis StatefulSet: %w", err)
+		return false, fmt.Errorf("failed to reconcile Redis StatefulSet: %w", err)
 	}
 	logger.Info("Reconciled Redis StatefulSet", "name", redisStatefulSet.Name)
 
@@ -301,18 +315,250 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 	sentinelStatefulSet := builder.BuildSentinelStatefulSet(rs)
 	stampAuthSecretVersion(sentinelStatefulSet, authVersion)
 	if err := controllerutil.SetControllerReference(rs, sentinelStatefulSet, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
+	r.warnOnSentinelScaleDown(ctx, rs, sentinelStatefulSet)
 	r.warnOnRollout(ctx, rs, sentinelStatefulSet,
 		"Sentinel pods restart one at a time to apply the new configuration; "+
 			"learned state on the volume is kept, so the monitor parameters of an "+
 			"already-seeded sentinel do not change")
 	if err := r.createOrUpdate(ctx, sentinelStatefulSet); err != nil {
-		return fmt.Errorf("failed to reconcile Sentinel StatefulSet: %w", err)
+		return false, fmt.Errorf("failed to reconcile Sentinel StatefulSet: %w", err)
 	}
 	logger.Info("Reconciled Sentinel StatefulSet", "name", sentinelStatefulSet.Name)
 
+	return scaleDownDeferred, nil
+}
+
+func (r *RedisSentinelReconciler) reconcilePodDisruptionBudgets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
+	logger := log.FromContext(ctx)
+
+	budgets := []*policyv1.PodDisruptionBudget{
+		builder.BuildRedisPodDisruptionBudget(rs),
+		builder.BuildSentinelPodDisruptionBudget(rs),
+	}
+
+	for _, pdb := range budgets {
+		if err := controllerutil.SetControllerReference(rs, pdb, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.createOrUpdate(ctx, pdb); err != nil {
+			return fmt.Errorf("failed to reconcile PodDisruptionBudget %s: %w", pdb.Name, err)
+		}
+		logger.Info("Reconciled PodDisruptionBudget", "name", pdb.Name)
+	}
+
 	return nil
+}
+
+// holdScaleDownUntilMasterMoves keeps the Redis StatefulSet at its current size
+// while the master occupies an ordinal the scale-down would delete, and asks
+// Sentinel to promote a replica that survives. Reports whether the scale-down
+// was held.
+//
+// Deleting the master pod outright works -- Sentinel notices and promotes --
+// but only after down-after-milliseconds plus an election, during which the
+// write Service has no endpoints and the acknowledged writes that had not yet
+// reached a replica are gone with the pod. Forcing the promotion first turns
+// that into an ordinary, immediate failover of a healthy master.
+//
+// Sentinel chooses which replica to promote, so the new master may itself sit
+// on a doomed ordinal; the guard simply runs again. It cannot loop forever
+// against a healthy cluster, because a promotion updates status.lastFailoverTime
+// and no further failover is forced within one failover timeout of it.
+func (r *RedisSentinelReconciler) holdScaleDownUntilMasterMoves(ctx context.Context, rs *redisv1alpha1.RedisSentinel, desired *appsv1.StatefulSet) bool {
+	logger := log.FromContext(ctx)
+
+	existing := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
+		// Nothing is running yet, or the read failed and createOrUpdate is
+		// about to report it. Either way no pod is about to be deleted.
+		return false
+	}
+	if existing.Spec.Replicas == nil || *desired.Spec.Replicas >= *existing.Spec.Replicas {
+		return false
+	}
+
+	live := *existing.Spec.Replicas
+	target := *desired.Spec.Replicas
+
+	// Pin the live size for this pass. Everything else in the template still
+	// converges, so a config edit made in the same pass is not held up.
+	hold := func(reason string) bool {
+		desired.Spec.Replicas = &live
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "ScaleDownDeferred",
+			fmt.Sprintf("Holding %s at %d replicas instead of %d: %s", desired.Name, live, target, reason))
+		return true
+	}
+
+	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return hold(fmt.Sprintf("cannot resolve the client TLS config to ask Sentinel which pod is master: %v", err))
+	}
+
+	masterAddr, err := r.getCurrentMaster(ctx, rs, adminPassword, tlsCfg)
+	if err != nil {
+		return hold("no Sentinel could name the current master, so the ordinals being removed cannot be shown to exclude it")
+	}
+
+	masterOrdinal, ok := r.masterOrdinal(ctx, rs, masterAddr)
+	if !ok {
+		return hold(fmt.Sprintf("the master Sentinel reports (%s) matches no running Redis pod", masterAddr))
+	}
+	if masterOrdinal < target {
+		return false
+	}
+
+	if since := timeSinceLastFailover(rs); since >= 0 && since < failoverTimeoutOf(rs) {
+		return hold(fmt.Sprintf("ordinal %d is master and a failover is still settling", masterOrdinal))
+	}
+
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses(rs), adminPassword, tlsCfg)
+	if err := pool.FailoverFromPool(ctx, rs.Name+"-master"); err != nil {
+		logger.Error(err, "Failed to request a failover before scaling down", "masterOrdinal", masterOrdinal)
+		return hold(fmt.Sprintf("ordinal %d is master and Sentinel refused the failover that would move it: %v", masterOrdinal, err))
+	}
+
+	logger.Info("Requested a failover off an ordinal that is about to be removed",
+		"masterOrdinal", masterOrdinal, "target", target)
+	return hold(fmt.Sprintf("ordinal %d is master; Sentinel was asked to promote a replica that survives the scale-down", masterOrdinal))
+}
+
+// masterOrdinal resolves the address Sentinel reports to the ordinal of the
+// Redis pod serving it.
+func (r *RedisSentinelReconciler) masterOrdinal(ctx context.Context, rs *redisv1alpha1.RedisSentinel, masterAddr string) (int32, bool) {
+	masterIP, _ := parseHostPort(masterAddr)
+	if masterIP == "" {
+		return 0, false
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/component": "redis",
+		"app.kubernetes.io/instance":  rs.Name,
+	}); err != nil {
+		return 0, false
+	}
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.PodIP != masterIP || !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		return podOrdinal(pod.Name)
+	}
+	return 0, false
+}
+
+// podOrdinal reads the StatefulSet ordinal off a pod name. The ordinal decides
+// which pods a scale-down deletes: the highest ones, always.
+func podOrdinal(podName string) (int32, bool) {
+	i := strings.LastIndex(podName, "-")
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(podName[i+1:], 10, 32)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return int32(n), true
+}
+
+// timeSinceLastFailover returns how long ago the master last changed, or -1
+// when no failover has been observed for this CR.
+func timeSinceLastFailover(rs *redisv1alpha1.RedisSentinel) time.Duration {
+	if rs.Status.LastFailoverTime == nil {
+		return -1
+	}
+	return time.Since(rs.Status.LastFailoverTime.Time)
+}
+
+// failoverTimeoutOf is the window Sentinel itself uses before it will retry a
+// failover, and therefore the shortest interval at which forcing another one
+// could achieve anything.
+func failoverTimeoutOf(rs *redisv1alpha1.RedisSentinel) time.Duration {
+	if rs.Spec.SentinelConfig.FailoverTimeout <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(rs.Spec.SentinelConfig.FailoverTimeout) * time.Millisecond
+}
+
+// pruneRemovedSentinels makes the running sentinels forget peers that no longer
+// exist. A removed sentinel stays in every survivor's set, flagged s_down, for
+// as long as the survivor runs. Sentinel needs a majority of the set it knows
+// to elect the sentinel that performs a failover, so a set shrunk past that
+// majority reaches quorum, marks the master o_down, starts a failover and never
+// finishes it -- verified against real sentinels: five monitors scaled to two
+// left the master o_down for two minutes with no promotion, and a SENTINEL
+// RESET on the survivors completed the same failover within five seconds.
+//
+// The reset also discards the learned replica list, which is rediscovered from
+// the master within seconds, so it runs only when the peer count is provably
+// stale rather than on every pass.
+func (r *RedisSentinelReconciler) pruneRemovedSentinels(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) {
+	logger := log.FromContext(ctx)
+	masterName := rs.Name + "-master"
+
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses(rs), password, tlsCfg)
+	info, err := pool.GetMasterFromPool(ctx, masterName)
+	if err != nil {
+		logger.V(1).Info("Cannot read the sentinel peer count", "error", err)
+		return
+	}
+
+	others, err := strconv.Atoi(info.NumOtherSentinels)
+	if err != nil {
+		return
+	}
+	known := int32(others) + 1
+	if known <= rs.Spec.SentinelConfig.Replicas {
+		return
+	}
+
+	if err := pool.ResetMasterAll(ctx, masterName); err != nil {
+		logger.Error(err, "Failed to reset the sentinel view of the master", "known", known)
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "SentinelPeersResetFailed", fmt.Sprintf(
+			"Sentinels still count %d peers but only %d exist, and the reset failed: %v",
+			known, rs.Spec.SentinelConfig.Replicas, err))
+		return
+	}
+
+	logger.Info("Reset the sentinel view of the master", "known", known, "expected", rs.Spec.SentinelConfig.Replicas)
+	recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "SentinelPeersReset", fmt.Sprintf(
+		"Sentinels counted %d peers but only %d exist; reset their view so a failover can still win an election",
+		known, rs.Spec.SentinelConfig.Replicas))
+}
+
+// warnOnSentinelScaleDown announces the loss of failure detectors. Removing a
+// sentinel does not remove it from the survivors' view: they keep it in
+// SENTINEL sentinels until a SENTINEL RESET, so the majority they require to
+// elect the sentinel that runs a failover is still counted from the old size.
+func (r *RedisSentinelReconciler) warnOnSentinelScaleDown(ctx context.Context, rs *redisv1alpha1.RedisSentinel, desired *appsv1.StatefulSet) {
+	existing := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
+		return
+	}
+	if existing.Spec.Replicas == nil || *desired.Spec.Replicas >= *existing.Spec.Replicas {
+		return
+	}
+
+	target := *desired.Spec.Replicas
+	recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "SentinelScaleDown", fmt.Sprintf(
+		"Removing sentinels %d..%d leaves %d monitoring with a quorum of %d. "+
+			"The surviving sentinels still count the removed ones as known peers until a SENTINEL RESET, "+
+			"so the majority they need to elect a failover leader is still computed from %d",
+		target, *existing.Spec.Replicas-1, target, rs.Spec.SentinelConfig.Quorum, *existing.Spec.Replicas))
+}
+
+// sentinelAddresses is the stable per-pod DNS of every Sentinel in the set.
+func sentinelAddresses(rs *redisv1alpha1.RedisSentinel) []string {
+	addrs := make([]string, rs.Spec.SentinelConfig.Replicas)
+	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
+		addrs[i] = fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
+			rs.Name, i, rs.Name, rs.Namespace)
+	}
+	return addrs
 }
 
 // authSecretVersion returns the resourceVersion of the auth Secret, or "" when
@@ -593,6 +839,10 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	}
 	conditions = append(conditions, sentinelCondition)
 
+	if sentinelStatefulSet.Status.ReadyReplicas >= rs.Spec.SentinelConfig.Replicas {
+		r.pruneRemovedSentinels(ctx, rs, adminPassword, tlsCfg)
+	}
+
 	rs.Status.Conditions = conditions
 
 	if err := r.Status().Update(ctx, rs); err != nil {
@@ -664,17 +914,10 @@ func (r *RedisSentinelReconciler) reconcileMasterLabel(ctx context.Context, rs *
 }
 
 func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (string, error) {
-	// Build list of all sentinel addresses for fallback
-	sentinelAddresses := make([]string, rs.Spec.SentinelConfig.Replicas)
-	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
-		sentinelAddresses[i] = fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
-			rs.Name, i, rs.Name, rs.Namespace)
-	}
-
 	masterName := rs.Name + "-master"
 
 	// Use sentinel pool to try multiple sentinels
-	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, tlsCfg)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses(rs), password, tlsCfg)
 	masterAddr, err := pool.GetMasterAddrFromPool(ctx, masterName)
 	if err != nil {
 		return "", err
@@ -855,17 +1098,10 @@ func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context
 
 // checkSentinelQuorum verifies the actual Sentinel quorum health
 func (r *RedisSentinelReconciler) checkSentinelQuorum(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (bool, string, error) {
-	// Build sentinel addresses
-	sentinelAddresses := make([]string, rs.Spec.SentinelConfig.Replicas)
-	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
-		sentinelAddresses[i] = fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
-			rs.Name, i, rs.Name, rs.Namespace)
-	}
-
 	masterName := rs.Name + "-master"
 
 	// Use pool to check quorum from any available sentinel
-	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, password, tlsCfg)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses(rs), password, tlsCfg)
 	healthy, count, err := pool.CheckQuorumFromPool(ctx, masterName)
 	if err != nil {
 		return false, "Unable to verify quorum", err
@@ -964,6 +1200,9 @@ func mergeForUpdate(existing, desired client.Object) (client.Object, error) {
 	case *networkingv1.NetworkPolicy:
 		d := desired.(*networkingv1.NetworkPolicy)
 		m.Spec = d.Spec
+	case *policyv1.PodDisruptionBudget:
+		d := desired.(*policyv1.PodDisruptionBudget)
+		m.Spec = d.Spec
 	default:
 		return nil, fmt.Errorf("createOrUpdate does not know how to update %T", desired)
 	}
@@ -1042,15 +1281,7 @@ func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs 
 	logger := log.FromContext(ctx)
 	masterName := rs.Name + "-master"
 
-	// Try to get sentinel info from pool
-	sentinelAddresses := make([]string, 0, rs.Spec.SentinelConfig.Replicas)
-	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
-		addr := fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
-			rs.Name, i, rs.Name, rs.Namespace)
-		sentinelAddresses = append(sentinelAddresses, addr)
-	}
-
-	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses, adminPassword, tlsCfg)
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(sentinelAddresses(rs), adminPassword, tlsCfg)
 	masterInfo, err := pool.GetMasterFromPool(ctx, masterName)
 	if err != nil {
 		logger.V(1).Info("Failed to get master info from sentinel", "error", err)
@@ -1275,6 +1506,7 @@ func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.sentinelsForAuthSecret)).
 		Named("redissentinel").
 		Complete(r)

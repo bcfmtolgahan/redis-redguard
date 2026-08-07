@@ -172,6 +172,45 @@ func (p *SentinelClientPool) SetMasterOptionAll(ctx context.Context, masterName,
 	return errors.Join(errs...)
 }
 
+// ResetMasterAll makes every sentinel in the pool forget what it learned about
+// the master and rediscover it. Like SENTINEL SET this is per-instance state
+// that never propagates, so it has to reach all of them: one sentinel left
+// counting removed peers still refuses to vote a failover leader through.
+func (p *SentinelClientPool) ResetMasterAll(ctx context.Context, masterName string) error {
+	var errs []error
+	for _, addr := range p.addresses {
+		client := p.newClient(addr)
+		_, err := client.SentinelReset(ctx, masterName)
+		client.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// FailoverFromPool asks the first reachable sentinel to promote a replica.
+// SENTINEL FAILOVER is deliberately not broadcast: it forces a failover without
+// asking the other sentinels for agreement, so one acceptance is the whole
+// operation and sending it to every member would only start it again on a
+// cluster that is already mid-promotion.
+func (p *SentinelClientPool) FailoverFromPool(ctx context.Context, masterName string) error {
+	var errs []error
+	for _, addr := range p.addresses {
+		client := p.newClient(addr)
+		err := client.Failover(ctx, masterName)
+		client.Close()
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
+	}
+	if len(errs) == 0 {
+		return fmt.Errorf("no sentinels available")
+	}
+	return fmt.Errorf("no sentinel accepted the failover: %w", errors.Join(errs...))
+}
+
 // newClient builds a client for one pool member with the pool's credentials.
 func (p *SentinelClientPool) newClient(addr string) *SentinelClient {
 	if p.tlsConfig != nil {

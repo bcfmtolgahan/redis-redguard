@@ -25,9 +25,42 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// Placement controls where one component's pods are scheduled. It is inlined
+// into RedisConfig and SentinelConfig: the two are scheduled independently, and
+// a node pool sized for Redis is rarely where the Sentinels belong.
+type Placement struct {
+	// NodeSelector restricts the pods to nodes carrying all of these labels
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Affinity replaces the scheduling rules for these pods. When
+	// podAntiAffinity is absent the operator adds a preferred anti-affinity
+	// that spreads the component across nodes; set podAntiAffinity to {} to
+	// opt out of it entirely.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// Tolerations let the pods schedule onto tainted nodes
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// TopologySpreadConstraints spread the pods across failure domains such
+	// as zones. Anti-affinity spreads by node; this is the wider guarantee.
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+
+	// PriorityClassName sets the scheduling priority and the order in which
+	// the kubelet evicts pods under node pressure
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+}
+
 // RedisConfig defines Redis server configuration
 // +kubebuilder:validation:XValidation:rule="has(self.storage) == has(oldSelf.storage)",message="redisConfig.storage is immutable: adding or removing it would change the StatefulSet volumeClaimTemplates, which Kubernetes forbids. Recreate the RedisSentinel instead."
 type RedisConfig struct {
+	// Placement controls where the Redis pods are scheduled
+	Placement `json:",inline"`
+
 	// Replicas is the number of Redis replicas
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
@@ -58,7 +91,11 @@ type RedisConfig struct {
 }
 
 // SentinelConfig defines Sentinel configuration
+// +kubebuilder:validation:XValidation:rule="self.quorum <= self.replicas",message="sentinelConfig.quorum must not exceed sentinelConfig.replicas: a quorum larger than the number of Sentinels can never be reached, so no failover can ever start while every pod still reports healthy"
 type SentinelConfig struct {
+	// Placement controls where the Sentinel pods are scheduled
+	Placement `json:",inline"`
+
 	// Replicas is the number of Sentinel instances (min 3 recommended)
 	// +kubebuilder:validation:Minimum=3
 	// +kubebuilder:default=3
