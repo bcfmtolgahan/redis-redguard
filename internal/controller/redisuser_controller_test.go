@@ -24,11 +24,13 @@ import (
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
 )
 
 var _ = Describe("RedisUser Controller", func() {
@@ -69,15 +71,16 @@ var _ = Describe("RedisUser Controller", func() {
 						RedisClusterRef:   clusterName,
 						Username:          "testuser",
 						PasswordSecretRef: "user-pass",
-						Enabled:           true,
+						Enabled:           ptr.To(true),
 					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
 
 			controllerReconciler = &RedisUserReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client:       k8sClient,
+				Scheme:       k8sClient.Scheme(),
+				RedisFactory: redisfake.NewFactory(),
 			}
 		})
 
@@ -88,6 +91,11 @@ var _ = Describe("RedisUser Controller", func() {
 
 			By("Cleanup the specific resource instance RedisUser")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			// Deletion holds the finalizer until the ACL user has been removed
+			// from a reachable pod, so the cleanup path needs one.
+			ensureReadyRedisPod(clusterName+"-redis-0", "default", clusterName, "10.244.5.1")
+			defer deleteRedisPods("default", clusterName)
 
 			// Reconcile once more so the finalizer added above is removed.
 			Eventually(func(g Gomega) {
@@ -100,10 +108,8 @@ var _ = Describe("RedisUser Controller", func() {
 
 		It("should report that there are no Redis pods to apply the ACL to", func() {
 			By("Reconciling the created resource")
-			// envtest runs no kubelet, so the StatefulSet never produces pods
-			// and the reconciler cannot reach a Redis instance. Assert the
-			// observed outcome; Task 1.3 replaces this with the fake Redis
-			// client and asserts the applied ACL instead.
+			// envtest runs no kubelet, so the StatefulSet produces no pods and
+			// there is nothing to apply the ACL to.
 			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})

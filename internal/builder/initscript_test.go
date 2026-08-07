@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,9 +28,18 @@ requirepass ${REDIS_PASSWORD}
 // it), the combined stdout+stderr, and the script's error, if any.
 func runInitScript(t *testing.T, script, hostname string, env map[string]string) (conf, output string, err error) {
 	t.Helper()
+	_, conf, output, err = runInitScriptInDataDir(t, script, hostname, env, nil)
+	return conf, output, err
+}
+
+// runInitScriptInDataDir is runInitScript with access to the data volume: seed
+// prepares it before the script runs, and its path is returned so a test can
+// inspect files other than redis.conf.
+func runInitScriptInDataDir(t *testing.T, script, hostname string, env map[string]string, seed func(dataDir string)) (dataDir, conf, output string, err error) {
+	t.Helper()
 
 	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
+	dataDir = filepath.Join(dir, "data")
 	etcDir := filepath.Join(dir, "etc")
 	for _, d := range []string{dataDir, etcDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -37,6 +48,9 @@ func runInitScript(t *testing.T, script, hostname string, env map[string]string)
 	}
 	if err := os.WriteFile(filepath.Join(etcDir, "redis.conf"), []byte(seedRedisConf), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if seed != nil {
+		seed(dataDir)
 	}
 
 	// Syntax-check the pristine script exactly as it ships.
@@ -79,9 +93,9 @@ func runInitScript(t *testing.T, script, hostname string, env map[string]string)
 
 	b, readErr := os.ReadFile(filepath.Join(dataDir, "redis.conf"))
 	if readErr != nil {
-		return "", string(out), runErr
+		return dataDir, "", string(out), runErr
 	}
-	return string(b), string(out), runErr
+	return dataDir, string(b), string(out), runErr
 }
 
 func testInitScript() string {
@@ -360,5 +374,125 @@ func TestInitScript_PasswordSubstitution_SpecialCharsStayLiteral(t *testing.T) {
 	}
 	if strings.Contains(out, password) {
 		t.Errorf("password printed to stdout/stderr:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ACL file durability
+// ---------------------------------------------------------------------------
+
+// readACLFile returns the ACL file the init script prepared on the data volume,
+// together with its permission bits.
+func readACLFile(t *testing.T, dataDir string) (string, os.FileMode) {
+	t.Helper()
+
+	path := filepath.Join(dataDir, "users.acl")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("no ACL file on the data volume: %v (redis-server aborts at startup when aclfile is missing)", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), info.Mode().Perm()
+}
+
+// aclUserLines returns the ACL file lines defining the given user.
+func aclUserLines(acl, username string) []string {
+	var out []string
+	for _, line := range strings.Split(acl, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "user" && fields[1] == username {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+	return out
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func TestInitScript_CreatesACLFileWithDefaultUser(t *testing.T) {
+	const password = "adminpw"
+
+	dataDir, _, out, err := runInitScriptInDataDir(t, testInitScript(), "test-redis-0",
+		map[string]string{"REDIS_PASSWORD": password}, nil)
+	if err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", err, out)
+	}
+
+	acl, mode := readACLFile(t, dataDir)
+
+	// An ACL file without a 'user default' line resets the default account to
+	// nopass, which silently discards requirepass and opens the instance.
+	lines := aclUserLines(acl, "default")
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one 'user default' line, got %d:\n%s", len(lines), acl)
+	}
+	want := "user default on #" + sha256Hex(password) + " ~* &* +@all"
+	if lines[0] != want {
+		t.Errorf("default user line = %q, want %q", lines[0], want)
+	}
+	if strings.Contains(acl, password) {
+		t.Errorf("ACL file holds the plaintext password:\n%s", acl)
+	}
+	if strings.Contains(out, password) {
+		t.Errorf("password printed to stdout/stderr:\n%s", out)
+	}
+	if mode != 0o600 {
+		t.Errorf("ACL file mode = %04o, want 0600", mode)
+	}
+}
+
+func TestInitScript_KeepsSavedACLUsersAndRebuildsDefault(t *testing.T) {
+	const appLine = "user app on #71d3d4e36cf4bc4309fd7390ba79fc6a1d03d8d7b45ef26f04bcdff3ff116868 ~app:* resetchannels -@all +@read"
+	const stale = "user default on #0000000000000000000000000000000000000000000000000000000000000000 ~* &* +@all"
+
+	seed := func(dataDir string) {
+		body := appLine + "\n" + stale + "\n"
+		if err := os.WriteFile(filepath.Join(dataDir, "users.acl"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dataDir, _, out, err := runInitScriptInDataDir(t, testInitScript(), "test-redis-1",
+		map[string]string{"REDIS_PASSWORD": "rotated"}, seed)
+	if err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", err, out)
+	}
+
+	acl, _ := readACLFile(t, dataDir)
+
+	if got := aclUserLines(acl, "app"); len(got) != 1 || got[0] != appLine {
+		t.Errorf("saved ACL user not preserved across restart, got %q:\n%s", got, acl)
+	}
+	// A rotated password must reach the default account, or the old one keeps
+	// working and the operator cannot authenticate with the new one.
+	lines := aclUserLines(acl, "default")
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one 'user default' line, got %d:\n%s", len(lines), acl)
+	}
+	if want := "user default on #" + sha256Hex("rotated") + " ~* &* +@all"; lines[0] != want {
+		t.Errorf("default user line = %q, want %q", lines[0], want)
+	}
+}
+
+func TestInitScript_NoPasswordLeavesDefaultUserOpen(t *testing.T) {
+	dataDir, _, out, err := runInitScriptInDataDir(t, testInitScript(), "test-redis-0", nil, nil)
+	if err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", err, out)
+	}
+
+	acl, _ := readACLFile(t, dataDir)
+
+	lines := aclUserLines(acl, "default")
+	if len(lines) != 1 {
+		t.Fatalf("want exactly one 'user default' line, got %d:\n%s", len(lines), acl)
+	}
+	if want := "user default on nopass ~* &* +@all"; lines[0] != want {
+		t.Errorf("default user line = %q, want %q", lines[0], want)
 	}
 }

@@ -106,6 +106,21 @@ func TestBuildRedisConfigMap_BaseDirectives(t *testing.T) {
 	}
 }
 
+func TestBuildRedisConfigMap_DeclaresACLFile(t *testing.T) {
+	conf := BuildRedisConfigMap(testSentinel()).Data["redis.conf"]
+
+	// Without an aclfile every ACL SETUSER is runtime-only state: the init
+	// script re-copies redis.conf from the ConfigMap on each start, so anything
+	// CONFIG REWRITE persisted there is discarded on the next restart.
+	line, ok := findDirective(conf, "aclfile")
+	if !ok {
+		t.Fatalf("redis.conf declares no aclfile, so ACL users vanish on restart:\n%s", conf)
+	}
+	if want := "aclfile /data/users.acl"; line != want {
+		t.Errorf("aclfile = %q, want %q (the data volume is the only writable, durable path)", line, want)
+	}
+}
+
 func TestBuildRedisConfigMap_AuthEnabled(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: "redis-pass"}

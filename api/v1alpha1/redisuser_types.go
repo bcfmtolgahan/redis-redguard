@@ -78,13 +78,17 @@ type RedisUserSpec struct {
 	// +required
 	PasswordSecretRef string `json:"passwordSecretRef"`
 
-	// ACLRules define the permissions for this user
+	// ACLRules define the permissions for this user. Nothing is granted
+	// implicitly: a user with no rules can authenticate and reach no key,
+	// channel or command.
 	// +optional
 	ACLRules ACLRule `json:"aclRules,omitempty"`
 
-	// Enabled indicates if the user is active
+	// Enabled indicates whether the user may authenticate. A disabled user
+	// keeps its rules but every AUTH for it is rejected.
+	// +optional
 	// +kubebuilder:default=true
-	Enabled bool `json:"enabled,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"` // pointer: an omitted false is re-defaulted to true on every update
 }
 
 // RedisUserStatus defines the observed state of RedisUser.

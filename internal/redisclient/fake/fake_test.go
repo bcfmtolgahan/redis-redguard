@@ -58,6 +58,45 @@ func TestACLDelUserRemovesFromUsers(t *testing.T) {
 	}
 }
 
+func TestACLSaveSnapshotsUsersPerNode(t *testing.T) {
+	f := fake.NewFactory()
+	ctx := context.Background()
+
+	c := f.NewClient("10.0.0.1:6379", "", nil)
+	if err := c.ACLSetUser(ctx, "app", "on", ">pw"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.SavedUsers("10.0.0.1:6379")) != 0 {
+		t.Error("an unsaved user must not count as durable state")
+	}
+
+	if err := c.ACLSave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.SavedUsers("10.0.0.1:6379")["app"]; !ok {
+		t.Errorf("ACLSave did not persist the user, got %v", f.SavedUsers("10.0.0.1:6379"))
+	}
+	if len(f.SavedUsers("10.0.0.2:6379")) != 0 {
+		t.Error("saving on one node must not persist anything on another")
+	}
+	if !slices.Contains(f.Calls(), "10.0.0.1:6379:ACLSave") {
+		t.Errorf("call log missing ACLSave, got %v", f.Calls())
+	}
+
+	if err := c.ACLDelUser(ctx, "app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.SavedUsers("10.0.0.1:6379")["app"]; !ok {
+		t.Error("an unsaved deletion must not change durable state")
+	}
+	if err := c.ACLSave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.SavedUsers("10.0.0.1:6379")["app"]; ok {
+		t.Error("deleted user still durable after ACLSave")
+	}
+}
+
 func TestSetMasterDrivesRolesAndSentinel(t *testing.T) {
 	f := fake.NewFactory()
 	ctx := context.Background()

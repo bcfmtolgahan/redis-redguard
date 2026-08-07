@@ -28,6 +28,7 @@ type Client interface {
 	SlaveOf(ctx context.Context, masterHost, masterPort string) error
 	ACLSetUser(ctx context.Context, username string, rules ...string) error
 	ACLDelUser(ctx context.Context, username string) error
+	ACLSave(ctx context.Context) error
 	BGSave(ctx context.Context) error
 	LastSave(ctx context.Context) (int64, error)
 	ConfigGet(ctx context.Context, parameter string) (map[string]string, error)

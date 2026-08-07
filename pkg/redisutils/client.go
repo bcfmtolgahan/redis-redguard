@@ -112,6 +112,12 @@ func (rc *RedisClient) ACLDelUser(ctx context.Context, username string) error {
 	return rc.client.Do(ctx, "ACL", "DELUSER", username).Err()
 }
 
+// ACLSave writes the in-memory ACL users to the configured aclfile. Without it
+// every SETUSER/DELUSER is lost when the server restarts.
+func (rc *RedisClient) ACLSave(ctx context.Context) error {
+	return rc.client.Do(ctx, "ACL", "SAVE").Err()
+}
+
 // ACLGetUser retrieves ACL information for a user
 func (rc *RedisClient) ACLGetUser(ctx context.Context, username string) (map[string]interface{}, error) {
 	result, err := rc.client.Do(ctx, "ACL", "GETUSER", username).Result()

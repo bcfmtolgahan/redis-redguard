@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"regexp"
 	"strings"
@@ -32,7 +33,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/redisclient"
@@ -144,8 +147,8 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 
-	// Apply ACL to all Redis pods (master and replicas)
-	// This ensures ACL rules persist after failover
+	// ACL commands are not replicated, so every node needs its own copy for the
+	// user to survive a failover.
 	appliedTo := []string{}
 	var lastErr error
 	for _, addr := range allAddresses {
@@ -160,16 +163,16 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		redisClient.Close()
 	}
 
-	// If we failed to apply to any pod, report error but continue
-	if len(appliedTo) == 0 {
-		logger.Error(lastErr, "Failed to apply ACL to any pod")
-		r.updateStatus(ctx, redisUser, "Error", nil, lastErr.Error())
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, lastErr
-	}
-
-	// Partial success - some pods may have failed
-	if lastErr != nil {
-		logger.Info("ACL applied to some pods, will retry failed ones", "applied", len(appliedTo), "total", len(allAddresses))
+	// Anything short of every ready pod means part of the cluster does not know
+	// the user, which a Ready status would hide.
+	if len(appliedTo) < len(allAddresses) {
+		message := fmt.Sprintf("ACL applied to %d of %d ready Redis pods; last error: %v",
+			len(appliedTo), len(allAddresses), lastErr)
+		logger.Info("ACL application incomplete, will retry", "applied", len(appliedTo), "total", len(allAddresses))
+		redisUser.Status.AppliedTo = appliedTo
+		r.setDegraded(ctx, redisUser, "ACLPartiallyApplied", message)
+		custmetrics.RedisUserACLStatus.WithLabelValues(redisUser.Namespace, redisUser.Name, redisUser.Spec.Username).Set(0)
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Update status
@@ -182,91 +185,109 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
+// handleDeletion removes the ACL user from every ready Redis pod before it lets
+// the object go. The finalizer stays whenever the removal could not be carried
+// out on all of them: dropping it early leaves working credentials behind on
+// every node that was unreachable at that moment.
 func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *redisv1alpha1.RedisUser) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if controllerutil.ContainsFinalizer(redisUser, redisUserFinalizer) {
-		// Delete ACL user from all Redis pods
-		cleanupSuccessful := true
-		cleanupAttempted := false
+	if !controllerutil.ContainsFinalizer(redisUser, redisUserFinalizer) {
+		return ctrl.Result{}, nil
+	}
 
-		redisSentinel := &redisv1alpha1.RedisSentinel{}
-		if validateUsername(redisUser.Spec.Username) != nil {
-			// The operator never applied a rejected spec, so there is nothing
-			// to clean up; issuing ACL DELUSER for such a name ('default' in
-			// particular is the admin account) must never happen.
-			logger.Info("Skipping ACL cleanup for a username the operator refuses to manage")
-		} else if err := r.Get(ctx, types.NamespacedName{
-			Name:      redisUser.Spec.RedisClusterRef,
-			Namespace: redisUser.Namespace,
-		}, redisSentinel); err == nil {
-			allAddresses, err := r.getAllRedisPodAddresses(ctx, redisSentinel)
-			if err == nil && len(allAddresses) > 0 {
-				cleanupAttempted = true
-				adminPassword := ""
-				if redisSentinel.Spec.RedisConfig.Auth != nil && redisSentinel.Spec.RedisConfig.Auth.SecretName != "" {
-					secret := &corev1.Secret{}
-					if err := r.Get(ctx, types.NamespacedName{
-						Name:      redisSentinel.Spec.RedisConfig.Auth.SecretName,
-						Namespace: redisSentinel.Namespace,
-					}, secret); err == nil {
-						adminPassword = string(secret.Data["password"])
-					}
-				}
+	// A rejected spec was never applied, so there is nothing to remove; issuing
+	// ACL DELUSER for such a name ('default' is the admin account) must never
+	// happen.
+	if err := validateUsername(redisUser.Spec.Username); err != nil {
+		logger.Info("Skipping ACL cleanup for a username the operator refuses to manage")
+		return r.removeFinalizer(ctx, redisUser)
+	}
 
-				// Without the TLS settings no pod is reachable, so retry the
-				// cleanup later rather than dial plaintext.
-				tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
-				if err != nil {
-					logger.Error(err, "Cannot resolve client TLS config for ACL cleanup, will retry")
-					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-				}
-
-				// Delete from all pods with proper cleanup
-				failedPods := []string{}
-				for _, addr := range allAddresses {
-					func(address string) {
-						redisClient := factoryOrDefault(r.RedisFactory).NewClient(address, adminPassword, tlsCfg)
-						defer redisClient.Close()
-
-						if err := redisClient.ACLDelUser(ctx, redisUser.Spec.Username); err != nil {
-							// Ignore "user not found" errors - user might already be deleted
-							if !strings.Contains(err.Error(), "ERR The user") {
-								logger.Error(err, "Failed to delete ACL user from pod", "username", redisUser.Spec.Username, "address", address)
-								failedPods = append(failedPods, address)
-								cleanupSuccessful = false
-							}
-						} else {
-							logger.Info("Deleted ACL user from pod", "username", redisUser.Spec.Username, "address", address)
-						}
-					}(addr)
-				}
-
-				// If cleanup failed on some pods, requeue to retry
-				if !cleanupSuccessful && len(failedPods) > 0 {
-					logger.Info("ACL cleanup incomplete, will retry", "failedPods", failedPods)
-					// Requeue after 10 seconds to retry cleanup
-					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-				}
-			}
-		} else if !apierrors.IsNotFound(err) {
-			// If we couldn't get the RedisSentinel for a reason other than NotFound, retry
-			logger.Error(err, "Failed to get RedisSentinel for cleanup")
+	redisSentinel := &redisv1alpha1.RedisSentinel{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      redisUser.Spec.RedisClusterRef,
+		Namespace: redisUser.Namespace,
+	}, redisSentinel); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Failed to get RedisSentinel for ACL cleanup")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		// The cluster is gone, so no server is left holding the account.
+		return r.removeFinalizer(ctx, redisUser)
+	}
 
-		// Only remove finalizer if cleanup was successful or cluster doesn't exist
-		// This ensures we don't leave orphaned ACL users
-		if cleanupSuccessful || !cleanupAttempted {
-			controllerutil.RemoveFinalizer(redisUser, redisUserFinalizer)
-			if err := r.Update(ctx, redisUser); err != nil {
-				return ctrl.Result{}, err
-			}
-			logger.Info("Finalizer removed, RedisUser cleanup complete", "username", redisUser.Spec.Username)
+	allAddresses, err := r.getAllRedisPodAddresses(ctx, redisSentinel)
+	if err != nil {
+		logger.Error(err, "Failed to list Redis pods for ACL cleanup")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if len(allAddresses) == 0 {
+		logger.Info("No ready Redis pod to remove the ACL user from; keeping the finalizer",
+			"username", redisUser.Spec.Username)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	adminPassword := ""
+	if redisSentinel.Spec.RedisConfig.Auth != nil && redisSentinel.Spec.RedisConfig.Auth.SecretName != "" {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      redisSentinel.Spec.RedisConfig.Auth.SecretName,
+			Namespace: redisSentinel.Namespace,
+		}, secret); err == nil {
+			adminPassword = string(secret.Data["password"])
 		}
 	}
 
+	// Without the TLS settings no pod is reachable, so retry the cleanup later
+	// rather than dial plaintext.
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		logger.Error(err, "Cannot resolve client TLS config for ACL cleanup, will retry")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	failedPods := []string{}
+	for _, addr := range allAddresses {
+		if err := r.deleteACL(ctx, addr, adminPassword, tlsCfg, redisUser.Spec.Username); err != nil {
+			logger.Error(err, "Failed to remove ACL user from pod",
+				"username", redisUser.Spec.Username, "address", addr)
+			failedPods = append(failedPods, addr)
+			continue
+		}
+		logger.Info("Removed ACL user from pod", "username", redisUser.Spec.Username, "address", addr)
+	}
+	if len(failedPods) > 0 {
+		logger.Info("ACL cleanup incomplete, will retry", "failedPods", failedPods)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	return r.removeFinalizer(ctx, redisUser)
+}
+
+func (r *RedisUserReconciler) removeFinalizer(ctx context.Context, redisUser *redisv1alpha1.RedisUser) (ctrl.Result, error) {
+	controllerutil.RemoveFinalizer(redisUser, redisUserFinalizer)
+	if err := r.Update(ctx, redisUser); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.FromContext(ctx).Info("Finalizer removed, RedisUser cleanup complete", "username", redisUser.Spec.Username)
 	return ctrl.Result{}, nil
+}
+
+// deleteACL removes the user from one node and persists the removal. Without
+// the save the account is restored from the ACL file on the next restart.
+func (r *RedisUserReconciler) deleteACL(ctx context.Context, addr, adminPassword string, tlsCfg *tls.Config, username string) error {
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
+	defer redisClient.Close()
+
+	// An already absent user is the desired end state, not a failure.
+	if err := redisClient.ACLDelUser(ctx, username); err != nil && !strings.Contains(err.Error(), "ERR The user") {
+		return err
+	}
+	if err := redisClient.ACLSave(ctx); err != nil {
+		return fmt.Errorf("persisting ACL removal: %w", err)
+	}
+	return nil
 }
 
 // usernamePattern mirrors the CRD's Pattern marker so a stale CRD cannot let
@@ -380,51 +401,38 @@ func validateRedisUserSpec(spec *redisv1alpha1.RedisUserSpec) error {
 	return validateACLRules(rules)
 }
 
+// applyACL writes the user to one node and persists it to that node's ACL file.
+// Skipping the save leaves the account in memory only, so the next restart of
+// that pod comes back without it.
 func (r *RedisUserReconciler) applyACL(ctx context.Context, redisClient redisclient.Client, redisUser *redisv1alpha1.RedisUser, password string) error {
-	rules := []string{"reset"} // Start fresh
+	if err := redisClient.ACLSetUser(ctx, redisUser.Spec.Username, buildACLRules(redisUser, password)...); err != nil {
+		return err
+	}
+	if err := redisClient.ACLSave(ctx); err != nil {
+		return fmt.Errorf("persisting ACL: %w", err)
+	}
+	return nil
+}
 
-	// Set password
-	rules = append(rules, fmt.Sprintf(">%s", password))
+// buildACLRules renders the spec as one ACL SETUSER rule list. It opens with
+// 'reset' so the account ends up exactly as the spec describes, and it adds no
+// implicit grant: a user that asks for no keys, channels or commands reaches
+// none of them.
+func buildACLRules(redisUser *redisv1alpha1.RedisUser, password string) []string {
+	rules := []string{"reset", ">" + password}
 
-	// Enable/disable user
-	if redisUser.Spec.Enabled {
+	if redisUser.Spec.Enabled == nil || *redisUser.Spec.Enabled {
 		rules = append(rules, "on")
 	} else {
 		rules = append(rules, "off")
 	}
 
-	// Add categories
-	for _, cat := range redisUser.Spec.ACLRules.Categories {
-		rules = append(rules, cat)
-	}
+	rules = append(rules, redisUser.Spec.ACLRules.Categories...)
+	rules = append(rules, redisUser.Spec.ACLRules.Commands...)
+	rules = append(rules, redisUser.Spec.ACLRules.Keys...)
+	rules = append(rules, redisUser.Spec.ACLRules.Channels...)
 
-	// Add commands
-	for _, cmd := range redisUser.Spec.ACLRules.Commands {
-		rules = append(rules, cmd)
-	}
-
-	// Add key patterns
-	for _, key := range redisUser.Spec.ACLRules.Keys {
-		rules = append(rules, key)
-	}
-
-	// Add channel patterns
-	for _, ch := range redisUser.Spec.ACLRules.Channels {
-		rules = append(rules, ch)
-	}
-
-	// If no rules specified, allow read-only access
-	if len(redisUser.Spec.ACLRules.Categories) == 0 &&
-		len(redisUser.Spec.ACLRules.Commands) == 0 {
-		rules = append(rules, "+@read")
-	}
-
-	// If no keys specified, allow all keys
-	if len(redisUser.Spec.ACLRules.Keys) == 0 {
-		rules = append(rules, "~*")
-	}
-
-	return redisClient.ACLSetUser(ctx, redisUser.Spec.Username, rules...)
+	return rules
 }
 
 func (r *RedisUserReconciler) getPasswordFromSecret(ctx context.Context, redisUser *redisv1alpha1.RedisUser) (string, error) {
@@ -490,25 +498,61 @@ func (r *RedisUserReconciler) getAllRedisPodAddresses(ctx context.Context, redis
 	}
 
 	addresses := []string{}
-	for _, pod := range podList.Items {
-		// Only include running pods with an IP
-		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
-			// Check if the pod is ready
-			isReady := false
-			for _, cond := range pod.Status.Conditions {
-				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-					isReady = true
-					break
-				}
-			}
-
-			if isReady {
-				addresses = append(addresses, fmt.Sprintf("%s:6379", pod.Status.PodIP))
-			}
+	for i := range podList.Items {
+		if redisPodIsReady(&podList.Items[i]) {
+			addresses = append(addresses, fmt.Sprintf("%s:6379", podList.Items[i].Status.PodIP))
 		}
 	}
 
 	return addresses, nil
+}
+
+// redisPodIsReady reports whether a pod can currently take an ACL command.
+func redisPodIsReady(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// redisUsersForPod maps a Redis pod that just became ready to the RedisUsers of
+// its cluster. A restarted pod comes back with whatever its ACL file held, so
+// without this the account could be missing until the next periodic resync.
+func (r *RedisUserReconciler) redisUsersForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+	if pod.Labels["app.kubernetes.io/managed-by"] != "redguard-operator" ||
+		pod.Labels["app.kubernetes.io/component"] != "redis" {
+		return nil
+	}
+	cluster := pod.Labels["app.kubernetes.io/instance"]
+	if cluster == "" || !redisPodIsReady(pod) {
+		return nil
+	}
+
+	users := &redisv1alpha1.RedisUserList{}
+	if err := r.List(ctx, users, client.InNamespace(pod.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list RedisUsers for a Redis pod event", "pod", pod.Name)
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, user := range users.Items {
+		if user.Spec.RedisClusterRef != cluster {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: user.Name, Namespace: user.Namespace},
+		})
+	}
+	return requests
 }
 
 // setDegraded reports a terminal, spec-caused failure: only a spec edit can
@@ -579,6 +623,7 @@ func (r *RedisUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisUser{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.redisUsersForPod)).
 		Named("redisuser").
 		Complete(r)
 }

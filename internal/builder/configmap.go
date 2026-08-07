@@ -19,6 +19,11 @@ func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 		"bind 0.0.0.0",
 		"port 6379",
 		"dir /data",
+		// ACL users are runtime state until ACL SAVE writes them here. The path
+		// is on the data volume because the init script re-copies redis.conf
+		// from this ConfigMap on every start, so anything persisted into the
+		// config file itself would not survive a restart.
+		"aclfile /data/users.acl",
 		"appendonly yes",
 		"appendfilename \"appendonly.aof\"",
 		"save 900 1",
@@ -94,8 +99,9 @@ func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 // Invariants the script must hold: only the master IP is ever written on stdout
 // inside command substitution (all progress goes to stderr), a sentinel reply is
 // validated as an IPv4 address before it can reach redis.conf, no command may
-// abort the retry loop under set -e, and the password never appears in output
-// or in a process argument list.
+// abort the retry loop under set -e, the password never appears in output or in
+// a process argument list, and the ACL file always exists and always defines the
+// default user.
 func buildRedisInitScript(sentinelHosts []string, masterName, bootstrapMasterHost string) string {
 	sentinelHostsStr := strings.Join(sentinelHosts, ",")
 
@@ -129,6 +135,24 @@ if [ -n "${REDIS_PASSWORD:-}" ]; then
          }' /data/redis.conf > /data/redis.conf.tmp
     mv /data/redis.conf.tmp /data/redis.conf
 fi
+
+# redis-server aborts at startup when aclfile is missing, and an ACL file that
+# carries no "user default" line resets that account to nopass, which discards
+# requirepass and leaves the instance open. The line is therefore rebuilt from
+# the current password on every start, so a rotated password takes effect, while
+# every other user is left exactly as ACL SAVE wrote it. Only the SHA-256 of the
+# password is stored, and it reaches sha256sum through a pipe, never argv.
+ACL_FILE=/data/users.acl
+if [ -n "${REDIS_PASSWORD:-}" ]; then
+    DEFAULT_USER="user default on #$(printf '%%s' "$REDIS_PASSWORD" | sha256sum | cut -d' ' -f1) ~* &* +@all"
+else
+    DEFAULT_USER="user default on nopass ~* &* +@all"
+fi
+[ -f "$ACL_FILE" ] || : > "$ACL_FILE"
+awk -v line="$DEFAULT_USER" '$1 == "user" && $2 == "default" { next } { print } END { print line }' \
+    "$ACL_FILE" > "$ACL_FILE.tmp"
+mv "$ACL_FILE.tmp" "$ACL_FILE"
+chmod 600 "$ACL_FILE"
 
 # A staged restore payload means the operator shut this master down to load a
 # backup. The previous AOF is moved aside (not deleted) so it cannot shadow

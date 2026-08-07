@@ -35,11 +35,14 @@ type Factory struct {
 }
 
 // node is the state of one fake Redis instance, keyed by dial address.
+// users is runtime state; savedUsers is what an ACL SAVE persisted and is
+// therefore what a restart of that node would come back with.
 type node struct {
 	role       string
 	masterHost string
 	masterPort string
 	users      map[string][]string
+	savedUsers map[string][]string
 	keyspace   map[int]int64
 	config     map[string]string
 	lastSave   int64
@@ -87,6 +90,18 @@ func (f *Factory) Calls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+// SavedUsers returns the users one node persisted through ACL SAVE, which is
+// the set that would survive a restart of that node.
+func (f *Factory) SavedUsers(addr string) map[string][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string][]string{}
+	for u, rules := range f.node(addr).savedUsers {
+		out[u] = append([]string(nil), rules...)
+	}
+	return out
 }
 
 // SetKeyspace declares the per-database key counts of one node, driving both
@@ -153,9 +168,10 @@ func (f *Factory) node(addr string) *node {
 	n, ok := f.nodes[addr]
 	if !ok {
 		n = &node{
-			users:    map[string][]string{},
-			keyspace: map[int]int64{},
-			config:   map[string]string{},
+			users:      map[string][]string{},
+			savedUsers: map[string][]string{},
+			keyspace:   map[int]int64{},
+			config:     map[string]string{},
 		}
 		f.nodes[addr] = n
 		f.syncRole(addr, n)
@@ -313,6 +329,9 @@ func (c *client) ACLSetUser(ctx context.Context, username string, rules ...strin
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "ACLSetUser")
+	if err := c.f.errorFor(c.addr, "ACLSetUser"); err != nil {
+		return err
+	}
 	stored := append([]string(nil), rules...)
 	c.f.node(c.addr).users[username] = stored
 	c.f.users[username] = stored
@@ -323,8 +342,28 @@ func (c *client) ACLDelUser(ctx context.Context, username string) error {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "ACLDelUser")
+	if err := c.f.errorFor(c.addr, "ACLDelUser"); err != nil {
+		return err
+	}
 	delete(c.f.node(c.addr).users, username)
 	delete(c.f.users, username)
+	return nil
+}
+
+// ACLSave snapshots the node's runtime users into its saved set, mirroring the
+// real command writing them to the aclfile.
+func (c *client) ACLSave(ctx context.Context) error {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.record(c.addr, "ACLSave")
+	if err := c.f.errorFor(c.addr, "ACLSave"); err != nil {
+		return err
+	}
+	n := c.f.node(c.addr)
+	n.savedUsers = make(map[string][]string, len(n.users))
+	for u, rules := range n.users {
+		n.savedUsers[u] = append([]string(nil), rules...)
+	}
 	return nil
 }
 

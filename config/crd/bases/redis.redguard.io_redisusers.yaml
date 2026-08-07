@@ -56,7 +56,10 @@ spec:
             description: spec defines the desired state of RedisUser
             properties:
               aclRules:
-                description: ACLRules define the permissions for this user
+                description: |-
+                  ACLRules define the permissions for this user. Nothing is granted
+                  implicitly: a user with no rules can authenticate and reach no key,
+                  channel or command.
                 properties:
                   categories:
                     description: Categories are ACL categories (+@read, +@write, etc.)
@@ -96,7 +99,9 @@ spec:
                 type: object
               enabled:
                 default: true
-                description: Enabled indicates if the user is active
+                description: |-
+                  Enabled indicates whether the user may authenticate. A disabled user
+                  keeps its rules but every AUTH for it is rejected.
                 type: boolean
               passwordSecretRef:
                 description: |-

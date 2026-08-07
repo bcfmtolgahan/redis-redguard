@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
@@ -134,7 +135,7 @@ var _ = Describe("RedisUser validation", func() {
 				RedisClusterRef:   "test-cluster",
 				Username:          "appuser",
 				PasswordSecretRef: "user-pass",
-				Enabled:           true,
+				Enabled:           ptr.To(true),
 			},
 		}
 	}
@@ -211,6 +212,11 @@ var _ = Describe("RedisUser validation", func() {
 			Expect(cond.Message).To(ContainSubstring("+@all"))
 
 			Expect(factory.Calls()).To(BeEmpty(), "a rejected spec must never reach Redis")
+
+			// Deletion holds the finalizer until the ACL user has been removed
+			// from a reachable pod, so the cleanup path needs one.
+			ensureReadyRedisPod("test-cluster-redis-0", ns, "test-cluster", "10.244.5.2")
+			defer deleteRedisPods(ns, "test-cluster")
 
 			Expect(k8sClient.Delete(ctx, updated)).To(Succeed())
 			Eventually(func(g Gomega) {
