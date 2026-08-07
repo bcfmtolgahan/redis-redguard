@@ -87,138 +87,97 @@ func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 	}
 }
 
-// buildRedisInitScript creates the init script that queries Sentinel for master
+// buildRedisInitScript creates the init script that queries Sentinel for master.
+// Invariants the script must hold: only the master IP is ever written on stdout
+// inside command substitution (all progress goes to stderr), a sentinel reply is
+// validated as an IPv4 address before it can reach redis.conf, no command may
+// abort the retry loop under set -e, and the password never appears in output
+// or in a process argument list.
 func buildRedisInitScript(sentinelHosts []string, masterName, bootstrapMasterHost string) string {
 	sentinelHostsStr := strings.Join(sentinelHosts, ",")
 
 	return fmt.Sprintf(`#!/bin/sh
-set -e
+set -eu
 
-echo "=== Redis Init Script Starting ==="
+log() { echo "[redguard-init] $*" >&2; }
 
-# Function to safely escape password for sed replacement
-# Escapes: / \ & and newlines
-escape_for_sed() {
-    printf '%%s' "$1" | sed -e 's/[\/&]/\\&/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
-}
-
-# Copy config to writable location first
-cp /etc/redis/redis.conf /data/redis.conf
-
-# Replace password placeholder if auth is enabled
-# Using awk for safer substitution (handles special characters better than sed)
-if [ -n "$REDIS_PASSWORD" ]; then
-    awk -v pass="$REDIS_PASSWORD" '{gsub(/\${REDIS_PASSWORD}/, pass); print}' /data/redis.conf > /data/redis.conf.tmp
-    mv /data/redis.conf.tmp /data/redis.conf
-fi
-
-# Configuration
 SENTINEL_HOSTS="%s"
 MASTER_NAME="%s"
 BOOTSTRAP_MASTER_HOST="%s"
 POD_ORDINAL=${HOSTNAME##*-}
-MY_IP=$(hostname -i)
+MY_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
 
-echo "Pod ordinal: $POD_ORDINAL"
-echo "My IP: $MY_IP"
-echo "Sentinel hosts: $SENTINEL_HOSTS"
-echo "Master name: $MASTER_NAME"
+log "pod ordinal=$POD_ORDINAL ip=$MY_IP master-name=$MASTER_NAME"
 
-# Function to query sentinel for current master
-# Uses REDISCLI_AUTH env var to avoid exposing password in process list
+cp /etc/redis/redis.conf /data/redis.conf
+
+# The password reaches awk through the environment and is replaced with
+# index/substr rather than gsub, so & and \ in the value stay literal.
+if [ -n "${REDIS_PASSWORD:-}" ]; then
+    awk 'BEGIN { pass = ENVIRON["REDIS_PASSWORD"]; ph = "${REDIS_PASSWORD}" }
+         {
+             out = ""
+             rest = $0
+             while ((i = index(rest, ph)) > 0) {
+                 out = out substr(rest, 1, i - 1) pass
+                 rest = substr(rest, i + length(ph))
+             }
+             print out rest
+         }' /data/redis.conf > /data/redis.conf.tmp
+    mv /data/redis.conf.tmp /data/redis.conf
+fi
+
+is_ipv4() {
+    printf '%%s\n' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+# Prints only the master IP on stdout; progress goes to stderr so command
+# substitution captures the bare value.
 get_master_from_sentinel() {
-    for sentinel in $(echo $SENTINEL_HOSTS | tr ',' ' '); do
-        echo "Trying sentinel: $sentinel"
-        # Query sentinel for master address using REDISCLI_AUTH for auth
-        MASTER_INFO=$(REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli -h $sentinel -p 26379 SENTINEL get-master-addr-by-name $MASTER_NAME 2>/dev/null || true)
-        if [ -n "$MASTER_INFO" ]; then
-            # MASTER_INFO contains IP on first line, port on second
-            MASTER_IP=$(echo "$MASTER_INFO" | head -1)
-            if [ -n "$MASTER_IP" ] && [ "$MASTER_IP" != "nil" ]; then
-                echo "Found master from sentinel: $MASTER_IP"
-                echo "$MASTER_IP"
-                return 0
-            fi
+    for sentinel in $(echo "$SENTINEL_HOSTS" | tr ',' ' '); do
+        log "querying sentinel $sentinel"
+        reply=$(REDISCLI_AUTH="${REDIS_PASSWORD:-}" redis-cli -h "$sentinel" -p 26379 \
+            SENTINEL get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -1 | tr -d '"\r') || reply=""
+        if [ -n "$reply" ] && [ "$reply" != "nil" ] && is_ipv4 "$reply"; then
+            log "sentinel $sentinel reports master $reply"
+            printf '%%s' "$reply"
+            return 0
         fi
     done
     return 1
 }
 
-# Function to check if an IP is myself
-is_myself() {
-    TARGET_IP=$1
-    if [ "$TARGET_IP" = "$MY_IP" ]; then
-        return 0
-    fi
-    # Also check if it resolves to my hostname
-    MY_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
-    TARGET_HOSTNAME=$(getent hosts $TARGET_IP 2>/dev/null | awk '{print $2}' || true)
-    if [ ! -z "$TARGET_HOSTNAME" ] && [ "$TARGET_HOSTNAME" = "$MY_HOSTNAME" ]; then
-        return 0
-    fi
-    return 1
-}
-
-# Wait for sentinels to be available (with timeout)
-echo "Waiting for sentinels to be ready..."
-SENTINEL_READY=false
 CURRENT_MASTER=""
-
-for i in $(seq 1 30); do
-    CURRENT_MASTER=$(get_master_from_sentinel)
-    if [ ! -z "$CURRENT_MASTER" ]; then
-        SENTINEL_READY=true
-        echo "Sentinel is ready, current master: $CURRENT_MASTER"
+i=1
+while [ "$i" -le 30 ]; do
+    # An assignment used as an if condition does not trip set -e on failure.
+    if CURRENT_MASTER=$(get_master_from_sentinel); then
         break
     fi
-    echo "Waiting for sentinel... attempt $i/30"
+    CURRENT_MASTER=""
+    log "sentinel not ready yet (attempt $i/30)"
     sleep 2
+    i=$((i + 1))
 done
 
-if [ "$SENTINEL_READY" = "true" ]; then
-    # Sentinel is available - follow its master designation
-    echo "Sentinel reports master at: $CURRENT_MASTER"
+grep -Ev '^(replicaof|slaveof)' /data/redis.conf > /data/redis.conf.tmp || true
+mv /data/redis.conf.tmp /data/redis.conf
 
-    if is_myself "$CURRENT_MASTER"; then
-        echo "I am the current master (confirmed by Sentinel)"
-        # Ensure we're not configured as a replica
-        sed -i '/^replicaof/d' /data/redis.conf
-        sed -i '/^slaveof/d' /data/redis.conf
+if [ -n "$CURRENT_MASTER" ]; then
+    if [ "$CURRENT_MASTER" = "$MY_IP" ]; then
+        log "sentinel confirms this pod as master"
     else
-        echo "Configuring as replica of $CURRENT_MASTER"
-        # Remove any existing replicaof config
-        sed -i '/^replicaof/d' /data/redis.conf
-        sed -i '/^slaveof/d' /data/redis.conf
-        # Add replicaof directive
-        echo "" >> /data/redis.conf
-        echo "replicaof $CURRENT_MASTER 6379" >> /data/redis.conf
+        log "configuring as replica of $CURRENT_MASTER"
+        printf '\nreplicaof %%s 6379\n' "$CURRENT_MASTER" >> /data/redis.conf
     fi
+elif [ "$POD_ORDINAL" = "0" ]; then
+    log "no sentinel reachable; ordinal 0 bootstraps as initial master"
 else
-    # Bootstrap mode - sentinels not ready yet
-    # This happens during initial cluster creation
-    echo "Sentinel not ready - entering bootstrap mode"
-
-    if [ "$POD_ORDINAL" = "0" ]; then
-        echo "Starting as initial master (bootstrap mode)"
-        # Ensure we're not configured as a replica
-        sed -i '/^replicaof/d' /data/redis.conf
-        sed -i '/^slaveof/d' /data/redis.conf
-    else
-        echo "Starting as replica of bootstrap master (bootstrap mode)"
-        # Remove any existing replicaof config
-        sed -i '/^replicaof/d' /data/redis.conf
-        sed -i '/^slaveof/d' /data/redis.conf
-        # Configure to replicate from pod-0
-        echo "" >> /data/redis.conf
-        echo "replicaof $BOOTSTRAP_MASTER_HOST 6379" >> /data/redis.conf
-    fi
+    log "no sentinel reachable; following bootstrap master $BOOTSTRAP_MASTER_HOST"
+    printf '\nreplicaof %%s 6379\n' "$BOOTSTRAP_MASTER_HOST" >> /data/redis.conf
 fi
 
-echo "=== Final redis.conf ==="
-grep -E "^(replicaof|slaveof|bind|port)" /data/redis.conf || true
-echo "========================"
-
-echo "Starting Redis server..."
+log "replication config: $(grep -E '^(replicaof|slaveof)' /data/redis.conf || echo master)"
 exec redis-server /data/redis.conf
 `, sentinelHostsStr, masterName, bootstrapMasterHost)
 }

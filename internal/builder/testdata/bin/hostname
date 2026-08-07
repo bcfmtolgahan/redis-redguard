@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub hostname for init-script tests. `-i` prints REDGUARD_TEST_MY_IP so the
+# test controls the pod IP; the host flavor of hostname lacks -i entirely.
+if [ "${1:-}" = "-i" ]; then
+    printf '%s\n' "${REDGUARD_TEST_MY_IP:-10.0.0.99}"
+else
+    printf '%s\n' "${HOSTNAME:-localhost}"
+fi

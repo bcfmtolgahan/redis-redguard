@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub redis-cli for init-script tests.
+# REDGUARD_TEST_MASTER_IP unset: behave as if no sentinel answers (exit 1).
+# Set: reply like SENTINEL get-master-addr-by-name, IP then port.
+if [ -z "${REDGUARD_TEST_MASTER_IP:-}" ]; then
+    exit 1
+fi
+printf '%s\n6379\n' "$REDGUARD_TEST_MASTER_IP"
