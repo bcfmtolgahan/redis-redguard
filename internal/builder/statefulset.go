@@ -8,6 +8,50 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// managedRunAsID is the uid and gid the managed Redis and Sentinel processes
+// run as. It is deliberately not the redis user baked into the image: nothing
+// the pod touches is owned by that uid either, and fsGroup is what grants
+// access to the data volume and the mounted TLS material.
+const managedRunAsID int64 = 1000
+
+// managedPodSecurityContext is the pod-level half of the restricted Pod
+// Security Standard. fsGroup also sets the group owner of every mounted volume,
+// which is how a uid that owns nothing in the image reads the PVC and the TLS
+// secrets.
+func managedPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: boolPtr(true),
+		RunAsUser:    int64Ptr(managedRunAsID),
+		RunAsGroup:   int64Ptr(managedRunAsID),
+		FSGroup:      int64Ptr(managedRunAsID),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// managedContainerSecurityContext is the container-level half. The root
+// filesystem is read-only because both init scripts and both servers write only
+// under /data; /tmp is supplied separately as an emptyDir.
+func managedContainerSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: boolPtr(false),
+		ReadOnlyRootFilesystem:   boolPtr(true),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+	}
+}
+
+// tmpVolume backs /tmp, the one writable path outside /data that busybox and
+// redis-cli can fall back to once the root filesystem is read-only.
+func tmpVolume() corev1.Volume {
+	return corev1.Volume{
+		Name:         "tmp",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	}
+}
+
 // BuildRedisStatefulSet creates a StatefulSet for Redis servers
 func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet {
 	labels := buildLabels(rs, "redis")
@@ -44,6 +88,10 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 			Name:      "config",
 			MountPath: "/etc/redis",
 		},
+		{
+			Name:      "tmp",
+			MountPath: "/tmp",
+		},
 	}
 	volumes := []corev1.Volume{
 		{
@@ -57,6 +105,7 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 				},
 			},
 		},
+		tmpVolume(),
 	}
 
 	// Build probe command - with or without auth
@@ -146,15 +195,12 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					SecurityContext: &corev1.PodSecurityContext{
-						FSGroup:      int64Ptr(1000),
-						RunAsUser:    int64Ptr(1000),
-						RunAsNonRoot: boolPtr(true),
-					},
+					SecurityContext: managedPodSecurityContext(),
 					Containers: []corev1.Container{
 						{
-							Name:  "redis",
-							Image: image,
+							Name:            "redis",
+							Image:           image,
+							SecurityContext: managedContainerSecurityContext(),
 							Command: []string{
 								"/bin/sh",
 								"-c",
@@ -281,6 +327,7 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 				},
 			},
 		},
+		tmpVolume(),
 	}
 
 	volumeMounts := []corev1.VolumeMount{
@@ -291,6 +338,10 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 		{
 			Name:      "sentinel-data",
 			MountPath: "/data",
+		},
+		{
+			Name:      "tmp",
+			MountPath: "/tmp",
 		},
 	}
 
@@ -354,15 +405,12 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					SecurityContext: &corev1.PodSecurityContext{
-						FSGroup:      int64Ptr(1000),
-						RunAsUser:    int64Ptr(1000),
-						RunAsNonRoot: boolPtr(true),
-					},
+					SecurityContext: managedPodSecurityContext(),
 					Containers: []corev1.Container{
 						{
-							Name:  "sentinel",
-							Image: "redis:7-alpine",
+							Name:            "sentinel",
+							Image:           "redis:7-alpine",
+							SecurityContext: managedContainerSecurityContext(),
 							Command: []string{
 								"/bin/sh",
 								"-c",

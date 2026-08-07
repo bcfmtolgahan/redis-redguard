@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -633,6 +634,179 @@ func TestStatefulSets_PodSecurityContext(t *testing.T) {
 		}
 		if sc.FSGroup == nil || *sc.FSGroup != 1000 {
 			t.Errorf("%s: fsGroup = %v, want 1000", name, sc.FSGroup)
+		}
+	}
+}
+
+// TestManagedPodsMeetRestrictedPSS pins every field the restricted Pod Security
+// Standard checks on a pod the operator builds. A namespace enforcing
+// "restricted" rejects the StatefulSet's pods outright if any of them is
+// missing, and the cluster then never forms.
+func TestManagedPodsMeetRestrictedPSS(t *testing.T) {
+	rs := testSentinel()
+
+	for name, sts := range map[string]*appsv1.StatefulSet{
+		"redis":    BuildRedisStatefulSet(rs),
+		"sentinel": BuildSentinelStatefulSet(rs),
+	} {
+		spec := sts.Spec.Template.Spec
+
+		psc := spec.SecurityContext
+		if psc == nil {
+			t.Errorf("%s: pod securityContext is nil", name)
+			continue
+		}
+		if psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
+			t.Errorf("%s: pod runAsNonRoot = %v, want true", name, psc.RunAsNonRoot)
+		}
+		if psc.RunAsUser == nil || *psc.RunAsUser == 0 {
+			t.Errorf("%s: pod runAsUser = %v, want a non-zero uid", name, psc.RunAsUser)
+		}
+		if psc.RunAsGroup == nil || *psc.RunAsGroup == 0 {
+			t.Errorf("%s: pod runAsGroup = %v, want a non-zero gid", name, psc.RunAsGroup)
+		}
+		if psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("%s: pod seccompProfile = %+v, want type RuntimeDefault", name, psc.SeccompProfile)
+		}
+		if spec.HostNetwork || spec.HostPID || spec.HostIPC {
+			t.Errorf("%s: pod shares a host namespace", name)
+		}
+
+		if len(spec.Containers) == 0 {
+			t.Errorf("%s: pod has no containers", name)
+			continue
+		}
+		for _, c := range append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...) {
+			sc := c.SecurityContext
+			if sc == nil {
+				t.Errorf("%s/%s: container securityContext is nil", name, c.Name)
+				continue
+			}
+			if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+				t.Errorf("%s/%s: allowPrivilegeEscalation = %v, want false", name, c.Name, sc.AllowPrivilegeEscalation)
+			}
+			if sc.Privileged != nil && *sc.Privileged {
+				t.Errorf("%s/%s: privileged = true", name, c.Name)
+			}
+			if sc.Capabilities == nil || !slices.Contains(sc.Capabilities.Drop, corev1.Capability("ALL")) {
+				t.Errorf("%s/%s: capabilities = %+v, want drop [ALL]", name, c.Name, sc.Capabilities)
+			}
+			if sc.Capabilities != nil && len(sc.Capabilities.Add) > 0 {
+				t.Errorf("%s/%s: capabilities.add = %v, want none", name, c.Name, sc.Capabilities.Add)
+			}
+			if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+				t.Errorf("%s/%s: readOnlyRootFilesystem = %v, want true", name, c.Name, sc.ReadOnlyRootFilesystem)
+			}
+		}
+
+		for _, v := range spec.Volumes {
+			if v.HostPath != nil {
+				t.Errorf("%s: volume %s is a hostPath, which restricted forbids", name, v.Name)
+			}
+		}
+	}
+}
+
+// TestManagedPodsMountEveryWritablePath is the other half of
+// readOnlyRootFilesystem: the init scripts and the servers write to /data, and
+// /tmp is the only path outside it that busybox and redis-cli fall back to, so
+// both have to be real mounts or the container cannot start.
+func TestManagedPodsMountEveryWritablePath(t *testing.T) {
+	rs := testSentinel()
+
+	for _, tc := range []struct {
+		name       string
+		sts        *appsv1.StatefulSet
+		dataVolume string
+	}{
+		{"redis", BuildRedisStatefulSet(rs), "data"},
+		{"sentinel", BuildSentinelStatefulSet(rs), "sentinel-data"},
+	} {
+		spec := tc.sts.Spec.Template.Spec
+		c := spec.Containers[0]
+
+		if !hasVolumeMount(c, tc.dataVolume, "/data") {
+			t.Errorf("%s: /data is not backed by volume %q: %v", tc.name, tc.dataVolume, c.VolumeMounts)
+		}
+		if !hasVolumeMount(c, "tmp", "/tmp") {
+			t.Errorf("%s: /tmp is not mounted, so a read-only root leaves no scratch path: %v",
+				tc.name, c.VolumeMounts)
+		}
+		v, ok := findVolume(spec.Volumes, "tmp")
+		if !ok {
+			t.Errorf("%s: no tmp volume: %v", tc.name, spec.Volumes)
+			continue
+		}
+		if v.EmptyDir == nil {
+			t.Errorf("%s: tmp volume = %+v, want an emptyDir", tc.name, v.VolumeSource)
+		}
+	}
+}
+
+// TestManagedPodsMountSecretsReadableByRuntimeUser guards the interaction
+// between the security context and the mounted credentials: the pod runs as a
+// uid that owns nothing in the image, so every secret file has to be reachable
+// through fsGroup. A mode without the group bit makes redis-server exit on the
+// unreadable key.
+func TestManagedPodsMountSecretsReadableByRuntimeUser(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: "redis-pass"}
+	rs.Spec.TLS = &redisv1alpha1.TLSConfig{
+		Enabled:              true,
+		CertificateSecretRef: "redis-tls",
+		CASecretRef:          "redis-ca",
+	}
+
+	for name, sts := range map[string]*appsv1.StatefulSet{
+		"redis":    BuildRedisStatefulSet(rs),
+		"sentinel": BuildSentinelStatefulSet(rs),
+	} {
+		spec := sts.Spec.Template.Spec
+		psc := spec.SecurityContext
+		if psc == nil || psc.FSGroup == nil {
+			t.Errorf("%s: fsGroup is unset, so mounted secrets stay owned by root", name)
+			continue
+		}
+		gid := *psc.FSGroup
+		if psc.RunAsGroup != nil && *psc.RunAsGroup != gid {
+			t.Errorf("%s: runAsGroup = %d and fsGroup = %d; mounted files are group-owned by fsGroup",
+				name, *psc.RunAsGroup, gid)
+		}
+
+		for _, v := range spec.Volumes {
+			switch {
+			case v.Secret != nil:
+				if v.Secret.DefaultMode == nil {
+					t.Errorf("%s: secret volume %s has no defaultMode; 0644 leaks the key to every uid",
+						name, v.Name)
+					continue
+				}
+				if *v.Secret.DefaultMode&0o040 == 0 {
+					t.Errorf("%s: secret volume %s mode %#o is not group-readable, so uid %d cannot read it",
+						name, v.Name, *v.Secret.DefaultMode, *psc.RunAsUser)
+				}
+				if *v.Secret.DefaultMode&0o004 != 0 {
+					t.Errorf("%s: secret volume %s mode %#o is world-readable", name, v.Name, *v.Secret.DefaultMode)
+				}
+			case v.ConfigMap != nil:
+				if v.ConfigMap.DefaultMode == nil || *v.ConfigMap.DefaultMode&0o050 != 0o050 {
+					t.Errorf("%s: configMap volume %s mode %v is not group-executable, so the init script cannot run",
+						name, v.Name, v.ConfigMap.DefaultMode)
+				}
+			}
+		}
+
+		// The password reaches the process through the environment, never
+		// through a file, so no mode governs it.
+		c := spec.Containers[0]
+		var fromSecret bool
+		for _, e := range c.Env {
+			if e.Name == "REDIS_PASSWORD" && e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+				fromSecret = true
+			}
+		}
+		if !fromSecret {
+			t.Errorf("%s: REDIS_PASSWORD is not projected from the auth secret: %v", name, c.Env)
 		}
 	}
 }

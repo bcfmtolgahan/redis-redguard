@@ -50,11 +50,12 @@ spec:
       #             operator: In
       #             values:
       #               - linux
+      # Satisfies the restricted Pod Security Standard. Keep in sync with
+      # operator.podSecurityContext in charts/redguard/values.yaml.
       securityContext:
-        # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
-        # This ensures that deployments meet the highest security requirements for Kubernetes.
-        # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
         runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:

@@ -68,6 +68,17 @@ var _ = BeforeSuite(func() {
 	Expect(utils.LoadImageToKindClusterWithName(projectImage)).To(Succeed(),
 		"failed to load the operator image into kind")
 
+	// Enforcement is turned on before anything is installed, so the API server
+	// rejects the operator pod and every pod the operator builds unless they
+	// meet the restricted standard. The suite forming a cluster is then proof
+	// of compliance rather than an assertion about it.
+	By("enforcing the restricted Pod Security Standard on both namespaces")
+	_, _ = kubectl("create", "namespace", operatorNamespace)
+	for _, ns := range []string{operatorNamespace, clusterNamespace} {
+		Expect(enforceRestrictedPodSecurity(ns)).To(Succeed(),
+			"failed to label namespace %s", ns)
+	}
+
 	By("installing the chart")
 	_, err = run("helm", "upgrade", "--install", helmRelease, chartPath,
 		"--namespace", operatorNamespace,
@@ -88,5 +99,12 @@ var _ = AfterSuite(func() {
 	By("removing the operator namespace")
 	if _, err := kubectl("delete", "namespace", operatorNamespace, "--ignore-not-found"); err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "namespace delete failed: %v\n", err)
+	}
+
+	// The cluster namespace outlives the suite, so its enforcement labels are
+	// removed rather than left on a namespace the suite no longer owns.
+	By("clearing the Pod Security labels from the cluster namespace")
+	if err := clearPodSecurityLabels(clusterNamespace); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "namespace unlabel failed: %v\n", err)
 	}
 })

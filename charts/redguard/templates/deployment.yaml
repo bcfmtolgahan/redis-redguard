@@ -21,8 +21,7 @@ spec:
     spec:
       serviceAccountName: {{ include "redguard.serviceAccountName" . }}
       securityContext:
-        runAsNonRoot: {{ .Values.operator.securityContext.runAsNonRoot }}
-        runAsUser: {{ .Values.operator.securityContext.runAsUser }}
+        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
       containers:
       - name: manager
         image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
@@ -36,10 +35,7 @@ spec:
         {{- end }}
         - --health-probe-bind-address=:{{ .Values.health.port }}
         securityContext:
-          allowPrivilegeEscalation: {{ .Values.operator.securityContext.allowPrivilegeEscalation }}
-          capabilities:
-            drop:
-            {{- toYaml .Values.operator.securityContext.capabilities.drop | nindent 12 }}
+          {{- toYaml .Values.operator.containerSecurityContext | nindent 10 }}
         livenessProbe:
           httpGet:
             path: /healthz
