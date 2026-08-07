@@ -2,6 +2,9 @@ package builder
 
 import (
 	"fmt"
+	"maps"
+	"regexp"
+	"slices"
 	"strings"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
@@ -338,6 +341,96 @@ fi
 chmod 600 "$STATE"
 exec redis-sentinel "$STATE"
 `, masterHost)
+}
+
+// reservedDirectives are redis.conf/sentinel.conf directives the operator owns
+// or that would subvert authentication, transport, replication topology or the
+// server process itself. Redis parses directive names case-insensitively, so
+// lookups happen on the lowercased name.
+var reservedDirectives = map[string]struct{}{
+	"requirepass":              {},
+	"masterauth":               {},
+	"masteruser":               {},
+	"user":                     {},
+	"aclfile":                  {},
+	"port":                     {},
+	"bind":                     {},
+	"dir":                      {},
+	"include":                  {},
+	"loadmodule":               {},
+	"rename-command":           {},
+	"unixsocket":               {},
+	"unixsocketperm":           {},
+	"protected-mode":           {},
+	"enable-protected-configs": {},
+	"enable-debug-command":     {},
+	"enable-module-command":    {},
+	"replicaof":                {},
+	"slaveof":                  {},
+	"replica-announce-ip":      {},
+	"replica-announce-port":    {},
+	"slave-announce-ip":        {},
+	"slave-announce-port":      {},
+}
+
+// reservedSentinelDirectives are the "sentinel <name>" directives the operator
+// owns; overriding them re-points monitoring or leaks credentials.
+var reservedSentinelDirectives = map[string]struct{}{
+	"monitor":            {},
+	"auth-pass":          {},
+	"auth-user":          {},
+	"announce-ip":        {},
+	"announce-port":      {},
+	"announce-hostnames": {},
+	"resolve-hostnames":  {},
+	"rename-command":     {},
+	"sentinel-user":      {},
+	"sentinel-pass":      {},
+}
+
+// configTokenPattern is the shape of one directive-name token.
+var configTokenPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]*$`)
+
+// ValidateCustomConfig rejects customConfig entries that could smuggle extra
+// directives past the renderer or override directives the operator owns. A key
+// is one directive name, or "sentinel <name>" for sentinel directives; values
+// may not contain line breaks, which is what keeps the "<key> <value>" line
+// rendering injection-proof.
+func ValidateCustomConfig(cfg map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(cfg)) {
+		value := cfg[key]
+		if strings.ContainsAny(key, "\n\r") || strings.ContainsAny(value, "\n\r") {
+			return fmt.Errorf("key %q: keys and values must not contain line breaks", key)
+		}
+		fields := strings.Fields(key)
+		if len(fields) == 0 {
+			return fmt.Errorf("key %q: empty directive name", key)
+		}
+		for _, f := range fields {
+			if !configTokenPattern.MatchString(f) {
+				return fmt.Errorf("key %q: %q is not a valid directive token", key, f)
+			}
+		}
+		directive := strings.ToLower(fields[0])
+		switch {
+		case directive == "sentinel":
+			if len(fields) != 2 {
+				return fmt.Errorf("key %q: sentinel directives take the form \"sentinel <name>\"", key)
+			}
+			if _, reserved := reservedSentinelDirectives[strings.ToLower(fields[1])]; reserved {
+				return fmt.Errorf("key %q is reserved: the operator manages this directive", key)
+			}
+		case len(fields) != 1:
+			return fmt.Errorf("key %q: a key must be a single directive name", key)
+		case strings.HasPrefix(directive, "tls-"):
+			return fmt.Errorf("key %q is reserved: TLS is configured via spec.tls", key)
+		default:
+			if _, reserved := reservedDirectives[directive]; reserved {
+				return fmt.Errorf("key %q is reserved: the operator manages this directive", key)
+			}
+		}
+	}
+	return nil
 }
 
 // buildLabels creates standard labels for resources

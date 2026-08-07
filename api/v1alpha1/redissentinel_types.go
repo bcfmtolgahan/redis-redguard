@@ -44,7 +44,10 @@ type RedisConfig struct {
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`
 
-	// CustomConfig allows custom Redis configuration
+	// CustomConfig allows custom Redis configuration. A key is one directive
+	// name; keys and values must not contain line breaks, and directives the
+	// operator owns (requirepass, masterauth, user, aclfile, tls-*, port,
+	// bind, dir, replicaof, slaveof, ...) are rejected at reconcile.
 	// +optional
 	CustomConfig map[string]string `json:"customConfig,omitempty"`
 
@@ -81,7 +84,10 @@ type SentinelConfig struct {
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
-	// CustomConfig allows custom Sentinel configuration
+	// CustomConfig allows custom Sentinel configuration. A key is one
+	// directive name or "sentinel <name>"; keys and values must not contain
+	// line breaks, and directives the operator owns (sentinel monitor,
+	// sentinel auth-pass, port, bind, tls-*, ...) are rejected at reconcile.
 	// +optional
 	CustomConfig map[string]string `json:"customConfig,omitempty"`
 }

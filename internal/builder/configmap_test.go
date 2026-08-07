@@ -519,6 +519,105 @@ func TestBuildSentinelConfigMap_InitScriptResolvesMaster(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// customConfig validation
+// ---------------------------------------------------------------------------
+
+func TestCustomConfigRejectsNewlines(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  map[string]string
+	}{
+		{"newline in value", map[string]string{"maxmemory": "1gb\nrequirepass hacked"}},
+		{"carriage return in value", map[string]string{"maxmemory": "1gb\rrequirepass hacked"}},
+		{"crlf in value", map[string]string{"maxmemory": "1gb\r\nrequirepass hacked"}},
+		{"newline in key", map[string]string{"maxmemory 1gb\nrequirepass": "hacked"}},
+		{"trailing newline in value", map[string]string{"maxmemory": "1gb\n"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateCustomConfig(tc.cfg); err == nil {
+				t.Errorf("ValidateCustomConfig(%q) = nil, want line-break rejection", tc.cfg)
+			}
+		})
+	}
+}
+
+func TestCustomConfigCannotOverrideAuthDirectives(t *testing.T) {
+	reserved := []string{
+		"requirepass",
+		"REQUIREPASS",
+		"Requirepass",
+		"masterauth",
+		"masteruser",
+		"user",
+		"aclfile",
+		"tls-port",
+		"tls-cert-file",
+		"tls-auth-clients",
+		"TLS-PORT",
+		"port",
+		"bind",
+		"replicaof",
+		"slaveof",
+		"dir",
+		"include",
+		"loadmodule",
+		"rename-command",
+		"unixsocket",
+		"protected-mode",
+		"enable-protected-configs",
+		"enable-debug-command",
+		"enable-module-command",
+		"replica-announce-ip",
+		"sentinel monitor",
+		"sentinel auth-pass",
+		"sentinel auth-user",
+		"sentinel announce-ip",
+		"sentinel resolve-hostnames",
+		"SENTINEL AUTH-PASS",
+	}
+	for _, key := range reserved {
+		if err := ValidateCustomConfig(map[string]string{key: "x"}); err == nil {
+			t.Errorf("ValidateCustomConfig accepted reserved key %q", key)
+		}
+	}
+}
+
+func TestCustomConfigRejectsMalformedKeys(t *testing.T) {
+	malformed := []string{
+		"",
+		"   ",
+		"maxmemory 1gb",
+		"maxmemory-policy allkeys-lru extra",
+		"sentinel",
+		"sentinel deny-scripts-reconfig yes",
+		"foo;bar",
+		"föö",
+	}
+	for _, key := range malformed {
+		if err := ValidateCustomConfig(map[string]string{key: "x"}); err == nil {
+			t.Errorf("ValidateCustomConfig accepted malformed key %q", key)
+		}
+	}
+}
+
+func TestCustomConfigAllowsTuningDirectives(t *testing.T) {
+	allowed := map[string]string{
+		"maxmemory":                      "256mb",
+		"maxmemory-policy":               "allkeys-lru",
+		"appendfsync":                    "everysec",
+		"save":                           "900 1",
+		"client-output-buffer-limit":     "normal 0 0 0",
+		"sentinel deny-scripts-reconfig": "yes",
+	}
+	for k, v := range allowed {
+		if err := ValidateCustomConfig(map[string]string{k: v}); err != nil {
+			t.Errorf("ValidateCustomConfig rejected legitimate entry %q=%q: %v", k, v, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // labels
 // ---------------------------------------------------------------------------
 

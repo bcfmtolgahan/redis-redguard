@@ -59,27 +59,38 @@ spec:
                 description: ACLRules define the permissions for this user
                 properties:
                   categories:
-                    description: Categories are ACL categories (+@all, +@read, +@write,
-                      etc.)
+                    description: Categories are ACL categories (+@read, +@write, etc.)
                     items:
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[^\s()]+$
                       type: string
                     type: array
                   channels:
                     description: Channels are pub/sub channel patterns (&*, &notifications:*,
                       etc.)
                     items:
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[^\s()]+$
                       type: string
                     type: array
                   commands:
                     description: Commands are allowed Redis commands (+get, +set,
                       -del, etc.)
                     items:
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[^\s()]+$
                       type: string
                     type: array
                   keys:
                     description: Keys are key patterns this user can access (~*, ~app:*,
                       etc.)
                     items:
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[^\s()]+$
                       type: string
                     type: array
                 type: object
@@ -96,9 +107,17 @@ spec:
                 description: RedisClusterRef references the RedisSentinel instance
                 type: string
               username:
-                description: Username is the Redis ACL username
+                description: |-
+                  Username is the Redis ACL username. The name "default" is reserved: it
+                  is the admin account whose password is requirepass, and redefining it
+                  would reset the cluster password.
+                maxLength: 64
                 minLength: 1
+                pattern: ^[a-zA-Z0-9][a-zA-Z0-9._-]*$
                 type: string
+                x-kubernetes-validations:
+                - message: username 'default' is reserved for the Redis admin account
+                  rule: self != 'default'
             required:
             - passwordSecretRef
             - redisClusterRef

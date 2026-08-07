@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -78,6 +80,15 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.Update(ctx, redisUser); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// Admission enforces the same constraints via CRD validation; this re-check
+	// keeps a stale CRD from letting a hijacking spec through. The failure is
+	// terminal until the spec is edited, so no requeue follows.
+	if err := validateRedisUserSpec(&redisUser.Spec); err != nil {
+		logger.Error(err, "Rejecting invalid RedisUser spec")
+		r.setDegraded(ctx, redisUser, "SpecRejected", err.Error())
+		return ctrl.Result{}, nil
 	}
 
 	// Get the RedisSentinel cluster
@@ -180,7 +191,12 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 		cleanupAttempted := false
 
 		redisSentinel := &redisv1alpha1.RedisSentinel{}
-		if err := r.Get(ctx, types.NamespacedName{
+		if validateUsername(redisUser.Spec.Username) != nil {
+			// The operator never applied a rejected spec, so there is nothing
+			// to clean up; issuing ACL DELUSER for such a name ('default' in
+			// particular is the admin account) must never happen.
+			logger.Info("Skipping ACL cleanup for a username the operator refuses to manage")
+		} else if err := r.Get(ctx, types.NamespacedName{
 			Name:      redisUser.Spec.RedisClusterRef,
 			Namespace: redisUser.Namespace,
 		}, redisSentinel); err == nil {
@@ -251,6 +267,117 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// usernamePattern mirrors the CRD's Pattern marker so a stale CRD cannot let
+// an unvalidated name through.
+var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// validateUsername re-checks the CRD's username constraints at reconcile.
+// Redis usernames are case-sensitive, so only the exact name 'default' is the
+// admin account.
+func validateUsername(username string) error {
+	if username == "default" {
+		return fmt.Errorf("username %q is reserved: it is the Redis admin account whose password is requirepass, and redefining it would reset the cluster password and lock out the operator", username)
+	}
+	if !usernamePattern.MatchString(username) {
+		return fmt.Errorf("username %q must match %s", username, usernamePattern)
+	}
+	return nil
+}
+
+// deniedACLKeywords are standalone rules that weaken authentication or fight
+// the fields the operator renders itself (password, on/off, reset).
+var deniedACLKeywords = map[string]string{
+	"nopass":      "it creates a passwordless account",
+	"reset":       "it discards the operator-managed password and state",
+	"resetpass":   "it discards the operator-managed password",
+	"on":          "user activation is controlled by spec.enabled",
+	"off":         "user activation is controlled by spec.enabled",
+	"allcommands": "it grants every command, including administrative ones",
+}
+
+// deniedACLCategories grant administrative control when added with +@.
+var deniedACLCategories = map[string]struct{}{
+	"all":       {},
+	"admin":     {},
+	"dangerous": {},
+}
+
+// deniedACLCommands can subvert authentication, configuration, replication
+// topology or the server process; the whole command is denied, subcommand
+// grants (+acl|setuser) included.
+var deniedACLCommands = map[string]struct{}{
+	"acl":       {},
+	"config":    {},
+	"shutdown":  {},
+	"debug":     {},
+	"failover":  {},
+	"replicaof": {},
+	"slaveof":   {},
+	"module":    {},
+	"cluster":   {},
+}
+
+// validateACLRules rejects rules that would escalate a RedisUser beyond its
+// own account. Redis parses rules case-insensitively and accepts several rules
+// inside one (...) selector argument, so every rule is lowercased and must be
+// a single bare token before the denylist applies.
+func validateACLRules(rules []string) error {
+	for _, rule := range rules {
+		if err := validateACLRule(rule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateACLRule(rule string) error {
+	if rule == "" {
+		return fmt.Errorf("aclRules: empty rule")
+	}
+	if strings.ContainsFunc(rule, unicode.IsSpace) {
+		return fmt.Errorf("aclRules: rule %q must be a single token", rule)
+	}
+	if strings.ContainsAny(rule, "()") {
+		return fmt.Errorf("aclRules: rule %q: selector syntax is not allowed", rule)
+	}
+	switch rule[0] {
+	case '>', '<', '#', '!':
+		return fmt.Errorf("aclRules: rule %q: passwords are managed via passwordSecretRef", rule)
+	}
+	norm := strings.ToLower(rule)
+	if why, ok := deniedACLKeywords[norm]; ok {
+		return fmt.Errorf("aclRules: rule %q is not allowed: %s", rule, why)
+	}
+	if category, ok := strings.CutPrefix(norm, "+@"); ok {
+		if _, denied := deniedACLCategories[category]; denied {
+			return fmt.Errorf("aclRules: rule %q grants administrative control of the cluster", rule)
+		}
+		return nil
+	}
+	if command, ok := strings.CutPrefix(norm, "+"); ok {
+		base, _, _ := strings.Cut(command, "|")
+		if _, denied := deniedACLCommands[base]; denied {
+			return fmt.Errorf("aclRules: rule %q: command can subvert authentication, configuration or topology", rule)
+		}
+	}
+	return nil
+}
+
+// validateRedisUserSpec re-checks at reconcile what the CRD rejects at
+// admission, so a stale CRD cannot smuggle through a spec that hijacks the
+// 'default' admin account or escalates its ACL grants.
+func validateRedisUserSpec(spec *redisv1alpha1.RedisUserSpec) error {
+	if err := validateUsername(spec.Username); err != nil {
+		return err
+	}
+	var rules []string
+	rules = append(rules, spec.ACLRules.Categories...)
+	rules = append(rules, spec.ACLRules.Commands...)
+	rules = append(rules, spec.ACLRules.Keys...)
+	rules = append(rules, spec.ACLRules.Channels...)
+	return validateACLRules(rules)
 }
 
 func (r *RedisUserReconciler) applyACL(ctx context.Context, redisClient redisclient.Client, redisUser *redisv1alpha1.RedisUser, password string) error {
@@ -382,6 +509,32 @@ func (r *RedisUserReconciler) getAllRedisPodAddresses(ctx context.Context, redis
 	}
 
 	return addresses, nil
+}
+
+// setDegraded reports a terminal, spec-caused failure: only a spec edit can
+// clear it, and that edit triggers its own reconcile.
+func (r *RedisUserReconciler) setDegraded(ctx context.Context, redisUser *redisv1alpha1.RedisUser, reason, message string) {
+	redisUser.Status.Phase = "Degraded"
+	now := metav1.Now()
+	redisUser.Status.Conditions = []metav1.Condition{
+		{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			LastTransitionTime: now,
+			Reason:             reason,
+			Message:            message,
+		},
+		{
+			Type:               "Degraded",
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: now,
+			Reason:             reason,
+			Message:            message,
+		},
+	}
+	if err := r.Status().Update(ctx, redisUser); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update RedisUser status")
+	}
 }
 
 func (r *RedisUserReconciler) updateStatus(ctx context.Context, redisUser *redisv1alpha1.RedisUser, phase string, appliedTo []string, errorMsg string) {

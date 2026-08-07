@@ -23,22 +23,37 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// ACLRule defines Redis ACL permissions
+// ACLRule defines Redis ACL permissions. Every entry is a single ACL rule
+// token: whitespace and Redis 7 selector syntax are rejected at admission, and
+// the operator additionally refuses privilege-escalating rules (nopass, +@all,
+// +@admin, +acl, +config, ...) at reconcile.
 type ACLRule struct {
-	// Categories are ACL categories (+@all, +@read, +@write, etc.)
+	// Categories are ACL categories (+@read, +@write, etc.)
 	// +optional
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=128
+	// +kubebuilder:validation:items:Pattern=`^[^\s()]+$`
 	Categories []string `json:"categories,omitempty"`
 
 	// Commands are allowed Redis commands (+get, +set, -del, etc.)
 	// +optional
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=128
+	// +kubebuilder:validation:items:Pattern=`^[^\s()]+$`
 	Commands []string `json:"commands,omitempty"`
 
 	// Keys are key patterns this user can access (~*, ~app:*, etc.)
 	// +optional
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=128
+	// +kubebuilder:validation:items:Pattern=`^[^\s()]+$`
 	Keys []string `json:"keys,omitempty"`
 
 	// Channels are pub/sub channel patterns (&*, &notifications:*, etc.)
 	// +optional
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=128
+	// +kubebuilder:validation:items:Pattern=`^[^\s()]+$`
 	Channels []string `json:"channels,omitempty"`
 }
 
@@ -48,9 +63,14 @@ type RedisUserSpec struct {
 	// +required
 	RedisClusterRef string `json:"redisClusterRef"`
 
-	// Username is the Redis ACL username
+	// Username is the Redis ACL username. The name "default" is reserved: it
+	// is the admin account whose password is requirepass, and redefining it
+	// would reset the cluster password.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
+	// +kubebuilder:validation:XValidation:rule="self != 'default'",message="username 'default' is reserved for the Redis admin account"
 	Username string `json:"username"`
 
 	// PasswordSecretRef references a Secret containing the password

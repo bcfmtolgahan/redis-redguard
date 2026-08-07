@@ -19,8 +19,15 @@ package controller
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
 )
 
 // These specs exercise the CRD's CEL rules against a real API server. A spec
@@ -54,5 +61,92 @@ var _ = Describe("RedisSentinel TLS validation", func() {
 
 		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+	})
+})
+
+// customConfig is validated at reconcile, not at admission: the reserved-
+// directive logic (case-insensitive names, tls- prefix, sentinel sub-
+// directives) is not reasonably expressible in CEL. A rejected spec must
+// degrade the CR with an actionable message and must never render a ConfigMap
+// carrying the injected directive.
+var _ = Describe("RedisSentinel customConfig validation", func() {
+	It("degrades on an injected directive instead of rendering it", func() {
+		rs := newTestSentinel("customconfig-inject", "default")
+		rs.Spec.RedisConfig.CustomConfig = map[string]string{
+			"maxmemory": "1gb\nrequirepass hacked",
+		}
+		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+
+		key := types.NamespacedName{Name: rs.Name, Namespace: rs.Namespace}
+		reconciler := &RedisSentinelReconciler{
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: redisfake.NewFactory(),
+		}
+
+		// The manager-owned reconciler works the same CR in the background, so
+		// a conflict on the finalizer update is possible; retry until the CR
+		// reports the terminal state.
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+
+			updated := &redisv1alpha1.RedisSentinel{}
+			g.Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+			g.Expect(updated.Status.Phase).To(Equal("Degraded"))
+
+			cond := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+			g.Expect(cond).NotTo(BeNil())
+			g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			g.Expect(cond.Message).To(ContainSubstring("customConfig"))
+		}).Should(Succeed())
+
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: rs.Name + "-redis-config", Namespace: rs.Namespace}, cm)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "no ConfigMap may be rendered from a rejected spec")
+
+		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &redisv1alpha1.RedisSentinel{}))).To(BeTrue())
+		}).Should(Succeed())
+	})
+
+	It("degrades on a reserved sentinel directive override", func() {
+		rs := newTestSentinel("customconfig-reserved", "default")
+		rs.Spec.SentinelConfig.CustomConfig = map[string]string{
+			"sentinel auth-pass": "other-master stolen",
+		}
+		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+
+		key := types.NamespacedName{Name: rs.Name, Namespace: rs.Namespace}
+		reconciler := &RedisSentinelReconciler{
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: redisfake.NewFactory(),
+		}
+
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+
+			updated := &redisv1alpha1.RedisSentinel{}
+			g.Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+			g.Expect(updated.Status.Phase).To(Equal("Degraded"))
+		}).Should(Succeed())
+
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: rs.Name + "-sentinel-config", Namespace: rs.Namespace}, cm)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &redisv1alpha1.RedisSentinel{}))).To(BeTrue())
+		}).Should(Succeed())
 	})
 })

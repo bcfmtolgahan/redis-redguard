@@ -70,7 +70,11 @@ spec:
                   customConfig:
                     additionalProperties:
                       type: string
-                    description: CustomConfig allows custom Redis configuration
+                    description: |-
+                      CustomConfig allows custom Redis configuration. A key is one directive
+                      name; keys and values must not contain line breaks, and directives the
+                      operator owns (requirepass, masterauth, user, aclfile, tls-*, port,
+                      bind, dir, replicaof, slaveof, ...) are rejected at reconcile.
                     type: object
                   image:
                     default: redis:7-alpine
@@ -164,7 +168,11 @@ spec:
                   customConfig:
                     additionalProperties:
                       type: string
-                    description: CustomConfig allows custom Sentinel configuration
+                    description: |-
+                      CustomConfig allows custom Sentinel configuration. A key is one
+                      directive name or "sentinel <name>"; keys and values must not contain
+                      line breaks, and directives the operator owns (sentinel monitor,
+                      sentinel auth-pass, port, bind, tls-*, ...) are rejected at reconcile.
                     type: object
                   downAfterMilliseconds:
                     default: 5000

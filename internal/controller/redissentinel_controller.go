@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -114,6 +115,16 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// customConfig is validated here rather than at admission: the reserved-
+	// directive logic is not reasonably expressible in CEL. The failure is
+	// terminal until the spec is edited, so no requeue follows.
+	if err := r.validateSpec(rs); err != nil {
+		logger.Error(err, "Rejecting invalid RedisSentinel spec")
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "InvalidCustomConfig", err.Error())
+		r.setDegraded(ctx, rs, "InvalidCustomConfig", err.Error())
+		return ctrl.Result{}, nil
+	}
+
 	// Reconcile resources
 	if err := r.reconcileConfigMaps(ctx, rs); err != nil {
 		logger.Error(err, "Failed to reconcile ConfigMaps")
@@ -166,6 +177,33 @@ func (r *RedisSentinelReconciler) handleDeletion(ctx context.Context, rs *redisv
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// validateSpec covers the spec constraints the CRD schema cannot express.
+func (r *RedisSentinelReconciler) validateSpec(rs *redisv1alpha1.RedisSentinel) error {
+	if err := builder.ValidateCustomConfig(rs.Spec.RedisConfig.CustomConfig); err != nil {
+		return fmt.Errorf("spec.redisConfig.customConfig: %w", err)
+	}
+	if err := builder.ValidateCustomConfig(rs.Spec.SentinelConfig.CustomConfig); err != nil {
+		return fmt.Errorf("spec.sentinelConfig.customConfig: %w", err)
+	}
+	return nil
+}
+
+// setDegraded reports a terminal, spec-caused failure. The next successful
+// reconcile rebuilds the condition set and clears it.
+func (r *RedisSentinelReconciler) setDegraded(ctx context.Context, rs *redisv1alpha1.RedisSentinel, reason, message string) {
+	rs.Status.Phase = "Degraded"
+	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
+		Type:               "Degraded",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: rs.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+	if err := r.Status().Update(ctx, rs); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update RedisSentinel status")
+	}
 }
 
 func (r *RedisSentinelReconciler) reconcileConfigMaps(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
