@@ -7,8 +7,6 @@
 bin/*
 Dockerfile.cross
 
-.git
-
 # Test binary, built with `go test -c`
 *.test
 
@@ -31,3 +29,5 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
+# planning docs (local only)
+planning/
