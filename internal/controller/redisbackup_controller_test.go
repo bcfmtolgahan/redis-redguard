@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -32,17 +33,31 @@ import (
 
 var _ = Describe("RedisBackup Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+		const (
+			resourceName = "test-resource"
+			clusterName  = "test-cluster"
+		)
 
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
 		redisbackup := &redisv1alpha1.RedisBackup{}
 
+		var controllerReconciler *RedisBackupReconciler
+
 		BeforeEach(func() {
+			By("creating the RedisSentinel cluster the backup refers to")
+			ensureTestSentinel(clusterName, "default")
+
+			By("creating the S3 credentials secret")
+			ensureSecret("s3-creds", "default", map[string][]byte{
+				"accessKeyId":     []byte("test-access-key"),
+				"secretAccessKey": []byte("test-secret-key"),
+			})
+
 			By("creating the custom resource for the Kind RedisBackup")
 			err := k8sClient.Get(ctx, typeNamespacedName, redisbackup)
 			if err != nil && errors.IsNotFound(err) {
@@ -51,34 +66,59 @@ var _ = Describe("RedisBackup Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: redisv1alpha1.RedisBackupSpec{
+						RedisClusterRef: clusterName,
+						// A daily schedule keeps the reconcile on the
+						// "nothing to do yet, requeue" path, so no Redis pod
+						// and no S3 bucket are needed.
+						Schedule: "0 2 * * *",
+						S3: redisv1alpha1.S3Config{
+							Bucket:               "test-bucket",
+							Region:               "us-east-1",
+							CredentialsSecretRef: "s3-creds",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			}
+
+			controllerReconciler = &RedisBackupReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &redisv1alpha1.RedisBackup{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Cleanup the specific resource instance RedisBackup")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			// Reconcile once more so the finalizer added above is removed.
+			Eventually(func(g Gomega) {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				g.Expect(err).NotTo(HaveOccurred())
+				err = k8sClient.Get(ctx, typeNamespacedName, resource)
+				g.Expect(errors.IsNotFound(err)).To(BeTrue())
+			}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
 		})
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &RedisBackupReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("requeueing until the next scheduled backup window")
+			Expect(result.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+
+			By("adding the backup finalizer")
+			backup := &redisv1alpha1.RedisBackup{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, backup)).To(Succeed())
+			Expect(backup.Finalizers).To(ContainElement(redisBackupFinalizer))
 		})
 	})
 })

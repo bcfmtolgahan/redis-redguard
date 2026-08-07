@@ -25,12 +25,21 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -40,11 +49,24 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	ctx       context.Context
-	cancel    context.CancelFunc
-	testEnv   *envtest.Environment
-	cfg       *rest.Config
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	testEnv *envtest.Environment
+	cfg     *rest.Config
+
+	// k8sClient talks to the API server directly (no cache). Specs need
+	// read-after-write consistency, which the Manager's cached client cannot
+	// guarantee, so this is deliberately NOT k8sManager.GetClient().
 	k8sClient client.Client
+
+	// k8sManager is a real controller-runtime Manager: it exercises
+	// SetupWithManager, the informer cache and the watch/requeue machinery.
+	k8sManager manager.Manager
+
+	// testRecorder is handed to the reconcilers that specs construct
+	// themselves, so events can be asserted without a nil-pointer panic.
+	testRecorder *record.FakeRecorder
 )
 
 func TestControllers(t *testing.T) {
@@ -83,6 +105,33 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	By("starting a real controller manager")
+	k8sManager, err = ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	Expect(err).NotTo(HaveOccurred())
+
+	testRecorder = record.NewFakeRecorder(100)
+
+	// The managed reconciler gets the Manager's real recorder rather than
+	// testRecorder: FakeRecorder.Event blocks once its buffer is full, which
+	// would wedge the Manager's worker goroutine after 100 background
+	// reconciles. testRecorder stays reserved for spec-owned reconcilers.
+	err = (&RedisSentinelReconciler{
+		Client:   k8sManager.GetClient(),
+		Scheme:   k8sManager.GetScheme(),
+		Recorder: k8sManager.GetEventRecorderFor("redissentinel"),
+	}).SetupWithManager(k8sManager)
+	Expect(err).NotTo(HaveOccurred())
+
+	go func() {
+		defer GinkgoRecover()
+		Expect(k8sManager.Start(ctx)).To(Succeed())
+	}()
+
+	Expect(k8sManager.GetCache().WaitForCacheSync(ctx)).To(BeTrue())
 })
 
 var _ = AfterSuite(func() {
@@ -91,6 +140,65 @@ var _ = AfterSuite(func() {
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
 })
+
+// newTestSentinel returns a minimal RedisSentinel that satisfies the CRD schema.
+// Field names/types follow api/v1alpha1/redissentinel_types.go: Storage is a
+// *StorageSpec and Size is a resource.Quantity.
+func newTestSentinel(name, ns string) *redisv1alpha1.RedisSentinel {
+	return &redisv1alpha1.RedisSentinel{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: redisv1alpha1.RedisSentinelSpec{
+			RedisConfig: redisv1alpha1.RedisConfig{
+				Replicas: 3,
+				Image:    "redis:7-alpine",
+				Storage: &redisv1alpha1.StorageSpec{
+					Size: resource.MustParse("1Gi"),
+				},
+			},
+			SentinelConfig: redisv1alpha1.SentinelConfig{
+				Replicas:              3,
+				Quorum:                2,
+				DownAfterMilliseconds: 5000,
+				FailoverTimeout:       10000,
+				ParallelSyncs:         1,
+			},
+			ServiceType: corev1.ServiceTypeClusterIP,
+		},
+	}
+}
+
+// ensureTestSentinel creates the RedisSentinel referenced by dependent CRs if it
+// is not there yet. Top-level containers are randomized by Ginkgo, so every
+// spec has to be able to create its own fixtures.
+func ensureTestSentinel(name, ns string) *redisv1alpha1.RedisSentinel {
+	GinkgoHelper()
+
+	existing := &redisv1alpha1.RedisSentinel{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, existing)
+	if err == nil {
+		return existing
+	}
+	Expect(apierrors.IsNotFound(err)).To(BeTrue(), "unexpected error getting RedisSentinel %s/%s: %v", ns, name, err)
+
+	sentinel := newTestSentinel(name, ns)
+	Expect(k8sClient.Create(ctx, sentinel)).To(Succeed())
+	return sentinel
+}
+
+// ensureSecret creates an opaque Secret if it does not exist yet.
+func ensureSecret(name, ns string, data map[string][]byte) {
+	GinkgoHelper()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Data:       data,
+	}
+	err := k8sClient.Create(ctx, secret)
+	if apierrors.IsAlreadyExists(err) {
+		return
+	}
+	Expect(err).NotTo(HaveOccurred())
+}
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by

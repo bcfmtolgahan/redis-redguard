@@ -18,14 +18,13 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 )
@@ -38,47 +37,61 @@ var _ = Describe("RedisSentinel Controller", func() {
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
 		redissentinel := &redisv1alpha1.RedisSentinel{}
+
+		var controllerReconciler *RedisSentinelReconciler
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind RedisSentinel")
 			err := k8sClient.Get(ctx, typeNamespacedName, redissentinel)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &redisv1alpha1.RedisSentinel{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+				Expect(k8sClient.Create(ctx, newTestSentinel(resourceName, "default"))).To(Succeed())
+			}
+
+			controllerReconciler = &RedisSentinelReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: testRecorder,
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &redisv1alpha1.RedisSentinel{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Cleanup the specific resource instance RedisSentinel")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			// The reconciler adds a finalizer, so the object only disappears
+			// once a reconcile of the deletion has removed it again. The
+			// Manager-owned controller does that too; driving it here keeps the
+			// cleanup deterministic.
+			Eventually(func(g Gomega) {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				g.Expect(err).NotTo(HaveOccurred())
+				err = k8sClient.Get(ctx, typeNamespacedName, resource)
+				g.Expect(errors.IsNotFound(err)).To(BeTrue())
+			}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
 		})
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &RedisSentinelReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+			// The same reconciler also runs inside the Manager, so a manual
+			// call can lose an optimistic-concurrency race (409 Conflict /
+			// AlreadyExists). Retry until the reconcile settles.
+			var result reconcile.Result
+			Eventually(func() error {
+				var err error
+				result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: typeNamespacedName,
+				})
+				return err
+			}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
 		})
 	})
 })

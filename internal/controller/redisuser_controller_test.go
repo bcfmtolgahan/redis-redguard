@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -32,17 +33,30 @@ import (
 
 var _ = Describe("RedisUser Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+		const (
+			resourceName = "test-resource"
+			clusterName  = "test-cluster"
+		)
 
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
 		redisuser := &redisv1alpha1.RedisUser{}
 
+		var controllerReconciler *RedisUserReconciler
+
 		BeforeEach(func() {
+			By("creating the RedisSentinel cluster the user belongs to")
+			ensureTestSentinel(clusterName, "default")
+
+			By("creating the user password secret")
+			ensureSecret("user-pass", "default", map[string][]byte{
+				"password": []byte("test-password"),
+			})
+
 			By("creating the custom resource for the Kind RedisUser")
 			err := k8sClient.Get(ctx, typeNamespacedName, redisuser)
 			if err != nil && errors.IsNotFound(err) {
@@ -51,34 +65,55 @@ var _ = Describe("RedisUser Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: redisv1alpha1.RedisUserSpec{
+						RedisClusterRef:   clusterName,
+						Username:          "testuser",
+						PasswordSecretRef: "user-pass",
+						Enabled:           true,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			}
+
+			controllerReconciler = &RedisUserReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &redisv1alpha1.RedisUser{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Cleanup the specific resource instance RedisUser")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &RedisUserReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			// Reconcile once more so the finalizer added above is removed.
+			Eventually(func(g Gomega) {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				g.Expect(err).NotTo(HaveOccurred())
+				err = k8sClient.Get(ctx, typeNamespacedName, resource)
+				g.Expect(errors.IsNotFound(err)).To(BeTrue())
+			}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+		})
+
+		It("should report that there are no Redis pods to apply the ACL to", func() {
+			By("Reconciling the created resource")
+			// envtest runs no kubelet, so the StatefulSet never produces pods
+			// and the reconciler cannot reach a Redis instance. Assert the
+			// observed outcome; Task 1.3 replaces this with the fake Redis
+			// client and asserts the applied ACL instead.
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			Expect(err).To(MatchError(ContainSubstring("no running Redis pods")))
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+			By("recording the failure in the status")
+			user := &redisv1alpha1.RedisUser{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, user)).To(Succeed())
+			Expect(user.Status.Phase).To(Equal("Error"))
 		})
 	})
 })
