@@ -23,483 +23,358 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	"github.com/redguard/redguard/test/utils"
 )
 
-// namespace where the project is deployed in
-const namespace = "redguard-system"
+const (
+	// The samples pin their own namespace, so the specs follow them rather
+	// than applying the same manifests somewhere else.
+	clusterNamespace = "default"
 
-// serviceAccountName created for the project
-const serviceAccountName = "redguard-controller-manager"
+	sentinelManifest = "config/samples/redis_v1alpha1_redissentinel.yaml"
+	userManifest     = "config/samples/redis_v1alpha1_redisuser.yaml"
 
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "redguard-controller-manager-metrics-service"
+	// Names created by the sample manifests above.
+	sentinelName = "redis-cluster"
+	userName     = "app-user"
+	userSecret   = "app-user-password"
 
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "redguard-metrics-binding"
+	// metricsReaderRole grants the scrape itself. The chart ships the
+	// authn/authz roles the operator needs to validate a scraper's token,
+	// but granting /metrics is the cluster owner's decision.
+	metricsReaderRole    = "redguard-e2e-metrics-reader"
+	metricsReaderBinding = "redguard-e2e-metrics-reader-binding"
+	curlPod              = "curl-metrics"
 
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
+	// failoverKey is written before the master is killed and read back after.
+	failoverKey   = "redguard-e2e:failover"
+	failoverValue = "written-before-failover"
+)
 
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
-	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+var (
+	redisSelector    = componentSelector(sentinelName, "redis")
+	sentinelSelector = componentSelector(sentinelName, "sentinel")
+)
 
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+var _ = Describe("Redguard", Ordered, func() {
+	var controllerPod string
 
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
+		By("deleting the sample resources")
+		_, _ = kubectl("delete", "-f", userManifest, "--ignore-not-found", "--timeout=2m")
+		_, _ = kubectl("delete", "secret", userSecret, "-n", clusterNamespace, "--ignore-not-found")
+		_, _ = kubectl("delete", "-f", sentinelManifest, "--ignore-not-found", "--timeout=5m")
 
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
+		By("deleting the StatefulSet volumes, which no owner reference reclaims")
+		_, _ = kubectl("delete", "pvc", "-n", clusterNamespace, "-l", redisSelector, "--ignore-not-found")
 
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		By("deleting the metrics test fixtures")
+		_, _ = kubectl("delete", "clusterrolebinding", metricsReaderBinding, "--ignore-not-found")
+		_, _ = kubectl("delete", "clusterrole", metricsReaderRole, "--ignore-not-found")
+		_, _ = kubectl("delete", "pod", curlPod, "-n", operatorNamespace, "--ignore-not-found")
 	})
 
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
 	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
+		if CurrentSpecReport().Failed() {
+			dumpCluster(clusterNamespace, sentinelName)
 		}
 	})
 
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
+	It("runs the operator installed from the chart", func() {
+		By("waiting for the controller pod to become ready")
+		Eventually(func(g Gomega) {
+			pods, err := listPods(operatorNamespace, "control-plane=controller-manager")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(pods).To(HaveLen(1), "expected exactly one controller pod, got %v", pods)
+			g.Expect(pods[0].Ready).To(BeTrue(), "controller pod is not ready: %+v", pods[0])
+			controllerPod = pods[0].Name
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				// Get the name of the controller-manager pod
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
+		By("checking the chart RBAC covers what the operator does at startup")
+		logs, err := kubectl("logs", controllerPod, "-n", operatorNamespace)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(logs).NotTo(ContainSubstring("is forbidden"),
+			"the ClusterRole shipped by the chart is missing a permission the operator needs")
+		Expect(logs).To(ContainSubstring("Starting workers"),
+			"no controller reached its work loop")
+	})
 
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+	It("brings up a healthy 3-node cluster with one master", func() {
+		By("applying the RedisSentinel sample")
+		_, err := kubectl("apply", "-f", sentinelManifest)
+		Expect(err).NotTo(HaveOccurred())
 
-				// Validate the pod's status
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
+		By("waiting for the cluster to converge on a single master within five minutes")
+		Eventually(func(g Gomega) {
+			redis, err := listPods(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(readyPods(redis)).To(HaveLen(3), "ready redis pods: %v", redis)
+
+			sentinels, err := listPods(clusterNamespace, sentinelSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(readyPods(sentinels)).To(HaveLen(3), "ready sentinel pods: %v", sentinels)
+
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			masters, replicas := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "exactly one master expected: %v", states)
+			g.Expect(replicas).To(HaveLen(2), "two replicas expected: %v", states)
+			for _, replica := range replicas {
+				g.Expect(replica.MasterLinkStatus).To(Equal("up"),
+					"replica is not in sync with the master: %s", replica)
+				g.Expect(replica.MasterHost).To(Equal(masters[0].IP),
+					"replica follows a different master than the one that reports role:master: %s", replica)
 			}
-			Eventually(verifyControllerUp).Should(Succeed())
-		})
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=redguard-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			status, err := getSentinelStatus(clusterNamespace, sentinelName)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(status.Phase).To(Equal("Running"), "status: %+v", status)
+			g.Expect(status.MasterNode).To(Equal(masters[0].IP+":6379"),
+				"the CR reports a master address that is not the pod serving as master")
+			g.Expect(status.ReadyReplicas).To(Equal(3))
+			g.Expect(status.ReadySentinels).To(Equal(3))
 
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
+			available, message := status.condition("Available")
+			g.Expect(available).To(Equal("True"), "Available condition: %s", message)
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-			By("getting the service account token")
-			token, err := serviceAccountToken()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
+		// Sentinel learns about replicas from INFO polling and about its peers
+		// from the master's pub/sub channel, so the full topology becomes
+		// visible a few seconds after the replicas are already in sync.
+		By("checking every Sentinel monitors the same master and sees the full quorum")
+		Eventually(func(g Gomega) {
+			sentinels, err := listPods(clusterNamespace, sentinelSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(readyPods(sentinels)).To(HaveLen(3))
 
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
+			status, err := getSentinelStatus(clusterNamespace, sentinelName)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			for _, s := range readyPods(sentinels) {
+				out, err := redisCLI(clusterNamespace, s.Name, "-p", "26379",
+					"SENTINEL", "get-master-addr-by-name", sentinelName+"-master")
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
+				fields := strings.Fields(out)
+				g.Expect(fields).To(HaveLen(2), "unexpected sentinel reply from %s: %q", s.Name, out)
+				g.Expect(fields[0]+":"+fields[1]).To(Equal(status.MasterNode),
+					"%s monitors a different master than the CR reports", s.Name)
+
+				master, err := redisCLI(clusterNamespace, s.Name, "-p", "26379",
+					"SENTINEL", "master", sentinelName+"-master")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(master).To(ContainSubstring("num-slaves\n2"),
+					"%s does not see both replicas", s.Name)
+				g.Expect(master).To(ContainSubstring("num-other-sentinels\n2"),
+					"%s does not see the other two sentinels", s.Name)
 			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+	})
 
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
+	It("applies an ACL user to every node of the cluster", func() {
+		By("creating the user password secret")
+		_, err := kubectl("create", "secret", "generic", userSecret,
+			"--from-literal=password=e2e-app-user-password", "-n", clusterNamespace)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("applying the RedisUser sample")
+		_, err = kubectl("apply", "-f", userManifest)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the RedisUser to report Ready")
+		Eventually(func(g Gomega) {
+			out, err := kubectl("get", "redisuser", userName, "-n", clusterNamespace, "-o", "json")
+			g.Expect(err).NotTo(HaveOccurred())
+			var cr struct {
+				Status struct {
+					Phase     string   `json:"phase"`
+					AppliedTo []string `json:"appliedTo"`
+					Message   string   `json:"message"`
+				} `json:"status"`
 			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+			g.Expect(json.Unmarshal([]byte(out), &cr)).To(Succeed())
+			g.Expect(cr.Status.Phase).To(Equal("Ready"), "status: %+v", cr.Status)
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
+		By("checking the ACL exists on every Redis node, not only on the master")
+		pods, err := listPods(clusterNamespace, redisSelector)
+		Expect(err).NotTo(HaveOccurred())
+		for _, p := range readyPods(pods) {
+			users, err := redisCLI(clusterNamespace, p.Name, "ACL", "LIST")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(users).To(ContainSubstring("user "+userName),
+				"%s has no ACL entry for %s, so the user disappears on failover", p.Name, userName)
+		}
+	})
 
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
+	It("serves authenticated metrics over the endpoint the chart exposes", func() {
+		By("granting the operator service account the right to read /metrics")
+		_, err := kubectl("create", "clusterrole", metricsReaderRole,
+			"--verb=get", "--non-resource-url=/metrics")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = kubectl("create", "clusterrolebinding", metricsReaderBinding,
+			"--clusterrole="+metricsReaderRole,
+			fmt.Sprintf("--serviceaccount=%s:%s", operatorNamespace, helmRelease))
+		Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
+		By("requesting a token for that service account")
+		token, err := serviceAccountToken(operatorNamespace, helmRelease)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(token).NotTo(BeEmpty())
+
+		By("scraping the metrics service from inside the cluster")
+		overrides := fmt.Sprintf(`{
+  "spec": {
+    "containers": [{
+      "name": "curl",
+      "image": "curlimages/curl:8.11.1",
+      "command": ["/bin/sh", "-c"],
+      "args": ["curl -sS -k -f -H 'Authorization: Bearer %s' https://%s-metrics.%s.svc.cluster.local:8080/metrics"],
+      "securityContext": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {"drop": ["ALL"]},
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "seccompProfile": {"type": "RuntimeDefault"}
+      }
+    }],
+    "serviceAccountName": "%s"
+  }
+}`, token, helmRelease, operatorNamespace, helmRelease)
+
+		_, err = kubectl("run", curlPod, "--restart=Never", "-n", operatorNamespace,
+			"--image=curlimages/curl:8.11.1", "--overrides", overrides)
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func(g Gomega) {
+			phase, err := kubectl("get", "pod", curlPod, "-n", operatorNamespace,
+				"-o", "jsonpath={.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(phase).To(Equal("Succeeded"), "scrape pod phase is %q", phase)
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("checking the operator exports its Redis metrics")
+		metrics, err := kubectl("logs", curlPod, "-n", operatorNamespace)
+		Expect(err).NotTo(HaveOccurred())
+		for _, name := range []string{"redis_cluster_info", "redis_connected_replicas", "redis_sentinel_status"} {
+			Expect(metrics).To(ContainSubstring(name), "metric %s is not exported", name)
+		}
+	})
+
+	It("promotes a replica when the master dies and keeps the data", func() {
+		By("finding the current master")
+		states, err := replicationStates(clusterNamespace, redisSelector)
+		Expect(err).NotTo(HaveOccurred())
+		masters, _ := splitByRole(states)
+		Expect(masters).To(HaveLen(1), "no single master to fail over from: %v", states)
+		oldMaster := masters[0]
+
+		By("writing a key and waiting for both replicas to acknowledge it")
+		_, err = redisCLI(clusterNamespace, oldMaster.Pod, "SET", failoverKey, failoverValue)
+		Expect(err).NotTo(HaveOccurred())
+		acked, err := redisCLI(clusterNamespace, oldMaster.Pod, "WAIT", "2", "10000")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(acked).To(Equal("2"),
+			"the write did not reach both replicas, so surviving the failover would prove nothing")
+
+		By("deleting the master pod")
+		_, err = kubectl("delete", "pod", oldMaster.Pod, "-n", clusterNamespace, "--wait=false")
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for Sentinel to promote one of the replicas")
+		var newMaster replicaState
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			masters, _ := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "expected exactly one master during failover: %v", states)
+			g.Expect(masters[0].Pod).NotTo(Equal(oldMaster.Pod),
+				"the deleted pod is master again; no promotion happened")
+			newMaster = masters[0]
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for the CR status to track the new master")
+		Eventually(func(g Gomega) {
+			status, err := getSentinelStatus(clusterNamespace, sentinelName)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(status.MasterNode).NotTo(Equal(oldMaster.IP+":6379"),
+				"the CR still points at the pod that was deleted")
+			g.Expect(status.MasterNode).To(Equal(newMaster.IP+":6379"),
+				"the CR does not report the promoted pod as master")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("reading the pre-failover key back from the new master")
+		value, err := redisCLI(clusterNamespace, newMaster.Pod, "GET", failoverKey)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(value).To(Equal(failoverValue), "the write made before the failover was lost")
+
+		By("waiting for the restarted pod to rejoin as a replica of the new master")
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(states).To(HaveLen(3), "not all pods are back: %v", states)
+			masters, replicas := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "exactly one master expected: %v", states)
+			g.Expect(masters[0].Pod).To(Equal(newMaster.Pod))
+			g.Expect(replicas).To(HaveLen(2))
+			for _, replica := range replicas {
+				g.Expect(replica.MasterLinkStatus).To(Equal("up"),
+					"replica did not resync after the failover: %s", replica)
+				g.Expect(replica.MasterHost).To(Equal(masters[0].IP),
+					"replica follows a stale master address: %s", replica)
 			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+	})
 
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
-		})
+	// The startup check in the first spec only covers the watches the manager
+	// opens before it has reconciled anything. Every permission the operator
+	// needs to build, watch and repair a cluster is only exercised by the specs
+	// above, so the log has to be re-read once they have all run.
+	It("never hits an RBAC denial while running the specs above", func() {
+		pods, err := listPods(operatorNamespace, "control-plane=controller-manager")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pods).To(HaveLen(1))
+		Expect(pods[0].Restarts).To(BeZero(),
+			"the controller restarted during the run, so its earlier logs are gone and something crashed it")
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
-
-		It("should create and manage a RedisSentinel cluster", func() {
-			By("creating a Redis password secret")
-			cmd := exec.Command("kubectl", "create", "secret", "generic", "redis-password",
-				"--from-literal=password=testpassword123",
-				"-n", "default")
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("applying RedisSentinel CR")
-			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/redis_v1alpha1_redissentinel.yaml")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for RedisSentinel to be Running")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "redissentinel", "redissentinel-sample",
-					"-n", "default", "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"))
-			}, 5*time.Minute, 10*time.Second).Should(Succeed())
-
-			By("verifying Redis pods are running")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "-l", "app=redis",
-					"-n", "default", "-o", "jsonpath={.items[*].status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Running"))
-			}, 3*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying NetworkPolicies are created")
-			cmd = exec.Command("kubectl", "get", "networkpolicy", "-n", "default")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(ContainSubstring("redis-netpol"))
-			Expect(output).To(ContainSubstring("sentinel-netpol"))
-
-			By("checking status conditions")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "redissentinel", "redissentinel-sample",
-					"-n", "default", "-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"))
-			}, 3*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("cleaning up RedisSentinel")
-			cmd = exec.Command("kubectl", "delete", "redissentinel", "redissentinel-sample", "-n", "default")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "secret", "redis-password", "-n", "default")
-			_, _ = utils.Run(cmd)
-		})
-
-		It("should test failover scenario", func() {
-			By("creating a Redis password secret")
-			cmd := exec.Command("kubectl", "create", "secret", "generic", "redis-password-failover",
-				"--from-literal=password=testpassword123",
-				"-n", "default")
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("applying RedisSentinel CR for failover test")
-			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/redis_v1alpha1_redissentinel.yaml")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for cluster to be Running")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "redissentinel", "redissentinel-sample",
-					"-n", "default", "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"))
-			}, 5*time.Minute, 10*time.Second).Should(Succeed())
-
-			By("getting current master node")
-			var masterNode string
-			cmd = exec.Command("kubectl", "get", "redissentinel", "redissentinel-sample",
-				"-n", "default", "-o", "jsonpath={.status.masterNode}")
-			masterNodeOutput, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			masterNode = masterNodeOutput
-
-			By("deleting master pod to trigger failover")
-			podName := "redissentinel-sample-redis-0"
-			cmd = exec.Command("kubectl", "delete", "pod", podName, "-n", "default", "--force")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for failover to complete")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "redissentinel", "redissentinel-sample",
-					"-n", "default", "-o", "jsonpath={.status.masterNode}")
-				newMaster, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(newMaster).NotTo(Equal(masterNode))
-				g.Expect(newMaster).NotTo(BeEmpty())
-			}, 3*time.Minute, 10*time.Second).Should(Succeed())
-
-			By("verifying failover event was recorded")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "events", "-n", "default")
-				events, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(events).To(ContainSubstring("FailoverDetected"))
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("cleaning up")
-			cmd = exec.Command("kubectl", "delete", "redissentinel", "redissentinel-sample", "-n", "default")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "secret", "redis-password-failover", "-n", "default")
-			_, _ = utils.Run(cmd)
-		})
-
-		It("should create and apply ACL users", func() {
-			By("creating Redis password secret")
-			cmd := exec.Command("kubectl", "create", "secret", "generic", "redis-password-acl",
-				"--from-literal=password=testpassword123",
-				"-n", "default")
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("creating RedisSentinel cluster")
-			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/redis_v1alpha1_redissentinel.yaml")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for cluster to be Running")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "redissentinel", "redissentinel-sample",
-					"-n", "default", "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"))
-			}, 5*time.Minute, 10*time.Second).Should(Succeed())
-
-			By("creating user password secret")
-			cmd = exec.Command("kubectl", "create", "secret", "generic", "app-user-password",
-				"--from-literal=password=apppass123",
-				"-n", "default")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("applying RedisUser CR")
-			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/redis_v1alpha1_redisuser.yaml")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for RedisUser to be Ready")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "redisuser", "redisuser-sample",
-					"-n", "default", "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Ready"))
-			}, 3*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("cleaning up")
-			cmd = exec.Command("kubectl", "delete", "redisuser", "redisuser-sample", "-n", "default")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "redissentinel", "redissentinel-sample", "-n", "default")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "delete", "secret", "redis-password-acl", "app-user-password", "-n", "default")
-			_, _ = utils.Run(cmd)
-		})
-
-		It("should verify Prometheus metrics are exported", func() {
-			By("checking that redis metrics are available")
-			Eventually(func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(metricsOutput).To(ContainSubstring("redis_cluster_info"))
-				g.Expect(metricsOutput).To(ContainSubstring("redis_connected_replicas"))
-				g.Expect(metricsOutput).To(ContainSubstring("redis_sentinel_status"))
-			}, 2*time.Minute, 10*time.Second).Should(Succeed())
-		})
+		logs, err := kubectl("logs", pods[0].Name, "-n", operatorNamespace)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(logs).NotTo(ContainSubstring("is forbidden"),
+			"the ClusterRole shipped by the chart is missing a permission the operator needs")
+		Expect(logs).NotTo(ContainSubstring("cannot list resource"),
+			"the ClusterRole shipped by the chart is missing a permission the operator needs")
 	})
 })
 
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
+// serviceAccountToken mints a token for a service account through the
+// TokenRequest API.
+func serviceAccountToken(namespace, name string) (string, error) {
+	request := filepath.Join(os.TempDir(), name+"-token-request.json")
+	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest"}`
+	if err := os.WriteFile(request, []byte(body), 0o600); err != nil {
+		return "", err
+	}
+	defer func() { _ = os.Remove(request) }()
 
-	// Temporary file to store the token request
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+	out, err := kubectl("create", "--raw",
+		fmt.Sprintf("/api/v1/namespaces/%s/serviceaccounts/%s/token", namespace, name),
+		"-f", request)
 	if err != nil {
 		return "", err
 	}
 
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		// Execute kubectl command to create the token
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		// Parse the JSON output to extract the token
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
+	var response struct {
+		Status struct {
+			Token string `json:"token"`
+		} `json:"status"`
 	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
+	if err := json.Unmarshal([]byte(out), &response); err != nil {
+		return "", fmt.Errorf("parse token response: %w", err)
+	}
+	return response.Status.Token, nil
 }

@@ -14,18 +14,18 @@ This guide will help you deploy and test Redguard locally using Kind and Helm.
 ### Automated Test (Recommended)
 
 ```bash
-# Run the automated test script
-./test-local.sh
+make test-e2e
 ```
 
-This script will:
-1. ✅ Check Docker is running
-2. ✅ Create Kind cluster
-3. ✅ Build operator image
-4. ✅ Load image to Kind
-5. ✅ Install operator with Helm
-6. ✅ Deploy sample RedisSentinel
-7. ✅ Wait for everything to be ready
+This target will:
+1. Create the Kind cluster
+2. Build the operator image and load it into Kind
+3. Install the operator with Helm from `charts/redguard`
+4. Deploy the sample RedisSentinel and assert a 3-node cluster forms with one master
+5. Kill the master and assert Sentinel promotes a replica without losing data
+6. Delete the Kind cluster
+
+The run fails if any of those assertions does not hold.
 
 ### Manual Steps
 
@@ -133,16 +133,15 @@ kubectl exec -it redis-cluster-sentinel-0 -- redis-cli -p 26379
 
 ### Test Failover (Automated)
 ```bash
-# Run automated failover test
-./test-failover.sh
+make test-e2e
 ```
 
-This will:
-1. Identify current master
-2. Write test data
-3. Delete master pod to trigger failover
-4. Verify new master is elected
-5. Verify data persistence
+The failover spec in the e2e suite:
+1. Identifies the current master
+2. Writes a key and waits for both replicas to acknowledge it
+3. Deletes the master pod
+4. Asserts Sentinel promotes a replica and the CR status follows it
+5. Reads the key back from the new master
 
 ### Manual Failover Test
 ```bash
@@ -213,8 +212,10 @@ kind load docker-image redguard:v0.1.0 --name redguard-test
 
 ### Automated Cleanup
 ```bash
-./cleanup-local.sh
+make cleanup-test-e2e
 ```
+
+`make test-e2e` already runs this on the way out, including when the suite fails.
 
 ### Manual Cleanup
 ```bash

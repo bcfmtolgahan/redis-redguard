@@ -21,7 +21,6 @@ package e2e
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"testing"
 
@@ -31,62 +30,63 @@ import (
 	"github.com/redguard/redguard/test/utils"
 )
 
-var (
-	// Optional Environment Variables:
-	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
-	// These variables are useful if CertManager is already installed, avoiding
-	// re-installation and conflicts.
-	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
-	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
-	isCertManagerAlreadyInstalled = false
+const (
+	// operatorNamespace is where the Helm release is installed.
+	operatorNamespace = "redguard-system"
+	// helmRelease is the release name; every chart resource is named after it.
+	helmRelease = "redguard"
+	// chartPath is the only chart in the repository.
+	chartPath = "charts/redguard"
 
-	// projectImage is the name of the image which will be build and loaded
-	// with the code source changes to be tested.
-	projectImage = "example.com/redguard:v0.0.1"
+	// The operator image is built from this working tree and side-loaded into
+	// kind, so the chart must never try to pull it.
+	imageRepository = "redguard"
+	imageTag        = "e2e"
 )
 
-// TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
-// temporary environment to validate project changes with the purpose of being used in CI jobs.
-// The default setup requires Kind, builds/loads the Manager Docker image locally, and installs
-// CertManager.
+var projectImage = imageRepository + ":" + imageTag
+
+// TestE2E runs the end-to-end suite against a live cluster. It requires a kind
+// cluster to already exist (see the setup-test-e2e target) and a running Docker
+// daemon to build the operator image.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting redguard integration test suite\n")
+	_, _ = fmt.Fprintf(GinkgoWriter, "Starting redguard e2e suite\n")
 	RunSpecs(t, "e2e suite")
 }
 
+// BeforeSuite installs the operator exactly the way the README tells a user to:
+// a chart install from charts/redguard. Installing through the chart is what
+// exercises the generated RBAC; a kustomize install would test a different set
+// of permissions than the one users get.
 var _ = BeforeSuite(func() {
-	By("building the manager(Operator) image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
+	By("building the operator image")
+	_, err := utils.Run(exec.Command("make", "docker-build", "IMG="+projectImage))
+	Expect(err).NotTo(HaveOccurred(), "failed to build the operator image")
 
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+	By("loading the operator image into the kind cluster")
+	Expect(utils.LoadImageToKindClusterWithName(projectImage)).To(Succeed(),
+		"failed to load the operator image into kind")
 
-	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
-	// To prevent errors when tests run in environments with CertManager already installed,
-	// we check for its presence before execution.
-	// Setup CertManager before the suite if not skipped and if not already installed
-	if !skipCertManagerInstall {
-		By("checking if cert manager is installed already")
-		isCertManagerAlreadyInstalled = utils.IsCertManagerCRDsInstalled()
-		if !isCertManagerAlreadyInstalled {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Installing CertManager...\n")
-			Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
-		}
-	}
+	By("installing the chart")
+	_, err = run("helm", "upgrade", "--install", helmRelease, chartPath,
+		"--namespace", operatorNamespace,
+		"--create-namespace",
+		"--set", "operator.image.repository="+imageRepository,
+		"--set", "operator.image.tag="+imageTag,
+		"--set", "operator.image.pullPolicy=Never",
+		"--wait", "--timeout", "5m")
+	Expect(err).NotTo(HaveOccurred(), "helm install failed")
 })
 
 var _ = AfterSuite(func() {
-	// Teardown CertManager after the suite if not skipped and if it was not already installed
-	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
-		utils.UninstallCertManager()
+	By("uninstalling the chart")
+	if _, err := run("helm", "uninstall", helmRelease, "--namespace", operatorNamespace, "--wait"); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "helm uninstall failed: %v\n", err)
+	}
+
+	By("removing the operator namespace")
+	if _, err := kubectl("delete", "namespace", operatorNamespace, "--ignore-not-found"); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "namespace delete failed: %v\n", err)
 	}
 })
