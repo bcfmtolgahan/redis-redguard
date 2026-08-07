@@ -76,6 +76,17 @@ type RedisRestoreStatus struct {
 	// +optional
 	Phase RestorePhase `json:"phase,omitempty"`
 
+	// ObservedGeneration is the spec generation the recorded phase applies to.
+	// A Completed or Failed restore re-runs only when the spec changes.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// QuiescedDownAfterMilliseconds records the sentinel down-after-milliseconds
+	// value to restore once the master restart is over; zero means the sentinels
+	// are not quiesced by this restore.
+	// +optional
+	QuiescedDownAfterMilliseconds int32 `json:"quiescedDownAfterMilliseconds,omitempty"`
+
 	// StartTime is when the restore operation started
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`

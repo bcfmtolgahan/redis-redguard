@@ -229,6 +229,15 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 		return "", 0, fmt.Errorf("BGSAVE failed: %w", err)
 	}
 
+	// Recorded so a restore of this object can verify the loaded dataset.
+	// Counted after BGSAVE completes, so a cluster taking writes may drift
+	// from the snapshot by the keys written since the fork.
+	if total, err := r.backupKeyCount(ctx, redisSentinel, backupPod); err != nil {
+		logger.Error(err, "Failed to count keys; restores of this backup fall back to a non-empty check")
+	} else {
+		redisBackup.Status.KeyCount = &total
+	}
+
 	// Get RDB file content using pod exec
 	rdbData, err := r.getRDBData(ctx, redisSentinel, backupPod)
 	if err != nil {
@@ -382,6 +391,25 @@ func (r *RedisBackupReconciler) getAdminPassword(ctx context.Context, redisSenti
 	}
 
 	return string(secret.Data["password"])
+}
+
+// backupKeyCount totals the backup pod's keys across all databases.
+func (r *RedisBackupReconciler) backupKeyCount(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) (int64, error) {
+	adminPassword := r.getAdminPassword(ctx, redisSentinel)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
+	if err != nil {
+		return 0, fmt.Errorf("resolve client TLS config: %w", err)
+	}
+
+	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
+	defer redisClient.Close()
+
+	info, err := redisClient.GetKeyspaceInfo(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return sumKeyspaceKeys(info)
 }
 
 func (r *RedisBackupReconciler) triggerBGSave(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) error {

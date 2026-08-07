@@ -31,6 +31,8 @@ type Client interface {
 	BGSave(ctx context.Context) error
 	LastSave(ctx context.Context) (int64, error)
 	ConfigGet(ctx context.Context, parameter string) (map[string]string, error)
+	ConfigSet(ctx context.Context, parameter, value string) error
+	ShutdownNoSave(ctx context.Context) error
 	DBSize(ctx context.Context) (int64, error)
 	Close() error
 }
@@ -41,6 +43,7 @@ type Sentinel interface {
 	GetMasterAddrFromPool(ctx context.Context, masterName string) (string, error)
 	GetMasterFromPool(ctx context.Context, masterName string) (*sentinel.MasterInfo, error)
 	CheckQuorumFromPool(ctx context.Context, masterName string) (bool, int, error)
+	SetMasterOptionAll(ctx context.Context, masterName, option, value string) error
 }
 
 // Factory constructs protocol clients. A nil tlsConfig selects the plaintext

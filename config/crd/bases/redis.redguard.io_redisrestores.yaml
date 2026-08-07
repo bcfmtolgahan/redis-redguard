@@ -189,9 +189,22 @@ spec:
                 description: Message provides additional information about the current
                   state
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation the recorded phase applies to.
+                  A Completed or Failed restore re-runs only when the spec changes.
+                format: int64
+                type: integer
               phase:
                 description: Phase represents the current phase of the restore operation
                 type: string
+              quiescedDownAfterMilliseconds:
+                description: |-
+                  QuiescedDownAfterMilliseconds records the sentinel down-after-milliseconds
+                  value to restore once the master restart is over; zero means the sentinels
+                  are not quiesced by this restore.
+                format: int32
+                type: integer
               restoredDataSize:
                 description: RestoredDataSize is the size of the restored data in
                   bytes

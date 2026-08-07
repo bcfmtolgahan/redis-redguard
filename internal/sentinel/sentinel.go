@@ -3,6 +3,7 @@ package sentinel
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -151,6 +152,35 @@ func (p *SentinelClientPool) GetMasterFromPool(ctx context.Context, masterName s
 		return nil, fmt.Errorf("all sentinels failed, last error: %w", lastErr)
 	}
 	return nil, fmt.Errorf("no sentinels available")
+}
+
+// SetMasterOptionAll applies SENTINEL SET to every sentinel in the pool.
+// SENTINEL SET is per-instance state that never propagates between sentinels,
+// so unlike the read paths this must reach all of them; any failure is
+// returned because one sentinel left on the old value defeats the caller's
+// intent, for example quiescing failure detection during a restore.
+func (p *SentinelClientPool) SetMasterOptionAll(ctx context.Context, masterName, option, value string) error {
+	var errs []error
+	for _, addr := range p.addresses {
+		client := p.newClient(addr)
+		err := client.SetMasterOption(ctx, masterName, option, value)
+		client.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// newClient builds a client for one pool member with the pool's credentials.
+func (p *SentinelClientPool) newClient(addr string) *SentinelClient {
+	if p.tlsConfig != nil {
+		return NewSentinelClientWithTLS(addr, p.password, p.tlsConfig)
+	}
+	if p.password != "" {
+		return NewSentinelClientWithAuth(addr, p.password)
+	}
+	return NewSentinelClient(addr)
 }
 
 // CheckQuorumFromPool tries to check quorum health from available sentinels

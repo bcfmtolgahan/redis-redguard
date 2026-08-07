@@ -25,11 +25,13 @@ var (
 // concurrent use; every client method appends "<addr>:<method>" to one call
 // log so tests can assert which pods were touched, in what order.
 type Factory struct {
-	mu         sync.Mutex
-	nodes      map[string]*node
-	masterAddr string
-	users      map[string][]string
-	calls      []string
+	mu            sync.Mutex
+	nodes         map[string]*node
+	masterAddr    string
+	users         map[string][]string
+	masterOptions map[string]string
+	errs          map[string]error
+	calls         []string
 }
 
 // node is the state of one fake Redis instance, keyed by dial address.
@@ -38,14 +40,17 @@ type node struct {
 	masterHost string
 	masterPort string
 	users      map[string][]string
-	dbSize     int64
+	keyspace   map[int]int64
+	config     map[string]string
 	lastSave   int64
 }
 
 func NewFactory() *Factory {
 	return &Factory{
-		nodes: map[string]*node{},
-		users: map[string][]string{},
+		nodes:         map[string]*node{},
+		users:         map[string][]string{},
+		masterOptions: map[string]string{},
+		errs:          map[string]error{},
 	}
 }
 
@@ -84,6 +89,54 @@ func (f *Factory) Calls() []string {
 	return append([]string(nil), f.calls...)
 }
 
+// SetKeyspace declares the per-database key counts of one node, driving both
+// GetKeyspaceInfo and DBSize (which, like the real command, sees DB 0 only).
+func (f *Factory) SetKeyspace(addr string, dbs map[int]int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ks := make(map[int]int64, len(dbs))
+	for db, n := range dbs {
+		ks[db] = n
+	}
+	f.node(addr).keyspace = ks
+}
+
+// SetError injects err into every future call of method on addr. For sentinel
+// pool methods, addr is the comma-joined pool address list.
+func (f *Factory) SetError(addr, method string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs[addr+":"+method] = err
+}
+
+// Configs returns the parameters written to addr through ConfigSet.
+func (f *Factory) Configs(addr string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range f.node(addr).config {
+		out[k] = v
+	}
+	return out
+}
+
+// MasterOptions returns the last value written per option through
+// SetMasterOptionAll, across all pools.
+func (f *Factory) MasterOptions() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]string, len(f.masterOptions))
+	for k, v := range f.masterOptions {
+		out[k] = v
+	}
+	return out
+}
+
+// errorFor returns the injected error for addr and method. Caller holds f.mu.
+func (f *Factory) errorFor(addr, method string) error {
+	return f.errs[addr+":"+method]
+}
+
 func (f *Factory) NewClient(addr, password string, tlsConfig *tls.Config) redisclient.Client {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -99,7 +152,11 @@ func (f *Factory) NewSentinelPool(addrs []string, password string, tlsConfig *tl
 func (f *Factory) node(addr string) *node {
 	n, ok := f.nodes[addr]
 	if !ok {
-		n = &node{users: map[string][]string{}}
+		n = &node{
+			users:    map[string][]string{},
+			keyspace: map[int]int64{},
+			config:   map[string]string{},
+		}
 		f.nodes[addr] = n
 		f.syncRole(addr, n)
 	}
@@ -139,13 +196,16 @@ func (c *client) Ping(ctx context.Context) error {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "Ping")
-	return nil
+	return c.f.errorFor(c.addr, "Ping")
 }
 
 func (c *client) IsMaster(ctx context.Context) (bool, error) {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "IsMaster")
+	if err := c.f.errorFor(c.addr, "IsMaster"); err != nil {
+		return false, err
+	}
 	return c.f.node(c.addr).role == "master", nil
 }
 
@@ -215,11 +275,23 @@ func (c *client) GetStatsInfo(ctx context.Context) (map[string]string, error) {
 	return map[string]string{}, nil
 }
 
+// GetKeyspaceInfo reports the node's keyspace in the INFO keyspace shape:
+// one "dbN" entry per database that holds keys.
 func (c *client) GetKeyspaceInfo(ctx context.Context) (map[string]string, error) {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "GetKeyspaceInfo")
-	return map[string]string{}, nil
+	if err := c.f.errorFor(c.addr, "GetKeyspaceInfo"); err != nil {
+		return nil, err
+	}
+	info := map[string]string{}
+	for db, n := range c.f.node(c.addr).keyspace {
+		if n == 0 {
+			continue
+		}
+		info[fmt.Sprintf("db%d", db)] = fmt.Sprintf("keys=%d,expires=0,avg_ttl=0", n)
+	}
+	return info, nil
 }
 
 func (c *client) SlaveOf(ctx context.Context, masterHost, masterPort string) error {
@@ -291,7 +363,28 @@ func (c *client) DBSize(ctx context.Context) (int64, error) {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "DBSize")
-	return c.f.node(c.addr).dbSize, nil
+	if err := c.f.errorFor(c.addr, "DBSize"); err != nil {
+		return 0, err
+	}
+	return c.f.node(c.addr).keyspace[0], nil
+}
+
+func (c *client) ConfigSet(ctx context.Context, parameter, value string) error {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.record(c.addr, "ConfigSet")
+	if err := c.f.errorFor(c.addr, "ConfigSet"); err != nil {
+		return err
+	}
+	c.f.node(c.addr).config[parameter] = value
+	return nil
+}
+
+func (c *client) ShutdownNoSave(ctx context.Context) error {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.record(c.addr, "ShutdownNoSave")
+	return c.f.errorFor(c.addr, "ShutdownNoSave")
 }
 
 func (c *client) Close() error {
@@ -351,4 +444,15 @@ func (p *pool) CheckQuorumFromPool(ctx context.Context, masterName string) (bool
 	defer p.f.mu.Unlock()
 	p.f.record(p.key(), "CheckQuorumFromPool")
 	return true, len(p.addrs), nil
+}
+
+func (p *pool) SetMasterOptionAll(ctx context.Context, masterName, option, value string) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.f.record(p.key(), "SetMasterOptionAll")
+	if err := p.f.errorFor(p.key(), "SetMasterOptionAll"); err != nil {
+		return err
+	}
+	p.f.masterOptions[option] = value
+	return nil
 }

@@ -127,6 +127,21 @@ if [ -n "${REDIS_PASSWORD:-}" ]; then
     mv /data/redis.conf.tmp /data/redis.conf
 fi
 
+# A staged restore payload means the operator shut this master down to load a
+# backup. The previous AOF is moved aside (not deleted) so it cannot shadow
+# the dump, and AOF is disabled for this boot because redis-server with
+# appendonly yes never loads dump.rdb. The operator re-enables AOF after it
+# verified the restored dataset.
+if [ -f /data/redguard-restore.rdb ]; then
+    log "restore payload found; loading it instead of the previous dataset"
+    rm -rf /data/appendonlydir.pre-restore
+    if [ -d /data/appendonlydir ]; then
+        mv /data/appendonlydir /data/appendonlydir.pre-restore
+    fi
+    mv /data/redguard-restore.rdb /data/dump.rdb
+    printf '\nappendonly no\n' >> /data/redis.conf
+fi
+
 is_ipv4() {
     printf '%%s\n' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 }

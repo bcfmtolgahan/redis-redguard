@@ -177,6 +177,11 @@ func (in *RedisBackupStatus) DeepCopyInto(out *RedisBackupStatus) {
 		in, out := &in.NextBackupTime, &out.NextBackupTime
 		*out = (*in).DeepCopy()
 	}
+	if in.KeyCount != nil {
+		in, out := &in.KeyCount, &out.KeyCount
+		*out = new(int64)
+		**out = **in
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

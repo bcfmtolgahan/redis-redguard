@@ -20,8 +20,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,11 +46,38 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/redisclient"
 	"github.com/redguard/redguard/internal/tlsutil"
 )
+
+// The restore replaces the master's dataset in place. Redis 7 with appendonly
+// yes never loads dump.rdb, and the configured save points overwrite it on a
+// normal shutdown, so the payload is staged under a name the running server
+// does not touch and the init script performs the swap on the restart that
+// SHUTDOWN NOSAVE triggers: it parks the old AOF, moves the payload to
+// dump.rdb and boots with AOF off. The controller re-enables AOF only after
+// the loaded dataset is verified. Sentinel failure detection is raised before
+// the shutdown so no stale replica is promoted while the master reloads.
+const (
+	// restorePayloadPath is the staging name the init script consumes.
+	restorePayloadPath = "/data/redguard-restore.rdb"
+	// preRestoreAOFPath is where the init script parks the previous AOF.
+	preRestoreAOFPath = "/data/appendonlydir.pre-restore"
+	// quiesceDownAfterMilliseconds keeps the sentinels from reading the
+	// controlled restart as a master failure.
+	quiesceDownAfterMilliseconds = "600000"
+	// restoreTimeout bounds a restore run end to end.
+	restoreTimeout = 30 * time.Minute
+	// restartPollInterval paces the wait for the master container restart.
+	restartPollInterval = 5 * time.Second
+)
+
+// podExecFn runs a command in a pod container, streaming stdin when non-nil.
+// It is a seam so unit tests can drive the exec-dependent restore steps.
+type podExecFn func(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, container string, command []string, stdin io.Reader) (stdout, stderr string, err error)
 
 // RedisRestoreReconciler reconciles a RedisRestore object
 type RedisRestoreReconciler struct {
@@ -59,11 +89,14 @@ type RedisRestoreReconciler struct {
 	Recorder   record.EventRecorder
 	// RedisFactory builds Redis clients; nil means DefaultFactory.
 	RedisFactory redisclient.Factory
+	// PodExec runs commands inside Redis pods; nil means the SPDY executor.
+	PodExec podExecFn
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores/finalizers,verbs=update
+// +kubebuilder:rbac:groups=redis.redguard.io,resources=redisbackups,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
@@ -72,7 +105,6 @@ type RedisRestoreReconciler struct {
 func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the RedisRestore instance
 	redisRestore := &redisv1alpha1.RedisRestore{}
 	if err := r.Get(ctx, req.NamespacedName, redisRestore); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -82,30 +114,42 @@ func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Skip if already completed or failed
+	// Terminal phases are sticky per spec generation: a requeue or operator
+	// restart must not run a finished restore again; only a spec change may.
 	if redisRestore.Status.Phase == redisv1alpha1.RestorePhaseCompleted ||
 		redisRestore.Status.Phase == redisv1alpha1.RestorePhaseFailed {
-		return ctrl.Result{}, nil
+		if redisRestore.Status.ObservedGeneration == redisRestore.Generation {
+			return ctrl.Result{}, nil
+		}
+		redisRestore.Status.StartTime = &metav1.Time{Time: time.Now()}
+		redisRestore.Status.CompletionTime = nil
+		redisRestore.Status.Duration = ""
+		if err := r.updateStatus(ctx, redisRestore, redisv1alpha1.RestorePhasePending, "Spec changed; starting a new restore run", 0); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Get the RedisSentinel cluster
 	redisSentinel := &redisv1alpha1.RedisSentinel{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      redisRestore.Spec.RedisClusterRef,
 		Namespace: redisRestore.Namespace,
 	}, redisSentinel); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.failRestore(ctx, redisRestore, nil, "RedisSentinel cluster not found: "+redisRestore.Spec.RedisClusterRef)
+		}
 		logger.Error(err, "Failed to get RedisSentinel cluster")
-		r.updateStatus(ctx, redisRestore, redisv1alpha1.RestorePhaseFailed, "RedisSentinel cluster not found", 0)
 		return ctrl.Result{}, err
 	}
 
-	// Initialize status if not set
 	if redisRestore.Status.Phase == "" {
-		r.updateStatus(ctx, redisRestore, redisv1alpha1.RestorePhasePending, "Starting restore operation", 0)
+		redisRestore.Status.StartTime = &metav1.Time{Time: time.Now()}
+		if err := r.updateStatus(ctx, redisRestore, redisv1alpha1.RestorePhasePending, "Starting restore operation", 0); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Perform restore based on current phase
 	switch redisRestore.Status.Phase {
 	case redisv1alpha1.RestorePhasePending:
 		return r.handlePendingPhase(ctx, redisRestore, redisSentinel)
@@ -120,124 +164,184 @@ func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
+// handlePendingPhase gates the restore: it refuses a populated cluster unless
+// forced and confirms the backup object exists before anything is touched.
 func (r *RedisRestoreReconciler) handlePendingPhase(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Check if cluster has data and Force is not set
 	if !restore.Spec.SkipDataCheck && !restore.Spec.Force {
-		hasData, err := r.checkClusterHasData(ctx, rs)
+		// INFO keyspace covers every database; DBSIZE would only see DB 0 and
+		// wave through a cluster populated on another index.
+		total, err := r.clusterKeyCount(ctx, rs)
 		if err != nil {
 			logger.Error(err, "Failed to check cluster data")
-			r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to check cluster data: "+err.Error(), 0)
 			return ctrl.Result{}, err
 		}
-
-		if hasData {
-			msg := "Cluster has existing data. Set spec.force=true to overwrite"
-			r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, msg, 0)
-			return ctrl.Result{}, nil
+		if total > 0 {
+			return r.failRestore(ctx, restore, rs, fmt.Sprintf(
+				"Cluster has existing data (%d keys across all databases); set spec.force=true to overwrite", total))
 		}
 	}
 
-	// Set start time
-	restore.Status.StartTime = &metav1.Time{Time: time.Now()}
+	object := "s3://" + restore.Spec.BackupSource.S3.Bucket + "/" + restore.Spec.BackupSource.BackupPath
+	size, err := r.preflightBackupObject(ctx, restore)
+	if err != nil {
+		var notFound *s3types.NotFound
+		if errors.As(err, &notFound) {
+			return r.failRestore(ctx, restore, rs, "Backup object not found: "+object)
+		}
+		logger.Error(err, "Backup object preflight failed")
+		return ctrl.Result{}, err
+	}
+	if size == 0 {
+		return r.failRestore(ctx, restore, rs, "Backup object is empty: "+object)
+	}
 
-	// Move to downloading phase
-	r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseDownloading, "Downloading backup from S3", 0)
+	if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseDownloading, "Downloading backup from S3", 0); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// handleDownloadingPhase downloads and validates the payload, then stages it
+// on the master's volume. The running server is not disturbed: the staging
+// name is one it never reads or writes.
 func (r *RedisRestoreReconciler) handleDownloadingPhase(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Download backup from S3
 	data, err := r.downloadBackup(ctx, restore)
 	if err != nil {
 		logger.Error(err, "Failed to download backup")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to download backup: "+err.Error(), 0)
 		return ctrl.Result{}, err
 	}
 
-	// Decompress if needed
 	var rdbData []byte
 	if restore.Spec.BackupSource.Compressed {
 		gzipReader, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
-			logger.Error(err, "Failed to create gzip reader")
-			r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to decompress backup: "+err.Error(), 0)
-			return ctrl.Result{}, err
+			return r.failRestore(ctx, restore, rs, "Backup is not valid gzip data: "+err.Error())
 		}
-		defer gzipReader.Close()
-
 		rdbData, err = io.ReadAll(gzipReader)
+		gzipReader.Close()
 		if err != nil {
-			logger.Error(err, "Failed to decompress backup")
-			r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to decompress backup: "+err.Error(), 0)
-			return ctrl.Result{}, err
+			return r.failRestore(ctx, restore, rs, "Failed to decompress backup: "+err.Error())
 		}
 	} else {
 		rdbData = data
 	}
 
-	// Verify RDB file format
 	if len(rdbData) < 5 || string(rdbData[:5]) != "REDIS" {
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Invalid RDB file format", 0)
-		return ctrl.Result{}, fmt.Errorf("invalid RDB file format")
+		return r.failRestore(ctx, restore, rs, "Downloaded object is not an RDB file")
 	}
 
-	restore.Status.RestoredDataSize = int64(len(rdbData))
-	logger.Info("Downloaded and verified backup", "size", len(rdbData))
-
-	// Store RDB data temporarily (in a real implementation, use a ConfigMap or persistent storage)
-	// For now, we'll copy directly to the master pod
-	if err := r.copyRDBToMaster(ctx, rs, rdbData); err != nil {
-		logger.Error(err, "Failed to copy RDB to master")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to copy RDB to master: "+err.Error(), 0)
+	if err := r.stageRestorePayload(ctx, rs, rdbData); err != nil {
+		logger.Error(err, "Failed to stage restore payload")
 		return ctrl.Result{}, err
 	}
 
-	// Move to restoring phase
-	r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseRestoring, "Restoring data to Redis", restore.Status.RestoredDataSize)
+	if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseRestoring,
+		"Restore payload staged; restarting the master to load it", int64(len(rdbData))); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// handleRestoringPhase quiesces the sentinels and shuts the master down so the
+// init script swaps the staged payload in, then waits for the payload to be
+// consumed. Every step keys on observable pod state, so a requeue or operator
+// restart re-enters safely.
 func (r *RedisRestoreReconciler) handleRestoringPhase(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Restart the master pod to load the new RDB file
-	if err := r.restartMasterPod(ctx, rs); err != nil {
-		logger.Error(err, "Failed to restart master pod")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to restart master pod: "+err.Error(), restore.Status.RestoredDataSize)
-		return ctrl.Result{}, err
+	if restoreExpired(restore) {
+		return r.failRestore(ctx, restore, rs, "Restore did not complete within "+restoreTimeout.String())
 	}
 
-	// Wait for master to be ready
-	if err := r.waitForMasterReady(ctx, rs); err != nil {
-		logger.Error(err, "Master pod not ready after restart")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Master pod not ready: "+err.Error(), restore.Status.RestoredDataSize)
-		return ctrl.Result{}, err
+	masterPod, err := r.getMasterPod(ctx, rs)
+	if err != nil {
+		logger.V(1).Info("Master pod not available yet", "error", err.Error())
+		return ctrl.Result{RequeueAfter: restartPollInterval}, nil
 	}
 
-	// Move to verifying phase
-	r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseVerifying, "Verifying restored data", restore.Status.RestoredDataSize)
-	return ctrl.Result{Requeue: true}, nil
-}
+	present, err := r.restorePayloadPresent(ctx, masterPod)
+	if err != nil {
+		// The container is down between the shutdown and the kubelet restart;
+		// exec failures here are polling, not errors.
+		logger.V(1).Info("Cannot check restore payload; container may be restarting", "error", err.Error())
+		return ctrl.Result{RequeueAfter: restartPollInterval}, nil
+	}
 
-func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	if !present {
+		if restore.Status.QuiescedDownAfterMilliseconds == 0 {
+			// The payload vanished but this restore never shut the master
+			// down: the pod restarted or failed over on its own. Stage again
+			// rather than verifying a dataset that was never loaded.
+			if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseDownloading,
+				"Restore payload lost before the restart; staging it again", 0); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseVerifying,
+			"Master restarted; verifying the restored dataset", 0); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
 
-	// Verify data was restored
 	adminPassword := r.getAdminPassword(ctx, rs)
 	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
 	if err != nil {
-		logger.Error(err, "Failed to resolve client TLS config")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to verify: "+err.Error(), restore.Status.RestoredDataSize)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("resolve client TLS config: %w", err)
+	}
+
+	// The value to restore is persisted before SENTINEL SET: if the process
+	// dies in between, the breadcrumb still gets the setting restored later;
+	// the reverse order could leave the sentinels quiesced forever.
+	if restore.Status.QuiescedDownAfterMilliseconds == 0 {
+		value := rs.Spec.SentinelConfig.DownAfterMilliseconds
+		if value == 0 {
+			value = 5000
+		}
+		restore.Status.QuiescedDownAfterMilliseconds = value
+		if err := r.Status().Update(ctx, restore); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if err := r.setSentinelDownAfter(ctx, rs, adminPassword, tlsCfg, quiesceDownAfterMilliseconds); err != nil {
+		return ctrl.Result{}, fmt.Errorf("quiesce sentinels: %w", err)
+	}
+
+	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
+	defer redisClient.Close()
+	// NOSAVE, or the exiting server would overwrite dump.rdb with the old
+	// dataset right before the init script swaps the payload in.
+	if err := redisClient.ShutdownNoSave(ctx); err != nil {
+		return ctrl.Result{}, fmt.Errorf("shut down master: %w", err)
+	}
+
+	logger.Info("Master shut down to load the restore payload", "pod", masterPod.Name)
+	return ctrl.Result{RequeueAfter: restartPollInterval}, nil
+}
+
+// handleVerifyingPhase confirms the restarted master actually serves the
+// restored dataset before durability and failover detection are switched back
+// on and the restore is declared complete.
+func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if restoreExpired(restore) {
+		return r.failRestore(ctx, restore, rs, "Restore did not complete within "+restoreTimeout.String())
+	}
+
+	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolve client TLS config: %w", err)
 	}
 	masterPod, err := r.getMasterPod(ctx, rs)
 	if err != nil {
-		logger.Error(err, "Failed to get master pod for verification")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Failed to verify: "+err.Error(), restore.Status.RestoredDataSize)
 		return ctrl.Result{}, err
 	}
 
@@ -245,58 +349,189 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
-	// Check if Redis is responsive
 	if err := redisClient.Ping(ctx); err != nil {
-		logger.Error(err, "Redis not responsive after restore")
-		r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, "Redis not responsive: "+err.Error(), restore.Status.RestoredDataSize)
+		// Still restarting or loading the dump; poll until the deadline.
+		logger.V(1).Info("Master not answering yet", "error", err.Error())
+		return ctrl.Result{RequeueAfter: restartPollInterval}, nil
+	}
+
+	isMaster, err := redisClient.IsMaster(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !isMaster {
+		return r.failRestore(ctx, restore, rs, fmt.Sprintf(
+			"Pod %s lost the master role during the restore; a failover replaced the restored dataset", masterPod.Name))
+	}
+
+	info, err := redisClient.GetKeyspaceInfo(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	total, err := sumKeyspaceKeys(info)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Get DB size to verify data was loaded
-	dbSize, err := redisClient.DBSize(ctx)
-	if err != nil {
-		logger.Error(err, "Failed to get DB size")
-	} else {
-		logger.Info("Restore verification complete", "dbSize", dbSize)
+	if expected := r.lookupBackupKeyCount(ctx, restore); expected != nil {
+		if total != *expected {
+			return r.failRestore(ctx, restore, rs, fmt.Sprintf(
+				"Restored key count %d does not match the %d recorded by the backup", total, *expected))
+		}
+	} else if total == 0 {
+		return r.failRestore(ctx, restore, rs, "Restore produced an empty dataset; the dump was not loaded")
 	}
 
-	// Calculate duration
+	// Durability returns only after the restored dataset is in memory:
+	// enabling AOF rewrites it from the current dataset.
+	if err := redisClient.ConfigSet(ctx, "appendonly", "yes"); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-enable appendonly: %w", err)
+	}
+
+	r.cleanupPreRestoreAOF(ctx, masterPod)
+
+	// Completing while the sentinels cannot detect failures would hide a
+	// degraded cluster; retry until the deadline instead.
+	if err := r.restoreSentinelDownAfter(ctx, restore, rs, adminPassword, tlsCfg); err != nil {
+		return ctrl.Result{}, fmt.Errorf("restore sentinel settings: %w", err)
+	}
+
 	if restore.Status.StartTime != nil {
-		duration := time.Since(restore.Status.StartTime.Time)
-		restore.Status.Duration = duration.String()
+		restore.Status.Duration = time.Since(restore.Status.StartTime.Time).String()
 	}
-
 	restore.Status.CompletionTime = &metav1.Time{Time: time.Now()}
 	restore.Status.RestoredFrom = restore.Spec.BackupSource.BackupPath
 
-	// Mark as completed
-	r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseCompleted, "Restore completed successfully", restore.Status.RestoredDataSize)
-	logger.Info("Restore completed successfully", "duration", restore.Status.Duration)
+	message := fmt.Sprintf("Restore completed: %d keys loaded", total)
+	if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseCompleted, message, 0); err != nil {
+		return ctrl.Result{}, err
+	}
+	recordEvent(r.Recorder, restore, corev1.EventTypeNormal, "RestoreCompleted", message)
+	logger.Info("Restore completed", "keys", total, "duration", restore.Status.Duration)
 
 	return ctrl.Result{}, nil
 }
 
-func (r *RedisRestoreReconciler) checkClusterHasData(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
+// failRestore lifts the sentinel quiesce when possible and records a terminal
+// failure. No data-destroying step may follow a failRestore.
+func (r *RedisRestoreReconciler) failRestore(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel, message string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if rs != nil && restore.Status.QuiescedDownAfterMilliseconds != 0 {
+		adminPassword := r.getAdminPassword(ctx, rs)
+		tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+		if err == nil {
+			err = r.restoreSentinelDownAfter(ctx, restore, rs, adminPassword, tlsCfg)
+		}
+		if err != nil {
+			logger.Error(err, "Failed to restore sentinel down-after-milliseconds")
+			message += "; sentinel down-after-milliseconds is still raised and must be restored manually"
+		}
+	}
+
+	if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseFailed, message, 0); err != nil {
+		return ctrl.Result{}, err
+	}
+	recordEvent(r.Recorder, restore, corev1.EventTypeWarning, "RestoreFailed", message)
+	return ctrl.Result{}, nil
+}
+
+// restoreExpired bounds the poll loops of the restart and verify phases.
+func restoreExpired(restore *redisv1alpha1.RedisRestore) bool {
+	return restore.Status.StartTime != nil && time.Since(restore.Status.StartTime.Time) > restoreTimeout
+}
+
+// clusterKeyCount returns the master's key total across all databases.
+func (r *RedisRestoreReconciler) clusterKeyCount(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (int64, error) {
 	adminPassword := r.getAdminPassword(ctx, rs)
 	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
 	if err != nil {
-		return false, fmt.Errorf("resolve client TLS config: %w", err)
+		return 0, fmt.Errorf("resolve client TLS config: %w", err)
 	}
 	masterPod, err := r.getMasterPod(ctx, rs)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 
 	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
 	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
 	defer redisClient.Close()
 
-	dbSize, err := redisClient.DBSize(ctx)
+	info, err := redisClient.GetKeyspaceInfo(ctx)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
+	return sumKeyspaceKeys(info)
+}
 
-	return dbSize > 0, nil
+// sumKeyspaceKeys totals the keys=N fields of an INFO keyspace section, which
+// lists every database holding keys.
+func sumKeyspaceKeys(info map[string]string) (int64, error) {
+	var total int64
+	for db, fields := range info {
+		if !strings.HasPrefix(db, "db") {
+			continue
+		}
+		for _, field := range strings.Split(fields, ",") {
+			value, ok := strings.CutPrefix(field, "keys=")
+			if !ok {
+				continue
+			}
+			n, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse keyspace entry %s=%q: %w", db, fields, err)
+			}
+			total += n
+		}
+	}
+	return total, nil
+}
+
+// lookupBackupKeyCount returns the key count recorded by the RedisBackup that
+// produced the object being restored, or nil when no backup in the namespace
+// matches, for example when the backup was taken elsewhere.
+func (r *RedisRestoreReconciler) lookupBackupKeyCount(ctx context.Context, restore *redisv1alpha1.RedisRestore) *int64 {
+	backups := &redisv1alpha1.RedisBackupList{}
+	if err := r.List(ctx, backups, client.InNamespace(restore.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list RedisBackups for verification")
+		return nil
+	}
+	want := fmt.Sprintf("s3://%s/%s", restore.Spec.BackupSource.S3.Bucket, restore.Spec.BackupSource.BackupPath)
+	for i := range backups.Items {
+		status := &backups.Items[i].Status
+		if status.BackupLocation == want && status.KeyCount != nil {
+			return status.KeyCount
+		}
+	}
+	return nil
+}
+
+// setSentinelDownAfter applies down-after-milliseconds on every sentinel.
+func (r *RedisRestoreReconciler) setSentinelDownAfter(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config, value string) error {
+	addrs := make([]string, rs.Spec.SentinelConfig.Replicas)
+	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
+		addrs[i] = fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
+			rs.Name, i, rs.Name, rs.Namespace)
+	}
+	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(addrs, password, tlsCfg)
+	return pool.SetMasterOptionAll(ctx, rs.Name+"-master", "down-after-milliseconds", value)
+}
+
+// restoreSentinelDownAfter puts down-after-milliseconds back to the recorded
+// pre-restore value (falling back to the spec) and clears the breadcrumb.
+func (r *RedisRestoreReconciler) restoreSentinelDownAfter(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) error {
+	value := restore.Status.QuiescedDownAfterMilliseconds
+	if value == 0 {
+		value = rs.Spec.SentinelConfig.DownAfterMilliseconds
+	}
+	if value == 0 {
+		return nil
+	}
+	if err := r.setSentinelDownAfter(ctx, rs, password, tlsCfg, strconv.Itoa(int(value))); err != nil {
+		return err
+	}
+	restore.Status.QuiescedDownAfterMilliseconds = 0
+	return nil
 }
 
 func (r *RedisRestoreReconciler) downloadBackup(ctx context.Context, restore *redisv1alpha1.RedisRestore) ([]byte, error) {
@@ -315,6 +550,24 @@ func (r *RedisRestoreReconciler) downloadBackup(ctx context.Context, restore *re
 	defer result.Body.Close()
 
 	return io.ReadAll(result.Body)
+}
+
+// preflightBackupObject confirms the backup object exists and returns its
+// size, before anything on the cluster is touched.
+func (r *RedisRestoreReconciler) preflightBackupObject(ctx context.Context, restore *redisv1alpha1.RedisRestore) (int64, error) {
+	s3Client, err := r.createS3Client(ctx, restore)
+	if err != nil {
+		return 0, err
+	}
+
+	head, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(restore.Spec.BackupSource.S3.Bucket),
+		Key:    aws.String(restore.Spec.BackupSource.BackupPath),
+	})
+	if err != nil {
+		return 0, err
+	}
+	return aws.ToInt64(head.ContentLength), nil
 }
 
 func (r *RedisRestoreReconciler) createS3Client(ctx context.Context, restore *redisv1alpha1.RedisRestore) (*s3.Client, error) {
@@ -360,126 +613,100 @@ func (r *RedisRestoreReconciler) createS3Client(ctx context.Context, restore *re
 	return s3Client, nil
 }
 
-func (r *RedisRestoreReconciler) copyRDBToMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, rdbData []byte) error {
-	logger := log.FromContext(ctx)
-
+// stageRestorePayload writes the RDB next to the master's data under the
+// staging name and renames it into place atomically, so the init script only
+// ever sees a complete file.
+func (r *RedisRestoreReconciler) stageRestorePayload(ctx context.Context, rs *redisv1alpha1.RedisSentinel, rdbData []byte) error {
 	masterPod, err := r.getMasterPod(ctx, rs)
 	if err != nil {
 		return err
 	}
 
-	if r.RESTConfig == nil {
-		return fmt.Errorf("RESTConfig is not set")
-	}
-
-	clientset, err := kubernetes.NewForConfig(r.RESTConfig)
+	cmd := []string{"sh", "-c",
+		"cat > " + restorePayloadPath + ".tmp && mv " + restorePayloadPath + ".tmp " + restorePayloadPath}
+	_, stderr, err := r.execInPod(ctx, masterPod, cmd, bytes.NewReader(rdbData))
 	if err != nil {
-		return fmt.Errorf("failed to create clientset: %w", err)
+		return fmt.Errorf("stage restore payload on %s: %w (stderr: %s)", masterPod.Name, err, stderr)
 	}
 
-	// Execute command to write RDB data to file
-	// First, stop Redis to safely replace the RDB file
-	// Note: In a production environment, you might want to use a different approach
-	// such as using SHUTDOWN NOSAVE followed by replacing the file
+	log.FromContext(ctx).Info("Staged restore payload", "pod", masterPod.Name, "size", len(rdbData))
+	return nil
+}
 
-	// Write RDB file using base64 encoding to handle binary data
-	// This is a simplified approach - production code should handle larger files differently
-	cmd := []string{"sh", "-c", fmt.Sprintf("cat > /data/dump.rdb.new && mv /data/dump.rdb.new /data/dump.rdb")}
+// restorePayloadPresent reports whether the staged payload still exists in the
+// master pod. Its absence is the positive signal that the init script ran and
+// the restarted server loaded the dump.
+func (r *RedisRestoreReconciler) restorePayloadPresent(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	cmd := []string{"sh", "-c",
+		"if [ -f " + restorePayloadPath + " ]; then echo present; else echo absent; fi"}
+	stdout, stderr, err := r.execInPod(ctx, pod, cmd, nil)
+	if err != nil {
+		return false, fmt.Errorf("check restore payload on %s: %w (stderr: %s)", pod.Name, err, stderr)
+	}
+	switch strings.TrimSpace(stdout) {
+	case "present":
+		return true, nil
+	case "absent":
+		return false, nil
+	}
+	return false, fmt.Errorf("unexpected payload check output %q", stdout)
+}
+
+// cleanupPreRestoreAOF removes the AOF the init script set aside. Best effort:
+// the restore is complete either way and the next restore replaces the dir.
+func (r *RedisRestoreReconciler) cleanupPreRestoreAOF(ctx context.Context, pod *corev1.Pod) {
+	cmd := []string{"sh", "-c", "rm -rf " + preRestoreAOFPath}
+	if _, stderr, err := r.execInPod(ctx, pod, cmd, nil); err != nil {
+		log.FromContext(ctx).V(1).Info("Could not remove pre-restore AOF dir", "error", err.Error(), "stderr", stderr)
+	}
+}
+
+// execInPod runs command in the redis container of pod through the seam.
+func (r *RedisRestoreReconciler) execInPod(ctx context.Context, pod *corev1.Pod, command []string, stdin io.Reader) (string, string, error) {
+	execFn := r.PodExec
+	if execFn == nil {
+		execFn = spdyPodExec
+	}
+	return execFn(ctx, r.RESTConfig, pod, "redis", command, stdin)
+}
+
+// spdyPodExec is the production podExecFn.
+func spdyPodExec(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, container string, command []string, stdin io.Reader) (string, string, error) {
+	if cfg == nil {
+		return "", "", fmt.Errorf("RESTConfig is not set")
+	}
+
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create clientset: %w", err)
+	}
 
 	req := clientset.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
-		Name(masterPod.Name).
-		Namespace(masterPod.Namespace).
+		Name(pod.Name).
+		Namespace(pod.Namespace).
 		SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
-			Container: "redis",
-			Command:   cmd,
-			Stdin:     true,
+			Container: container,
+			Command:   command,
+			Stdin:     stdin != nil,
 			Stdout:    true,
 			Stderr:    true,
 		}, scheme.ParameterCodec)
 
-	exec, err := remotecommand.NewSPDYExecutor(r.RESTConfig, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
 	if err != nil {
-		return fmt.Errorf("failed to create executor: %w", err)
+		return "", "", fmt.Errorf("failed to create executor: %w", err)
 	}
 
 	var stdout, stderr bytes.Buffer
 	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  bytes.NewReader(rdbData),
+		Stdin:  stdin,
 		Stdout: &stdout,
 		Stderr: &stderr,
 	})
-
-	if err != nil {
-		logger.Error(err, "Failed to copy RDB file", "stderr", stderr.String())
-		return fmt.Errorf("failed to copy RDB file: %w", err)
-	}
-
-	logger.Info("Copied RDB file to master pod", "pod", masterPod.Name, "size", len(rdbData))
-	return nil
-}
-
-func (r *RedisRestoreReconciler) restartMasterPod(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
-	logger := log.FromContext(ctx)
-
-	masterPod, err := r.getMasterPod(ctx, rs)
-	if err != nil {
-		return err
-	}
-
-	// Delete the pod to trigger a restart
-	if err := r.Delete(ctx, masterPod); err != nil {
-		return fmt.Errorf("failed to delete master pod: %w", err)
-	}
-
-	logger.Info("Deleted master pod for restart", "pod", masterPod.Name)
-	return nil
-}
-
-func (r *RedisRestoreReconciler) waitForMasterReady(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
-	logger := log.FromContext(ctx)
-
-	// Resolved once for the whole wait loop instead of on every tick.
-	adminPassword := r.getAdminPassword(ctx, rs)
-	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
-	if err != nil {
-		return fmt.Errorf("resolve client TLS config: %w", err)
-	}
-
-	// Wait for the new master pod to be ready
-	timeout := time.After(5 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for master to be ready")
-		case <-ticker.C:
-			masterPod, err := r.getMasterPod(ctx, rs)
-			if err != nil {
-				logger.V(1).Info("Waiting for master pod...", "error", err)
-				continue
-			}
-
-			if masterPod.Status.Phase == corev1.PodRunning {
-				// Check if Redis is responsive
-				addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
-				redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
-
-				if err := redisClient.Ping(ctx); err == nil {
-					redisClient.Close()
-					logger.Info("Master pod is ready", "pod", masterPod.Name)
-					return nil
-				}
-				redisClient.Close()
-			}
-
-			logger.V(1).Info("Master pod not ready yet", "phase", masterPod.Status.Phase)
-		}
-	}
+	return stdout.String(), stderr.String(), err
 }
 
 func (r *RedisRestoreReconciler) getMasterPod(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (*corev1.Pod, error) {
@@ -494,6 +721,9 @@ func (r *RedisRestoreReconciler) getMasterPod(ctx context.Context, rs *redisv1al
 		Namespace: rs.Namespace,
 	}, pod); err != nil {
 		return nil, err
+	}
+	if pod.Status.PodIP == "" {
+		return nil, fmt.Errorf("master pod %s has no IP yet", podName)
 	}
 
 	return pod, nil
@@ -515,9 +745,12 @@ func (r *RedisRestoreReconciler) getAdminPassword(ctx context.Context, rs *redis
 	return string(secret.Data["password"])
 }
 
-func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redisv1alpha1.RedisRestore, phase redisv1alpha1.RestorePhase, message string, dataSize int64) {
+// updateStatus writes the phase transition. The error must reach the caller: a
+// swallowed write here once let finished phases re-run their side effects.
+func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redisv1alpha1.RedisRestore, phase redisv1alpha1.RestorePhase, message string, dataSize int64) error {
 	restore.Status.Phase = phase
 	restore.Status.Message = message
+	restore.Status.ObservedGeneration = restore.Generation
 	if dataSize > 0 {
 		restore.Status.RestoredDataSize = dataSize
 	}
@@ -542,7 +775,9 @@ func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redi
 
 	if err := r.Status().Update(ctx, restore); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to update RedisRestore status")
+		return err
 	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

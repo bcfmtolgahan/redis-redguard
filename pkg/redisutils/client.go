@@ -3,6 +3,7 @@ package redisutils
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -351,6 +352,23 @@ func NewRedisClientWithTLS(addr, password string, tlsConfig *tls.Config) *RedisC
 // DBSize returns the number of keys in the currently selected database
 func (rc *RedisClient) DBSize(ctx context.Context) (int64, error) {
 	return rc.client.DBSize(ctx).Result()
+}
+
+// ShutdownNoSave asks the server to exit without a final RDB save. A server
+// that obeys closes the connection instead of replying, so only a Redis error
+// reply (a refusal) is surfaced; network errors mean the server went away as
+// requested. A server that ignored the command is caught by the caller's
+// follow-up state checks, not here.
+func (rc *RedisClient) ShutdownNoSave(ctx context.Context) error {
+	err := rc.client.ShutdownNoSave(ctx).Err()
+	if err == nil {
+		return nil
+	}
+	var redisErr redis.Error
+	if errors.As(err, &redisErr) {
+		return err
+	}
+	return nil
 }
 
 // GetKeyspaceInfo returns keyspace statistics per database

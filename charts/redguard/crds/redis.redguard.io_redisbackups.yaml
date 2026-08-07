@@ -183,6 +183,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              keyCount:
+                description: |-
+                  KeyCount is the number of keys across all databases when the last backup
+                  was taken; RedisRestore uses it to verify a restored dataset.
+                format: int64
+                type: integer
               lastBackupDuration:
                 description: LastBackupDuration is the duration of the last backup
                 type: string

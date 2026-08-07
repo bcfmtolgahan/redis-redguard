@@ -100,6 +100,11 @@ type RedisBackupStatus struct {
 	// +optional
 	BackupSize int64 `json:"backupSize,omitempty"`
 
+	// KeyCount is the number of keys across all databases when the last backup
+	// was taken; RedisRestore uses it to verify a restored dataset.
+	// +optional
+	KeyCount *int64 `json:"keyCount,omitempty"`
+
 	// BackupCount is the total number of backups retained
 	// +optional
 	BackupCount int32 `json:"backupCount,omitempty"`
