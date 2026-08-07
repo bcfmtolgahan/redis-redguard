@@ -229,6 +229,93 @@ var _ = Describe("Redguard", Ordered, func() {
 		}
 	})
 
+	It("rolls the Redis pods when the configuration changes", func() {
+		By("checking the cluster runs the default eviction policy")
+		before, err := listPods(clusterNamespace, redisSelector)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(readyPods(before)).To(HaveLen(3), "pods: %v", before)
+		for _, p := range readyPods(before) {
+			policy, err := redisCLI(clusterNamespace, p.Name, "CONFIG", "GET", "maxmemory-policy")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(policy).To(ContainSubstring("noeviction"),
+				"%s already runs the configuration this spec is about to apply", p.Name)
+		}
+
+		beforeHash, err := podTemplateConfigHash(clusterNamespace, sentinelName+"-redis")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(beforeHash).NotTo(BeEmpty(),
+			"the pod template carries no config hash, so no config edit can ever reach a running pod")
+
+		By("editing spec.redisConfig.customConfig on the running cluster")
+		_, err = kubectl("patch", "redissentinel", sentinelName, "-n", clusterNamespace, "--type=merge",
+			"-p", `{"spec":{"redisConfig":{"customConfig":{"maxmemory-policy":"allkeys-lru"}}}}`)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the operator to change the pod template")
+		Eventually(func(g Gomega) {
+			hash, err := podTemplateConfigHash(clusterNamespace, sentinelName+"-redis")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(hash).NotTo(BeEmpty())
+			g.Expect(hash).NotTo(Equal(beforeHash), "the pod template still fingerprints the old configuration")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for every Redis pod to be replaced and serve the new configuration")
+		Eventually(func(g Gomega) {
+			pods, err := listPods(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(readyPods(pods)).To(HaveLen(3), "pods: %v", pods)
+
+			old := podUIDs(before)
+			for _, p := range readyPods(pods) {
+				g.Expect(p.UID).NotTo(Equal(old[p.Name]), "%s was never restarted", p.Name)
+				policy, err := redisCLI(clusterNamespace, p.Name, "CONFIG", "GET", "maxmemory-policy")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(policy).To(ContainSubstring("allkeys-lru"),
+					"%s still runs the configuration it started with", p.Name)
+			}
+		}, 6*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for the cluster to converge on a single master again")
+		Eventually(func(g Gomega) {
+			states, err := replicationStates(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			masters, replicas := splitByRole(states)
+			g.Expect(masters).To(HaveLen(1), "the roll left no single master: %v", states)
+			g.Expect(replicas).To(HaveLen(2), "the roll left a replica behind: %v", states)
+			for _, replica := range replicas {
+				g.Expect(replica.MasterLinkStatus).To(Equal("up"), "replica did not resync after the roll: %s", replica)
+				g.Expect(replica.MasterHost).To(Equal(masters[0].IP), "replica follows a stale master: %s", replica)
+			}
+
+			writeIPs, err := serviceEndpointIPs(clusterNamespace, sentinelName+"-redis")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(writeIPs).To(ConsistOf(masters[0].IP),
+				"the write Service did not follow the master through the roll")
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		// The ACL file lives on the data volume, which the roll reuses. A user
+		// that only existed in server memory would be gone from every pod here.
+		By("checking the ACL user survived the restart on every node")
+		settled, err := listPods(clusterNamespace, redisSelector)
+		Expect(err).NotTo(HaveOccurred())
+		for _, p := range readyPods(settled) {
+			users, err := redisCLI(clusterNamespace, p.Name, "ACL", "LIST")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(users).To(ContainSubstring("user "+userName),
+				"%s lost the ACL user across the restart", p.Name)
+		}
+
+		// Three periodic reconcile passes. The rendered config is assembled from
+		// a Go map, so a fingerprint taken over the rendered bytes verbatim would
+		// differ on each pass and roll the cluster, master included, forever.
+		By("checking an unchanged spec does not roll the pods again")
+		Consistently(func(g Gomega) {
+			now, err := listPods(clusterNamespace, redisSelector)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(podUIDs(now)).To(Equal(podUIDs(settled)), "the pods restarted without a spec change")
+		}, 95*time.Second, 10*time.Second).Should(Succeed())
+	})
+
 	It("serves authenticated metrics over the endpoint the chart exposes", func() {
 		By("granting the operator service account the right to read /metrics")
 		_, err := kubectl("create", "clusterrole", metricsReaderRole,

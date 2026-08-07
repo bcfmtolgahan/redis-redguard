@@ -21,7 +21,9 @@ package e2e
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -46,6 +48,43 @@ const (
 
 var projectImage = imageRepository + ":" + imageTag
 
+// kindCluster and kindBinary follow the Makefile, which passes both through the
+// environment.
+func kindCluster() string {
+	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok && v != "" {
+		return v
+	}
+	return "kind"
+}
+
+func kindBinary() string {
+	if v, ok := os.LookupEnv("KIND"); ok && v != "" {
+		return v
+	}
+	return "kind"
+}
+
+// pinKubeconfig exports the kind cluster's credentials to a file only this
+// process reads, and points every command the suite spawns at it. Child
+// processes inherit the environment, so this covers kubectl and helm alike.
+func pinKubeconfig() error {
+	cluster := kindCluster()
+	out, err := run(kindBinary(), "get", "kubeconfig", "--name", cluster)
+	if err != nil {
+		return fmt.Errorf("read kubeconfig for kind cluster %s: %w", cluster, err)
+	}
+
+	dir, err := os.MkdirTemp("", "redguard-e2e-kubeconfig")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
+		return err
+	}
+	return os.Setenv("KUBECONFIG", path)
+}
+
 // TestE2E runs the end-to-end suite against a live cluster. It requires a kind
 // cluster to already exist (see the setup-test-e2e target) and a running Docker
 // daemon to build the operator image.
@@ -60,6 +99,15 @@ func TestE2E(t *testing.T) {
 // exercises the generated RBAC; a kustomize install would test a different set
 // of permissions than the one users get.
 var _ = BeforeSuite(func() {
+	// Every kubectl and helm invocation resolves the current context afresh
+	// from the shared kubeconfig, and this suite deletes namespaces and
+	// cluster-scoped RBAC. Anything that switches contexts while it runs -- a
+	// second kind cluster being created, a person running kubectl -- would aim
+	// those deletes at whatever cluster is current at that moment. Pinning a
+	// kubeconfig of its own makes the target independent of that file.
+	By("pinning the suite to the kind cluster's own kubeconfig")
+	Expect(pinKubeconfig()).To(Succeed())
+
 	By("building the operator image")
 	_, err := utils.Run(exec.Command("make", "docker-build", "IMG="+projectImage))
 	Expect(err).NotTo(HaveOccurred(), "failed to build the operator image")
@@ -91,6 +139,14 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
+	// The pinned kubeconfig holds cluster credentials; it outlives the suite
+	// otherwise, since it sits in a temp directory of its own.
+	defer func() {
+		if path := os.Getenv("KUBECONFIG"); filepath.Base(path) == "config" {
+			_ = os.RemoveAll(filepath.Dir(path))
+		}
+	}()
+
 	By("uninstalling the chart")
 	if _, err := run("helm", "uninstall", helmRelease, "--namespace", operatorNamespace, "--wait"); err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "helm uninstall failed: %v\n", err)

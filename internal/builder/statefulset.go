@@ -1,12 +1,56 @@
 package builder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+const (
+	// ConfigHashAnnotation fingerprints the ConfigMap a pod reads at startup.
+	// Both servers parse their config file once, in the init script, so an edit
+	// to customConfig, the sentinel timers or the TLS block reaches a running
+	// pod only by changing the pod template and letting the StatefulSet roll.
+	ConfigHashAnnotation = "redis.redguard.io/config-hash"
+
+	// AuthSecretVersionAnnotation carries the resourceVersion of the auth
+	// Secret. The password is projected as an environment variable and read
+	// once at startup; the init scripts substitute it into redis.conf, the ACL
+	// file and the sentinel credential lines, so a rotation takes effect only
+	// on restart. The resourceVersion is stamped rather than a digest of the
+	// password so nothing derived from the secret value sits on a pod template.
+	// The reconciler owns this one: only it can read the Secret.
+	AuthSecretVersionAnnotation = "redis.redguard.io/auth-secret-version"
+)
+
+// configHash fingerprints rendered configuration files. A .conf value is
+// hashed as a sorted multiset of lines: the renderer walks customConfig as a Go
+// map, so an unchanged spec renders the same directives in a different order on
+// every call, and hashing the bytes verbatim would restart every pod on an
+// arbitrary reconcile. Everything else, scripts included, is hashed verbatim
+// because there line order is meaning.
+func configHash(data map[string]string) string {
+	h := sha256.New()
+	for _, key := range slices.Sorted(maps.Keys(data)) {
+		value := data[key]
+		if strings.HasSuffix(key, ".conf") {
+			lines := strings.Split(value, "\n")
+			slices.Sort(lines)
+			value = strings.Join(lines, "\n")
+		}
+		fmt.Fprintf(h, "%s\x00%s\x00", key, value)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // managedRunAsID is the uid and gid the managed Redis and Sentinel processes
 // run as. It is deliberately not the redis user baked into the image: nothing
@@ -184,7 +228,8 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels:      labels,
+					Annotations: map[string]string{ConfigHashAnnotation: configHash(BuildRedisConfigMap(rs).Data)},
 				},
 				Spec: corev1.PodSpec{
 					SecurityContext: managedPodSecurityContext(),
@@ -391,7 +436,8 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels:      labels,
+					Annotations: map[string]string{ConfigHashAnnotation: configHash(BuildSentinelConfigMap(rs).Data)},
 				},
 				Spec: corev1.PodSpec{
 					SecurityContext: managedPodSecurityContext(),

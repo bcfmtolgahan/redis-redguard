@@ -36,7 +36,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/builder"
@@ -80,6 +82,7 @@ func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
@@ -275,11 +278,20 @@ func (r *RedisSentinelReconciler) reconcileServices(ctx context.Context, rs *red
 func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
 	logger := log.FromContext(ctx)
 
+	authVersion, err := r.authSecretVersion(ctx, rs)
+	if err != nil {
+		return err
+	}
+
 	// Redis StatefulSet
 	redisStatefulSet := builder.BuildRedisStatefulSet(rs)
+	stampAuthSecretVersion(redisStatefulSet, authVersion)
 	if err := controllerutil.SetControllerReference(rs, redisStatefulSet, r.Scheme); err != nil {
 		return err
 	}
+	r.warnOnRollout(ctx, rs, redisStatefulSet,
+		"Redis pods restart in descending ordinal order to apply the new configuration; "+
+			"Sentinel promotes a replica when the master restarts")
 	if err := r.createOrUpdate(ctx, redisStatefulSet); err != nil {
 		return fmt.Errorf("failed to reconcile Redis StatefulSet: %w", err)
 	}
@@ -287,15 +299,96 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 
 	// Sentinel StatefulSet
 	sentinelStatefulSet := builder.BuildSentinelStatefulSet(rs)
+	stampAuthSecretVersion(sentinelStatefulSet, authVersion)
 	if err := controllerutil.SetControllerReference(rs, sentinelStatefulSet, r.Scheme); err != nil {
 		return err
 	}
+	r.warnOnRollout(ctx, rs, sentinelStatefulSet,
+		"Sentinel pods restart one at a time to apply the new configuration; "+
+			"learned state on the volume is kept, so the monitor parameters of an "+
+			"already-seeded sentinel do not change")
 	if err := r.createOrUpdate(ctx, sentinelStatefulSet); err != nil {
 		return fmt.Errorf("failed to reconcile Sentinel StatefulSet: %w", err)
 	}
 	logger.Info("Reconciled Sentinel StatefulSet", "name", sentinelStatefulSet.Name)
 
 	return nil
+}
+
+// authSecretVersion returns the resourceVersion of the auth Secret, or "" when
+// the CR configures no authentication. A Secret that is referenced but absent
+// also yields "": the pods cannot start without it either, and the version
+// appears and rolls them once the Secret does. Any other read failure aborts
+// the pass rather than stamping a version the Secret does not have: doing so
+// would restart every pod, master included, and restart them back on the next
+// successful read.
+func (r *RedisSentinelReconciler) authSecretVersion(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
+	auth := rs.Spec.RedisConfig.Auth
+	if auth == nil || auth.SecretName == "" {
+		return "", nil
+	}
+
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: auth.SecretName, Namespace: rs.Namespace}
+	if err := r.Get(ctx, key, secret); err != nil {
+		if errors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read auth secret %s: %w", auth.SecretName, err)
+	}
+	return secret.ResourceVersion, nil
+}
+
+// stampAuthSecretVersion records on the pod template which version of the auth
+// Secret the pods read at startup. Nothing else in the template changes when a
+// password is rotated, so without it the pods keep presenting the old
+// credential until an unrelated event happens to restart them.
+func stampAuthSecretVersion(sts *appsv1.StatefulSet, version string) {
+	if version == "" {
+		return
+	}
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = map[string]string{}
+	}
+	sts.Spec.Template.Annotations[builder.AuthSecretVersionAnnotation] = version
+}
+
+// warnOnRollout announces a pod restart before it happens. Rolling a
+// StatefulSet is how a config or password change reaches a running server, but
+// it is not free, and an operator who edited one directive should not have to
+// deduce from a failover event that the two are connected.
+func (r *RedisSentinelReconciler) warnOnRollout(ctx context.Context, rs *redisv1alpha1.RedisSentinel, desired *appsv1.StatefulSet, message string) {
+	existing := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
+		// Nothing is running yet, or the read failed and createOrUpdate is
+		// about to report it. Either way there is no restart to announce.
+		return
+	}
+	if podConfigIdentity(existing) == podConfigIdentity(desired) {
+		return
+	}
+
+	// A rotation is the one case where the pods disagree with each other while
+	// the roll runs: a restarted node presents the new password to peers that
+	// still require the old one, so replication and Sentinel authentication
+	// stay broken until the last pod has restarted.
+	if authSecretVersionOf(existing) != authSecretVersionOf(desired) {
+		message += "; the auth Secret changed, so replication and Sentinel " +
+			"authentication are interrupted until every pod has restarted"
+	}
+
+	recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "ConfigRollout",
+		fmt.Sprintf("%s: %s", desired.Name, message))
+}
+
+// podConfigIdentity is the pair of annotations that decide whether the
+// StatefulSet controller replaces the pods.
+func podConfigIdentity(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[builder.ConfigHashAnnotation] + "/" + authSecretVersionOf(sts)
+}
+
+func authSecretVersionOf(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[builder.AuthSecretVersionAnnotation]
 }
 
 func (r *RedisSentinelReconciler) reconcileNetworkPolicies(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
@@ -1141,6 +1234,33 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 	logger.V(2).Info("Collected metrics from pod", "pod", podName)
 }
 
+// sentinelsForAuthSecret maps a Secret back to the RedisSentinels that name it
+// as their auth Secret. The Secret is created by the user and can be shared, so
+// no owner reference points from it to a CR and Owns() cannot see it; without
+// this mapping a rotated password sits in the Secret while every pod keeps
+// serving the credential it read at startup.
+func (r *RedisSentinelReconciler) sentinelsForAuthSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	list := &redisv1alpha1.RedisSentinelList{}
+	if err := r.List(ctx, list, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list RedisSentinels for a Secret change",
+			"secret", obj.GetName(), "namespace", obj.GetNamespace())
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range list.Items {
+		rs := &list.Items[i]
+		auth := rs.Spec.RedisConfig.Auth
+		if auth == nil || auth.SecretName != obj.GetName() {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: rs.Name, Namespace: rs.Namespace},
+		})
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RedisFactory == nil {
@@ -1155,6 +1275,7 @@ func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.sentinelsForAuthSecret)).
 		Named("redissentinel").
 		Complete(r)
 }

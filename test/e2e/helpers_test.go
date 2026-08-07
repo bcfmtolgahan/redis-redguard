@@ -58,7 +58,10 @@ func kubectl(args ...string) (string, error) {
 
 // podState is the slice of pod status the specs assert on.
 type podState struct {
-	Name     string
+	Name string
+	// UID distinguishes a pod that was replaced from one that merely
+	// reconnected: a StatefulSet roll reuses the name and the volume.
+	UID      string
 	IP       string
 	Phase    string
 	Ready    bool
@@ -78,6 +81,7 @@ func listPods(namespace, selector string) ([]podState, error) {
 		Items []struct {
 			Metadata struct {
 				Name              string `json:"name"`
+				UID               string `json:"uid"`
 				DeletionTimestamp string `json:"deletionTimestamp"`
 			} `json:"metadata"`
 			Status struct {
@@ -104,6 +108,7 @@ func listPods(namespace, selector string) ([]podState, error) {
 		}
 		p := podState{
 			Name:  item.Metadata.Name,
+			UID:   item.Metadata.UID,
 			IP:    item.Status.PodIP,
 			Phase: item.Status.Phase,
 		}
@@ -130,6 +135,23 @@ func readyPods(pods []podState) []podState {
 		}
 	}
 	return ready
+}
+
+// podUIDs maps pod name to UID, the identity that changes when a pod is
+// replaced rather than restarted in place.
+func podUIDs(pods []podState) map[string]string {
+	uids := make(map[string]string, len(pods))
+	for _, p := range pods {
+		uids[p.Name] = p.UID
+	}
+	return uids
+}
+
+// podTemplateConfigHash reads the annotation that makes a config change reach
+// running pods. An empty result means the StatefulSet would never roll.
+func podTemplateConfigHash(namespace, statefulSet string) (string, error) {
+	return kubectl("get", "statefulset", statefulSet, "-n", namespace,
+		"-o", `jsonpath={.spec.template.metadata.annotations.redis\.redguard\.io/config-hash}`)
 }
 
 // redisCLI runs redis-cli inside a pod and returns its trimmed stdout.
