@@ -375,10 +375,25 @@ func TestBuildSentinelConfigMap_TimersRendered(t *testing.T) {
 func TestBuildSentinelConfigMap_BaseDirectives(t *testing.T) {
 	conf := BuildSentinelConfigMap(testSentinel()).Data["sentinel.conf"]
 
-	for _, want := range []string{"bind 0.0.0.0", "port 26379", "dir /tmp"} {
-		if !strings.Contains(conf, want) {
-			t.Errorf("sentinel.conf missing %q, got:\n%s", want, conf)
+	want := []string{
+		"bind 0.0.0.0",
+		"port 26379",
+		"dir /data",
+		"sentinel resolve-hostnames yes",
+		"sentinel announce-hostnames no",
+	}
+	for _, w := range want {
+		if !strings.Contains(conf, w) {
+			t.Errorf("sentinel.conf missing %q, got:\n%s", w, conf)
 		}
+	}
+	if strings.Contains(conf, "dir /tmp") {
+		t.Errorf("sentinel state must not live in /tmp:\n%s", conf)
+	}
+	// Directives apply in order: sentinel rejects a hostname monitor target
+	// unless resolve-hostnames is already enabled when the line is parsed.
+	if r, m := strings.Index(conf, "sentinel resolve-hostnames yes"), strings.Index(conf, "sentinel monitor "); r == -1 || m == -1 || r > m {
+		t.Errorf("resolve-hostnames must precede the monitor directive:\n%s", conf)
 	}
 }
 
@@ -492,8 +507,14 @@ func TestBuildSentinelConfigMap_InitScriptResolvesMaster(t *testing.T) {
 	if !strings.Contains(script, want) {
 		t.Errorf("sentinel init.sh missing %q, got:\n%s", want, script)
 	}
-	if !strings.Contains(script, "exec redis-sentinel /tmp/sentinel.conf") {
-		t.Errorf("sentinel init.sh does not exec redis-sentinel, got:\n%s", script)
+	if !strings.Contains(script, `exec redis-sentinel "$STATE"`) {
+		t.Errorf("sentinel init.sh must exec redis-sentinel on the durable state file, got:\n%s", script)
+	}
+	if strings.Contains(script, "/tmp/sentinel.conf") {
+		t.Errorf("sentinel state must not live in /tmp:\n%s", script)
+	}
+	if strings.Contains(script, "chmod 666") {
+		t.Errorf("state file holds the redis password; it must not be world-readable:\n%s", script)
 	}
 }
 

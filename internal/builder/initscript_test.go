@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 )
 
 // seedRedisConf mirrors the shape of the generated redis.conf the init script
@@ -160,6 +162,181 @@ func TestInitScript_GarbageFromSentinel_IsRejected(t *testing.T) {
 	}
 	if strings.Contains(conf, "not-an-ip") {
 		t.Errorf("non-IP sentinel reply must never reach the config:\n%s", conf)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sentinel init script
+// ---------------------------------------------------------------------------
+
+// sentinelInitResult is what one execution of the sentinel init script left
+// behind: the state file content and mode ("" / 0 when it does not exist),
+// the combined output, the script error, and the temp data dir.
+type sentinelInitResult struct {
+	conf    string
+	mode    os.FileMode
+	output  string
+	err     error
+	dataDir string
+}
+
+// runSentinelInitScript syntax-checks the generated sentinel init script,
+// rewrites its absolute paths into a temp dir, replaces the final exec and the
+// retry sleep, seeds the ConfigMap-side sentinel.conf, optionally plants
+// pre-existing state (a pod restart), and runs it under sh with the stub
+// binaries from testdata/bin first on PATH.
+func runSentinelInitScript(t *testing.T, script, seedConf, existingState string, env map[string]string) sentinelInitResult {
+	t.Helper()
+
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	etcDir := filepath.Join(dir, "etc")
+	for _, d := range []string{dataDir, etcDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(etcDir, "sentinel.conf"), []byte(seedConf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if existingState != "" {
+		if err := os.WriteFile(filepath.Join(dataDir, "sentinel.conf"), []byte(existingState), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pristine := filepath.Join(dir, "init-pristine.sh")
+	if err := os.WriteFile(pristine, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sh", "-n", pristine).CombinedOutput(); err != nil {
+		t.Fatalf("generated script fails sh -n: %v\n%s", err, out)
+	}
+
+	s := strings.ReplaceAll(script, "/etc/sentinel", etcDir)
+	s = strings.ReplaceAll(s, "/data", dataDir)
+	s = strings.ReplaceAll(s, "exec redis-sentinel", "echo WOULD_EXEC redis-sentinel")
+	s = strings.ReplaceAll(s, "sleep 2", "sleep 0")
+
+	path := filepath.Join(dir, "init.sh")
+	if err := os.WriteFile(path, []byte(s), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	stub, err := filepath.Abs("testdata/bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", path)
+	cmd.Env = []string{"PATH=" + stub + ":" + os.Getenv("PATH")}
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, runErr := cmd.CombinedOutput()
+
+	res := sentinelInitResult{output: string(out), err: runErr, dataDir: dataDir}
+	statePath := filepath.Join(dataDir, "sentinel.conf")
+	if b, readErr := os.ReadFile(statePath); readErr == nil {
+		res.conf = string(b)
+	}
+	if fi, statErr := os.Stat(statePath); statErr == nil {
+		res.mode = fi.Mode()
+	}
+	return res
+}
+
+// testSentinelInit returns the generated sentinel init script and the
+// sentinel.conf template it seeds from, with auth enabled.
+func testSentinelInit(t *testing.T) (script, seedConf string) {
+	t.Helper()
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Auth = &redisv1alpha1.AuthConfig{SecretName: "redis-pass"}
+	cm := BuildSentinelConfigMap(rs)
+	return cm.Data["init.sh"], cm.Data["sentinel.conf"]
+}
+
+const sentinelMasterFQDN = "test-rs-redis-0.test-rs-redis-headless.default.svc.cluster.local"
+
+func TestSentinelInitScript_FirstStart_SeedsSubstitutesResolves(t *testing.T) {
+	// & is special in awk gsub replacements and \ starts escapes in awk -v
+	// assignments; both must survive verbatim.
+	const password = `sw&rd\fi&sh\\x`
+
+	script, seedConf := testSentinelInit(t)
+	res := runSentinelInitScript(t, script, seedConf, "", map[string]string{
+		"REDGUARD_TEST_RESOLVE_IP": "10.244.0.7",
+		"REDIS_PASSWORD":           password,
+	})
+	if res.err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
+	}
+	if want := "sentinel monitor test-rs-master 10.244.0.7 6379 2"; !strings.Contains(res.conf, want) {
+		t.Errorf("monitor target not resolved to the master IP, want %q in:\n%s", want, res.conf)
+	}
+	if strings.Contains(res.conf, sentinelMasterFQDN) {
+		t.Errorf("master hostname left unresolved in state:\n%s", res.conf)
+	}
+	if want := "sentinel auth-pass test-rs-master " + password; !strings.Contains(res.conf, want) {
+		t.Errorf("password not substituted literally, want %q in:\n%s", want, res.conf)
+	}
+	if strings.Contains(res.conf, "${REDIS_PASSWORD}") {
+		t.Errorf("placeholder left behind:\n%s", res.conf)
+	}
+	if strings.Contains(res.output, password) {
+		t.Errorf("password printed to stdout/stderr:\n%s", res.output)
+	}
+	if got := res.mode.Perm(); got != 0o600 {
+		t.Errorf("state file mode = %o, want 600; it holds the redis password", got)
+	}
+	if want := "WOULD_EXEC redis-sentinel " + filepath.Join(res.dataDir, "sentinel.conf"); !strings.Contains(res.output, want) {
+		t.Errorf("script must exec sentinel on the durable state file, output:\n%s", res.output)
+	}
+}
+
+func TestSentinelInitScript_Restart_KeepsExistingState(t *testing.T) {
+	// State a sentinel rewrote after a failover: the master is no longer the
+	// bootstrap pod and the password is already literal. Re-seeding would
+	// re-monitor redis-0; re-substituting would corrupt content that happens
+	// to contain the placeholder text.
+	existing := "port 26379\n" +
+		"dir /data\n" +
+		"sentinel monitor test-rs-master 10.9.9.9 6379 2\n" +
+		"sentinel known-replica test-rs-master 10.9.9.8 6379\n" +
+		"sentinel auth-pass test-rs-master literal${REDIS_PASSWORD}chunk\n" +
+		"sentinel current-epoch 5\n"
+
+	script, seedConf := testSentinelInit(t)
+	// No REDGUARD_TEST_RESOLVE_IP: a restart must not depend on DNS at all.
+	res := runSentinelInitScript(t, script, seedConf, existing, map[string]string{
+		"REDIS_PASSWORD": "newpass",
+	})
+	if res.err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
+	}
+	if res.conf != existing {
+		t.Errorf("existing state was modified on restart:\ngot:\n%s\nwant:\n%s", res.conf, existing)
+	}
+	if want := "WOULD_EXEC redis-sentinel " + filepath.Join(res.dataDir, "sentinel.conf"); !strings.Contains(res.output, want) {
+		t.Errorf("script must exec sentinel on the durable state file, output:\n%s", res.output)
+	}
+}
+
+func TestSentinelInitScript_UnresolvableMaster_IsFatal(t *testing.T) {
+	script, seedConf := testSentinelInit(t)
+	// No REDGUARD_TEST_RESOLVE_IP: DNS never answers within the retry budget.
+	res := runSentinelInitScript(t, script, seedConf, "", nil)
+
+	if res.err == nil {
+		t.Fatalf("script must exit non-zero when the master never resolves, output:\n%s", res.output)
+	}
+	if strings.Contains(res.output, "WOULD_EXEC") {
+		t.Errorf("script must not start sentinel with an unresolvable monitor target, output:\n%s", res.output)
+	}
+	// A failed seed must leave no state file: the next start has to retry the
+	// seed instead of keeping the unresolved hostname forever.
+	if res.conf != "" {
+		t.Errorf("failed seed left state behind, which a restart would then keep:\n%s", res.conf)
 	}
 }
 

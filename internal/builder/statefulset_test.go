@@ -436,13 +436,61 @@ func TestBuildSentinelStatefulSet_ReplicaCount(t *testing.T) {
 	}
 }
 
-// Sentinel keeps its state in /tmp; it must not request a PVC.
-func TestBuildSentinelStatefulSet_HasNoVolumeClaimTemplates(t *testing.T) {
+// Sentinel rewrites its config with the learned master, replicas and failover
+// epoch. Without a PVC that state dies with the container and a restarted
+// sentinel re-monitors the bootstrap master.
+func TestBuildSentinelStatefulSet_PersistsState(t *testing.T) {
 	sts := BuildSentinelStatefulSet(testSentinel())
 
-	if len(sts.Spec.VolumeClaimTemplates) != 0 {
-		t.Errorf("sentinel StatefulSet has %d volumeClaimTemplates, want 0: %v",
+	if len(sts.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("got %d volumeClaimTemplates, want 1: %v",
 			len(sts.Spec.VolumeClaimTemplates), sts.Spec.VolumeClaimTemplates)
+	}
+	vct := sts.Spec.VolumeClaimTemplates[0]
+
+	if vct.Name != "sentinel-data" {
+		t.Errorf("volumeClaimTemplate name = %q, want %q", vct.Name, "sentinel-data")
+	}
+	if len(vct.Spec.AccessModes) != 1 || vct.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Errorf("accessModes = %v, want [ReadWriteOnce]", vct.Spec.AccessModes)
+	}
+	gotSize := vct.Spec.Resources.Requests[corev1.ResourceStorage]
+	if wantSize := resource.MustParse("1Gi"); gotSize.Cmp(wantSize) != 0 {
+		t.Errorf("storage request = %s, want %s", gotSize.String(), wantSize.String())
+	}
+	if !hasVolumeMount(sts.Spec.Template.Spec.Containers[0], "sentinel-data", "/data") {
+		t.Errorf("container does not mount the sentinel-data claim at /data: %v",
+			sts.Spec.Template.Spec.Containers[0].VolumeMounts)
+	}
+}
+
+func TestBuildSentinelStatefulSet_StorageClassFollowsRedis(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Storage = &redisv1alpha1.StorageSpec{
+		Size:             resource.MustParse("10Gi"),
+		StorageClassName: "gp3",
+	}
+
+	vct := BuildSentinelStatefulSet(rs).Spec.VolumeClaimTemplates[0]
+
+	if vct.Spec.StorageClassName == nil || *vct.Spec.StorageClassName != "gp3" {
+		t.Errorf("storageClassName = %v, want %q", vct.Spec.StorageClassName, "gp3")
+	}
+	// The size does not follow Redis: sentinel state is a single small file.
+	gotSize := vct.Spec.Resources.Requests[corev1.ResourceStorage]
+	if wantSize := resource.MustParse("1Gi"); gotSize.Cmp(wantSize) != 0 {
+		t.Errorf("storage request = %s, want %s", gotSize.String(), wantSize.String())
+	}
+}
+
+func TestBuildSentinelStatefulSet_NoStorageClassByDefault(t *testing.T) {
+	rs := testSentinel()
+	rs.Spec.RedisConfig.Storage = nil
+
+	vct := BuildSentinelStatefulSet(rs).Spec.VolumeClaimTemplates[0]
+
+	if vct.Spec.StorageClassName != nil {
+		t.Errorf("storageClassName = %q, want nil (cluster default)", *vct.Spec.StorageClassName)
 	}
 }
 

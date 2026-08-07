@@ -288,6 +288,10 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 			Name:      "config",
 			MountPath: "/etc/sentinel",
 		},
+		{
+			Name:      "sentinel-data",
+			MountPath: "/data",
+		},
 	}
 
 	// Add TLS volumes and mounts if enabled
@@ -329,7 +333,7 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 		}
 	}
 
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      rs.Name + "-sentinel",
 			Namespace: rs.Namespace,
@@ -401,8 +405,35 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 					Volumes: volumes,
 				},
 			},
+			// Sentinel rewrites its config with the learned master, replicas
+			// and failover epoch; without durable state a restarted pod would
+			// re-seed from the template and re-monitor the bootstrap master.
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "sentinel-data",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{
+							corev1.ReadWriteOnce,
+						},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
 		},
 	}
+
+	// The state is one small file; only the storage class follows Redis.
+	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != "" {
+		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = &rs.Spec.RedisConfig.Storage.StorageClassName
+	}
+
+	return sts
 }
 
 // Helper functions

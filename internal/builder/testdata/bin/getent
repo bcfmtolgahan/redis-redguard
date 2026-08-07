@@ -1,3 +1,8 @@
 #!/bin/sh
-# Stub getent for init-script tests: name resolution always fails.
-exit 1
+# Stub getent for init-script tests.
+# REDGUARD_TEST_RESOLVE_IP unset: name resolution fails.
+# Set: print "<ip> <name>" like `getent hosts <name>`.
+if [ -z "${REDGUARD_TEST_RESOLVE_IP:-}" ]; then
+    exit 1
+fi
+printf '%s %s\n' "$REDGUARD_TEST_RESOLVE_IP" "${2:-}"

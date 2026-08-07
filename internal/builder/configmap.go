@@ -207,7 +207,11 @@ func BuildSentinelConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 		"# Sentinel configuration",
 		"bind 0.0.0.0",
 		"port 26379",
-		"dir /tmp",
+		"dir /data",
+		// Directives apply in order: resolve-hostnames must be set before the
+		// monitor line or sentinel rejects its hostname target at parse time.
+		"sentinel resolve-hostnames yes",
+		"sentinel announce-hostnames no",
 		fmt.Sprintf("sentinel monitor %s %s 6379 %d", masterName, masterHost, rs.Spec.SentinelConfig.Quorum),
 		fmt.Sprintf("sentinel down-after-milliseconds %s %d", masterName, rs.Spec.SentinelConfig.DownAfterMilliseconds),
 		fmt.Sprintf("sentinel failover-timeout %s %d", masterName, rs.Spec.SentinelConfig.FailoverTimeout),
@@ -257,42 +261,83 @@ func BuildSentinelConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 		},
 		Data: map[string]string{
 			"sentinel.conf": strings.Join(config, "\n"),
-			"init.sh": `#!/bin/sh
-set -e
-
-# Copy config to writable location first
-cp /etc/sentinel/sentinel.conf /tmp/sentinel.conf
-
-# Replace password placeholder if auth is enabled
-# Using awk for safer substitution (handles special characters better than sed)
-if [ -n "$REDIS_PASSWORD" ]; then
-    awk -v pass="$REDIS_PASSWORD" '{gsub(/\${REDIS_PASSWORD}/, pass); print}' /tmp/sentinel.conf > /tmp/sentinel.conf.tmp
-    mv /tmp/sentinel.conf.tmp /tmp/sentinel.conf
-fi
-
-# Wait for master to be available and get its IP
-MASTER_HOST="` + masterHost + `"
-echo "Waiting for master at $MASTER_HOST"
-for i in $(seq 1 30); do
-    MASTER_IP=$(getent hosts $MASTER_HOST | awk '{ print $1 }')
-    if [ -n "$MASTER_IP" ]; then
-        echo "Master resolved to IP: $MASTER_IP"
-        # Replace hostname with IP in config using awk (safer than sed for special chars)
-        awk -v host="$MASTER_HOST" -v ip="$MASTER_IP" '{gsub(host, ip); print}' /tmp/sentinel.conf > /tmp/sentinel.conf.tmp
-        mv /tmp/sentinel.conf.tmp /tmp/sentinel.conf
-        break
-    fi
-    echo "Waiting for master... ($i/30)"
-    sleep 2
-done
-
-# Sentinel needs writable config
-chmod 666 /tmp/sentinel.conf
-
-exec redis-sentinel /tmp/sentinel.conf
-`,
+			"init.sh":       buildSentinelInitScript(masterHost),
 		},
 	}
+}
+
+// buildSentinelInitScript creates the sentinel startup script. Invariants the
+// script must hold: existing state on the PVC is kept verbatim (sentinel wrote
+// the learned master, replicas and epoch into it, and its password is already
+// literal), a seed is published atomically only after the master hostname
+// resolved, an unresolvable master is fatal rather than a silent fall-through,
+// and the state file holding the password is never readable beyond its owner.
+func buildSentinelInitScript(masterHost string) string {
+	return fmt.Sprintf(`#!/bin/sh
+set -eu
+
+log() { echo "[redguard-sentinel-init] $*" >&2; }
+
+STATE=/data/sentinel.conf
+SEED=/data/sentinel.conf.seed
+
+umask 077
+
+if [ -f "$STATE" ]; then
+    log "existing sentinel state found; keeping it"
+else
+    log "seeding sentinel config from template"
+    cp /etc/sentinel/sentinel.conf "$SEED"
+    chmod 600 "$SEED"
+
+    # The password reaches awk through the environment and is replaced with
+    # index/substr rather than gsub, so & and \ in the value stay literal.
+    if [ -n "${REDIS_PASSWORD:-}" ]; then
+        awk 'BEGIN { pass = ENVIRON["REDIS_PASSWORD"]; ph = "${REDIS_PASSWORD}" }
+             {
+                 out = ""
+                 rest = $0
+                 while ((i = index(rest, ph)) > 0) {
+                     out = out substr(rest, 1, i - 1) pass
+                     rest = substr(rest, i + length(ph))
+                 }
+                 print out rest
+             }' "$SEED" > "$SEED.tmp"
+        mv "$SEED.tmp" "$SEED"
+    fi
+
+    MASTER_HOST="%s"
+    log "resolving master host $MASTER_HOST"
+    MASTER_IP=""
+    i=1
+    while [ "$i" -le 30 ]; do
+        MASTER_IP=$(getent hosts "$MASTER_HOST" 2>/dev/null | awk '{ print $1 }' | head -1) || MASTER_IP=""
+        if [ -n "$MASTER_IP" ]; then
+            break
+        fi
+        log "waiting for master DNS ($i/30)"
+        sleep 2
+        i=$((i + 1))
+    done
+    if [ -z "$MASTER_IP" ]; then
+        # Leave nothing behind: the next start must retry the seed instead of
+        # keeping a monitor target that never resolved.
+        rm -f "$SEED"
+        log "FATAL: cannot resolve $MASTER_HOST; refusing to start with an unresolvable monitor target"
+        exit 1
+    fi
+    log "master resolved to $MASTER_IP"
+    awk -v host="$MASTER_HOST" -v ip="$MASTER_IP" '{ gsub(host, ip); print }' "$SEED" > "$SEED.tmp"
+    mv "$SEED.tmp" "$SEED"
+
+    # Publish atomically so a crash mid-seed cannot leave a half-built state
+    # file that the next start would then keep.
+    mv "$SEED" "$STATE"
+fi
+
+chmod 600 "$STATE"
+exec redis-sentinel "$STATE"
+`, masterHost)
 }
 
 // buildLabels creates standard labels for resources
