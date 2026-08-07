@@ -13,30 +13,13 @@ import (
 // pod-selecting peer in an ingress/egress rule — a peer nothing matches allows
 // nothing.
 //
-// It currently FAILS. Both builders select `app: redis` / `app: sentinel` plus
-// `redis.redguard.io/redis-name`, but buildLabels() only ever emits the
+// It currently fails: both builders select `app: redis` / `app: sentinel` plus
+// `redis.redguard.io/redis-name`, but buildLabels only emits the
 // app.kubernetes.io/* set, so both policies match zero pods and every
-// cross-component rule points at an empty set.
-//
-// Observed with the t.Skip removed
-// (go test ./internal/builder/... -run TestNetworkPolicySelectorMatchesPodLabels -v):
-//
-//	--- FAIL: TestNetworkPolicySelectorMatchesPodLabels (0.00s)
-//	  redis: netpol selects app=redis but pods carry
-//	    map[app.kubernetes.io/component:redis app.kubernetes.io/instance:test-rs
-//	    app.kubernetes.io/managed-by:redguard-operator app.kubernetes.io/name:redguard]
-//	    — policy matches zero pods
-//	  redis: netpol selects redis.redguard.io/redis-name=test-rs but pods carry … (same)
-//	  sentinel: netpol selects app=sentinel but pods carry … (same, component:sentinel)
-//	  sentinel: netpol selects redis.redguard.io/redis-name=test-rs but pods carry … (same)
-//	  redis: peer selector map[app:sentinel redis.redguard.io/redis-name:test-rs]
-//	    matches neither redis pods … nor sentinel pods …
-//	  (and four more peer-selector failures across both policies)
-//
-// Skipped, not deleted: Task 3.3 of the hardening plan fixes the selectors and
-// un-skips this test as its failing-test step.
+// cross-component peer points at an empty set. Skipped rather than deleted so
+// the gap stays visible until the selectors are corrected.
 func TestNetworkPolicySelectorMatchesPodLabels(t *testing.T) {
-	t.Skip("known bug, fixed in Task 3.3 of planning/2026-08-07-redguard-v0.3.0-hardening.md")
+	t.Skip("selectors do not match any pod labels; see BuildRedisNetworkPolicy")
 
 	rs := testSentinel()
 	redisPods := BuildRedisStatefulSet(rs).Spec.Template.Labels

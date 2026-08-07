@@ -745,8 +745,8 @@ func (r *RedisRestoreReconciler) getAdminPassword(ctx context.Context, rs *redis
 	return string(secret.Data["password"])
 }
 
-// updateStatus writes the phase transition. The error must reach the caller: a
-// swallowed write here once let finished phases re-run their side effects.
+// updateStatus writes the phase transition. The error must reach the caller;
+// swallowing it lets a finished phase re-run its side effects on the next pass.
 func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redisv1alpha1.RedisRestore, phase redisv1alpha1.RestorePhase, message string, dataSize int64) error {
 	restore.Status.Phase = phase
 	restore.Status.Message = message
