@@ -23,7 +23,7 @@ operator:
 
   image:
     repository: ghcr.io/bcfmtolgahan/redguard
-    tag: v0.2.1
+    tag: v0.3.0
     pullPolicy: IfNotPresent
 
   # The informer cache dominates memory, and Secrets cannot be label-scoped
