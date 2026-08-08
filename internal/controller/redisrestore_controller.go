@@ -94,6 +94,13 @@ type RedisRestoreReconciler struct {
 	RedisFactory redisclient.Factory
 	// PodExec runs commands inside Redis pods; nil means the SPDY executor.
 	PodExec podExecFn
+	// AllowedBuckets and AllowedEndpoints are the same allowlists the backup
+	// controller enforces (--allowed-backup-buckets, --allowed-backup-endpoints).
+	// With spec.backupSource.s3.useIAMRole the GetObject is signed with the
+	// operator's own identity, so an unrestricted restore reads any object that
+	// identity can reach; empty AllowedBuckets disables the IAM-role path.
+	AllowedBuckets   []string
+	AllowedEndpoints []string
 }
 
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores,verbs=get;list;watch;create;update;patch;delete
@@ -135,6 +142,14 @@ func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Refuse disallowed destinations before any Redis or S3 side effect. The
+	// check runs before every phase, so a violating restore never starts and an
+	// operator restarted with a tighter allowlist stops an in-flight one.
+	if err := r.validateRestoreDestination(redisRestore); err != nil {
+		logger.Error(err, "Restore destination not allowed")
+		return r.markDestinationRejected(ctx, redisRestore, err)
 	}
 
 	redisSentinel := &redisv1alpha1.RedisSentinel{}
@@ -423,6 +438,35 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 	return ctrl.Result{}, nil
 }
 
+// validateRestoreDestination applies the shared destination policy to the
+// read path; see validateS3Destination for the confused-deputy rationale.
+func (r *RedisRestoreReconciler) validateRestoreDestination(restore *redisv1alpha1.RedisRestore) error {
+	return validateS3Destination(&restore.Spec.BackupSource.S3, r.AllowedBuckets, r.AllowedEndpoints)
+}
+
+// markDestinationRejected records a destination-policy refusal as a terminal
+// failure under its own reason, distinguishable from a run that failed. The
+// Failed phase is sticky per generation, so the sentinel reconciler resumes
+// converging any quiesce a stopped in-flight run left behind.
+func (r *RedisRestoreReconciler) markDestinationRejected(ctx context.Context, restore *redisv1alpha1.RedisRestore, cause error) (ctrl.Result, error) {
+	restore.Status.Phase = redisv1alpha1.RestorePhaseFailed
+	restore.Status.Message = cause.Error()
+	restore.Status.ObservedGeneration = restore.Generation
+	meta.SetStatusCondition(&restore.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: restore.Generation,
+		Reason:             "DestinationNotAllowed",
+		Message:            cause.Error(),
+	})
+	recordEvent(r.Recorder, restore, corev1.EventTypeWarning, "DestinationNotAllowed", cause.Error())
+	if err := r.Status().Update(ctx, restore); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update RedisRestore status")
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
 // failRestore lifts the sentinel quiesce when possible and records a terminal
 // failure. No data-destroying step may follow a failRestore.
 func (r *RedisRestoreReconciler) failRestore(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel, message string) (ctrl.Result, error) {
@@ -616,6 +660,12 @@ func (r *RedisRestoreReconciler) preflightBackupObject(ctx context.Context, rest
 }
 
 func (r *RedisRestoreReconciler) createS3Client(ctx context.Context, restore *redisv1alpha1.RedisRestore) (*s3.Client, error) {
+	// Re-checked here so no future call site can reach AWS with the operator's
+	// identity without passing the destination policy.
+	if err := r.validateRestoreDestination(restore); err != nil {
+		return nil, err
+	}
+
 	var cfg aws.Config
 	var err error
 

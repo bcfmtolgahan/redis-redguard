@@ -52,10 +52,10 @@ type S3Config struct {
 	CredentialsSecretRef string `json:"credentialsSecretRef,omitempty"`
 
 	// UseIAMRole indicates whether to use IAM role instead of credentials.
-	// The request then runs under the operator's own AWS identity;
-	// RedisBackup rejects destinations whose bucket is not listed in the
-	// operator's --allowed-backup-buckets or whose custom endpoint is not
-	// in --allowed-backup-endpoints.
+	// The request then runs under the operator's own AWS identity; both
+	// RedisBackup and RedisRestore reject destinations whose bucket is not
+	// listed in the operator's --allowed-backup-buckets or whose custom
+	// endpoint is not in --allowed-backup-endpoints.
 	// +optional
 	UseIAMRole bool `json:"useIAMRole,omitempty"`
 }

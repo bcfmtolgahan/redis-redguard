@@ -179,12 +179,12 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&allowedBackupBuckets, "allowed-backup-buckets", "",
-		"Comma-separated S3 buckets a RedisBackup may target with the operator's IAM role "+
-			"(spec.s3.useIAMRole). Empty disables the IAM-role path entirely; backups must then "+
-			"supply spec.s3.credentialsSecretRef. Backups using credentialsSecretRef are not restricted.")
+		"Comma-separated S3 buckets a RedisBackup or RedisRestore may target with the operator's "+
+			"IAM role (s3.useIAMRole). Empty disables the IAM-role path entirely; the CRs must then "+
+			"supply s3.credentialsSecretRef. CRs using credentialsSecretRef are not restricted.")
 	flag.StringVar(&allowedBackupEndpoints, "allowed-backup-endpoints", "",
-		"Comma-separated custom S3 endpoints permitted for IAM-role backups, for example a VPC "+
-			"endpoint URL. Empty permits only the default AWS endpoint.")
+		"Comma-separated custom S3 endpoints permitted for IAM-role backups and restores, for "+
+			"example a VPC endpoint URL. Empty permits only the default AWS endpoint.")
 	flag.StringVar(&watchNamespace, "watch-namespace", "",
 		"Comma-separated namespaces the operator watches and acts on. Empty watches every "+
 			"namespace, which means an informer over the whole cluster; set this on a large "+
@@ -313,6 +313,11 @@ func main() {
 		Scheme:     mgr.GetScheme(),
 		RESTConfig: mgr.GetConfig(),
 		Recorder:   mgr.GetEventRecorderFor("redisrestore-controller"),
+		// The same destination policy as the backup side: a restore under the
+		// operator's IAM role reads any object that identity can reach, so it
+		// must pass the identical allowlists.
+		AllowedBuckets:   splitCommaList(allowedBackupBuckets),
+		AllowedEndpoints: splitCommaList(allowedBackupEndpoints),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisRestore")
 		os.Exit(1)

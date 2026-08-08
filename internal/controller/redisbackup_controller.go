@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -218,26 +217,10 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// validateBackupDestination enforces the operator-level destination policy on
-// the confused-deputy path: with useIAMRole the request runs under the
-// operator's own AWS identity, so any namespace user could otherwise aim that
-// identity at an arbitrary bucket or endpoint. Tenant-supplied credentials
-// (credentialsSecretRef) carry only privileges the tenant already holds and
-// are not restricted.
+// validateBackupDestination applies the shared destination policy to the
+// write path; see validateS3Destination for the confused-deputy rationale.
 func (r *RedisBackupReconciler) validateBackupDestination(redisBackup *redisv1alpha1.RedisBackup) error {
-	if !redisBackup.Spec.S3.UseIAMRole {
-		return nil
-	}
-	if len(r.AllowedBuckets) == 0 {
-		return fmt.Errorf("spec.s3.useIAMRole is set but the operator runs without --allowed-backup-buckets; the IAM-role path is disabled, use spec.s3.credentialsSecretRef instead")
-	}
-	if !slices.Contains(r.AllowedBuckets, redisBackup.Spec.S3.Bucket) {
-		return fmt.Errorf("bucket %q is not in the operator's --allowed-backup-buckets", redisBackup.Spec.S3.Bucket)
-	}
-	if ep := redisBackup.Spec.S3.Endpoint; ep != "" && !slices.Contains(r.AllowedEndpoints, ep) {
-		return fmt.Errorf("endpoint %q is not in the operator's --allowed-backup-endpoints; a custom endpoint would redirect requests signed with the operator's identity", ep)
-	}
-	return nil
+	return validateS3Destination(&redisBackup.Spec.S3, r.AllowedBuckets, r.AllowedEndpoints)
 }
 
 // markDestinationRejected surfaces a destination-policy refusal in status and
