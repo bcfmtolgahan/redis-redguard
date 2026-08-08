@@ -615,8 +615,6 @@ func (r *RedisUserReconciler) redisUsersForPod(ctx context.Context, obj client.O
 	return requests
 }
 
-// setDegraded reports a terminal, spec-caused failure: only a spec edit can
-// clear it, and that edit triggers its own reconcile.
 // reportACLStatus publishes whether the user is applied on every node. The
 // CR's existing series are dropped first so a renamed spec.username leaves no
 // stale series claiming the old account is still applied.
@@ -632,6 +630,8 @@ func (r *RedisUserReconciler) reportACLStatus(redisUser *redisv1alpha1.RedisUser
 		Set(value)
 }
 
+// setDegraded reports a partially applied user: the next pass that reaches
+// Ready flips the condition back to False.
 func (r *RedisUserReconciler) setDegraded(ctx context.Context, redisUser *redisv1alpha1.RedisUser, reason, message string) {
 	redisUser.Status.Phase = "Degraded"
 	redisUser.Status.ObservedGeneration = redisUser.Generation
