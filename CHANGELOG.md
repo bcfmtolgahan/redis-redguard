@@ -154,17 +154,14 @@ A 0.2.1 user will hit all of these.
 
 ### Known limitations
 
-- **TLS clusters do not reach `Running`.** The Redis start-up script queries
-  Sentinel without TLS flags, so on a TLS cluster it never resolves the master
-  and the pod is killed by its liveness probe first. Separately, a `caSecretRef`
-  naming a Secret other than `certificateSecretRef` produces a nested `subPath`
-  mount that the container runtime refuses.
-- **A restore can lose its own payload.** The restore raises Sentinel's
-  `down-after-milliseconds` before restarting the master, but the `RedisSentinel`
-  controller converges that value back towards the spec within one reconcile
-  pass. If the restart outlasts the spec value plus an election, Sentinel
-  promotes a replica and the restored dataset is discarded. Check that
-  `status.phase` reached `Completed`.
+- **A restore is a write outage.** The master is restarted to load the payload.
+  Sentinel's failure threshold is raised for the duration and held against the
+  operator's own drift repair, but clients see the master go away.
+- **ACL accounts outlive their cluster.** The ACL file lives on the retained
+  Redis data volume, so deleting a `RedisSentinel` and recreating it under the
+  same name brings back every account with its previous password. Nothing prunes
+  accounts that have no owning `RedisUser`.
+- **IPv6-only clusters are unsupported.** Master addresses are parsed as IPv4.
 - A single-replica cluster is not highly available; the operator reports
   `HighlyAvailable=False`.
 - A Service cannot follow a failover while the operator is down.

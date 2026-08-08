@@ -274,11 +274,23 @@ var _ = Describe("RedisSentinel credential rotation", func() {
 		userSecret.Data["password"] = []byte("new-password")
 		Expect(k8sClient.Update(ctx, userSecret)).To(Succeed())
 
-		By("failing the pass instead of rolling into a split cluster")
+		By("degrading without aborting the pass")
+		// The pass has to reach updateStatus even when the push fails: that is
+		// where the master label moves, and an unreachable node is exactly the
+		// partition that triggers the failover the label has to follow.
 		Eventually(func(g Gomega) {
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
-			g.Expect(err).To(HaveOccurred(),
-				"an incomplete push must surface, not silently leave the cluster half-configured")
+			drainEvents()
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred(),
+				"an incomplete push must degrade and requeue, not abort the pass that maintains the master label")
+			g.Expect(result.RequeueAfter).To(BeNumerically(">", 0),
+				"a degraded rotation must schedule its own retry")
+
+			rs := &redisv1alpha1.RedisSentinel{}
+			g.Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+			degraded := meta.FindStatusCondition(rs.Status.Conditions, "Degraded")
+			g.Expect(degraded).NotTo(BeNil())
+			g.Expect(degraded.Reason).To(Equal("CredentialRotationFailed"))
 		}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
 
 		By("writing no credential anywhere before every node was reachable")

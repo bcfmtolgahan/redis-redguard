@@ -1,8 +1,15 @@
 package sentinel
 
 import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -140,5 +147,143 @@ func TestParseSentinelsReplySurfacesMalformedEntries(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "string") {
 		t.Errorf("error %q does not name the offending type", err)
+	}
+}
+
+// fakeSentinelServer is a minimal RESP2 endpoint: it refuses HELLO so go-redis
+// falls back to RESP2, answers SENTINEL FAILOVER with a fixed reply, and counts
+// how many failover commands reached it.
+type fakeSentinelServer struct {
+	ln            net.Listener
+	failoverReply string
+
+	mu        sync.Mutex
+	failovers int
+}
+
+func newFakeSentinelServer(t *testing.T, failoverReply string) *fakeSentinelServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeSentinelServer{ln: ln, failoverReply: failoverReply}
+	t.Cleanup(func() { _ = ln.Close() })
+	go s.serve()
+	return s
+}
+
+func (s *fakeSentinelServer) addr() string { return s.ln.Addr().String() }
+
+func (s *fakeSentinelServer) failoverCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failovers
+}
+
+func (s *fakeSentinelServer) serve() {
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.handle(conn)
+	}
+}
+
+func (s *fakeSentinelServer) handle(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	r := bufio.NewReader(conn)
+	for {
+		args, err := readRESPCommand(r)
+		if err != nil {
+			return
+		}
+		reply := "+OK\r\n"
+		switch {
+		case strings.EqualFold(args[0], "HELLO"):
+			reply = "-ERR unknown command 'HELLO'\r\n"
+		case strings.EqualFold(args[0], "SENTINEL") && len(args) > 1 && strings.EqualFold(args[1], "failover"):
+			s.mu.Lock()
+			s.failovers++
+			s.mu.Unlock()
+			reply = s.failoverReply + "\r\n"
+		}
+		if _, err := conn.Write([]byte(reply)); err != nil {
+			return
+		}
+	}
+}
+
+// readRESPCommand parses one client command: an array of bulk strings.
+func readRESPCommand(r *bufio.Reader) ([]string, error) {
+	line, err := respLine(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(line) < 2 || line[0] != '*' {
+		return nil, fmt.Errorf("unexpected line %q", line)
+	}
+	n, err := strconv.Atoi(line[1:])
+	if err != nil {
+		return nil, err
+	}
+	args := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		line, err := respLine(r)
+		if err != nil {
+			return nil, err
+		}
+		if len(line) < 2 || line[0] != '$' {
+			return nil, fmt.Errorf("unexpected bulk header %q", line)
+		}
+		size, err := strconv.Atoi(line[1:])
+		if err != nil {
+			return nil, err
+		}
+		buf := make([]byte, size+2)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		args = append(args, string(buf[:size]))
+	}
+	return args, nil
+}
+
+func respLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// A second forced failover started while one is running is not agreed with the
+// sentinel already driving the first: two sentinels then promote two different
+// replicas. The -INPROG refusal means the promotion the caller wants is already
+// happening, so it is success, not a reason to ask the next sentinel.
+func TestFailoverFromPoolStopsOnInProgress(t *testing.T) {
+	busy := newFakeSentinelServer(t, "-INPROG Failover already in progress")
+	idle := newFakeSentinelServer(t, "+OK")
+
+	pool := NewSentinelClientPool([]string{busy.addr(), idle.addr()}, "")
+	if err := pool.FailoverFromPool(context.Background(), "rg-master"); err != nil {
+		t.Fatalf("FailoverFromPool during an in-progress failover: %v", err)
+	}
+	if got := idle.failoverCount(); got != 0 {
+		t.Errorf("the second sentinel received %d SENTINEL FAILOVER commands; an in-progress reply must end the traversal", got)
+	}
+}
+
+func TestFailoverFromPoolTriesNextSentinelOnOtherErrors(t *testing.T) {
+	broken := newFakeSentinelServer(t, "-ERR No such master with that name")
+	healthy := newFakeSentinelServer(t, "+OK")
+
+	pool := NewSentinelClientPool([]string{broken.addr(), healthy.addr()}, "")
+	if err := pool.FailoverFromPool(context.Background(), "rg-master"); err != nil {
+		t.Fatalf("FailoverFromPool: %v", err)
+	}
+	if got := healthy.failoverCount(); got != 1 {
+		t.Errorf("the healthy sentinel received %d SENTINEL FAILOVER commands, want 1", got)
 	}
 }

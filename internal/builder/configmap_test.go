@@ -66,6 +66,39 @@ func findDirective(conf, prefix string) (string, bool) {
 	return "", false
 }
 
+// TestValidateAuthPassword pins the two failure modes the validator exists
+// for: an empty value renders the default ACL user nopass while auth reads as
+// enabled, and whitespace, quote, backslash or control bytes cannot survive
+// every consumer (probe command lines expand the value unquoted). Awkward but
+// representable characters must pass, because the config render quotes them.
+func TestValidateAuthPassword(t *testing.T) {
+	for _, p := range []string{
+		"s3cr3t",
+		`p@ss'word#1&$*(){}[]`,
+		"UPPER.lower-123_~=+",
+		strings.Repeat("x", 512),
+	} {
+		if err := ValidateAuthPassword(p); err != nil {
+			t.Errorf("ValidateAuthPassword(%q) = %v, want nil", p, err)
+		}
+	}
+
+	for name, p := range map[string]string{
+		"empty":           "",
+		"space":           "pass word",
+		"tab":             "pass\tword",
+		"newline":         "pass\nword",
+		"carriage return": "pass\rword",
+		"double quote":    `pass"word`,
+		"backslash":       `pass\word`,
+		"control byte":    "pass\x01word",
+	} {
+		if err := ValidateAuthPassword(p); err == nil {
+			t.Errorf("ValidateAuthPassword must reject the %s case %q", name, p)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // redis.conf
 // ---------------------------------------------------------------------------

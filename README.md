@@ -195,13 +195,12 @@ Every field is in [docs/reference.md](docs/reference.md).
   replica.
 - **NetworkPolicies need a CNI that enforces them.** The operator writes the
   objects regardless. Under a CNI that ignores NetworkPolicy they are inert.
-- **TLS does not currently work.** `spec.tls` is accepted and the pods are
-  configured for it, but the Redis start-up script queries Sentinel without TLS
-  and never resolves the master, so the Redis pods do not become ready. See
-  [docs/operations.md](docs/operations.md#tls).
-- **A restore restarts the master.** If the restart outlasts
-  `sentinelConfig.downAfterMilliseconds`, Sentinel can promote a replica and the
-  restored dataset is discarded. Check `status.phase` on the `RedisRestore`.
+- **The operator does not issue or renew certificates.** `spec.tls` consumes
+  Secrets you supply. Renewing the certificate rolls the pods, because both
+  servers read it once at start-up.
+- **A restore restarts the master.** The operator raises Sentinel's failure
+  threshold for the duration and holds it against its own drift repair, but the
+  restart is still a write outage. Check `status.phase` on the `RedisRestore`.
 
 ## Uninstall
 

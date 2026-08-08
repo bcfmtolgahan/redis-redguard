@@ -34,7 +34,8 @@ What it does not defend against:
 - **A cluster without authentication.** `spec.redisConfig.auth` is optional. With
   it unset, the `default` user is `nopass` and anything that reaches port 6379
   has full access.
-- **Traffic interception.** TLS does not currently work; see
+- **Traffic interception.** Without `spec.tls` every connection, including the
+  password, crosses the network in clear text. See
   [operations.md](operations.md#tls).
 - **Anyone with `update` on `RedisSentinel` objects in a namespace.** They pick
   the image, the resource requests, the `priorityClassName` and the

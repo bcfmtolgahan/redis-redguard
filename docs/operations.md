@@ -214,19 +214,12 @@ on both pod templates, so renewing the certificate rolls the pods — servers lo
 their certificates once, at start-up, and a renewal reaches a running pod no
 other way.
 
-**TLS clusters do not currently reach `Running`.** Two defects block it:
+`caSecretRef` may name the certificate Secret or a separate one; both shapes are
+mounted into a single directory, so the paths in the configuration, the probes
+and the start-up script do not change.
 
-- The Redis start-up script queries Sentinel with a plain `redis-cli` and no TLS
-  flags. With TLS on, Sentinel listens on `tls-port` only and answers the
-  plaintext connection with an I/O error, so the script never resolves the
-  master. It retries for 60 seconds, which is longer than the liveness probe
-  allows, and the pod is killed and restarted before `redis-server` ever runs.
-- A `caSecretRef` naming a Secret other than `certificateSecretRef` mounts
-  `ca.crt` with a `subPath` inside the certificate volume. The container fails to
-  start with `error mounting ... not a directory`.
-
-Until both are fixed, run without TLS and rely on network controls. Do not plan
-a production rollout around `spec.tls`.
+The operator neither issues nor renews certificates. Supply them yourself or
+through cert-manager; a renewal rolls the pods.
 
 ## Backup
 

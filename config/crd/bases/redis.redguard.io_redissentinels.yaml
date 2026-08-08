@@ -1094,19 +1094,36 @@ spec:
                         - type: integer
                         - type: string
                         default: 1Gi
-                        description: Size is the storage size
+                        description: |-
+                          Size is the storage size. Compared as a quantity, so a respelling of the
+                          same amount is not a change.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
+                        x-kubernetes-validations:
+                        - message: 'redisConfig.storage.size is immutable: a StatefulSet
+                            volumeClaimTemplate cannot be resized after creation.
+                            Resize the PersistentVolumeClaims directly, or recreate
+                            the RedisSentinel.'
+                          rule: quantity(string(self)).compareTo(quantity(string(oldSelf)))
+                            == 0
                       storageClassName:
-                        description: StorageClassName is the storage class name
+                        description: |-
+                          StorageClassName is the storage class name. Unset selects the cluster's
+                          default StorageClass. A pointer keeps an explicit "" distinguishable from
+                          unset: a plain string with omitempty drops the key when a Go client
+                          re-serializes the object, which the immutability rules would reject.
                         type: string
+                        x-kubernetes-validations:
+                        - message: 'redisConfig.storage.storageClassName is immutable:
+                            a StatefulSet volumeClaimTemplate cannot be moved to another
+                            storage class after creation. Recreate the RedisSentinel.'
+                          rule: self == oldSelf
                     type: object
                     x-kubernetes-validations:
-                    - message: 'redisConfig.storage is immutable: a StatefulSet volumeClaimTemplate
-                        cannot be resized or moved to another storage class after
-                        creation. Resize the PersistentVolumeClaims directly, or recreate
-                        the RedisSentinel.'
-                      rule: self == oldSelf
+                    - message: 'redisConfig.storage.storageClassName is immutable:
+                        a StatefulSet volumeClaimTemplate cannot be moved to another
+                        storage class after creation. Recreate the RedisSentinel.'
+                      rule: has(self.storageClassName) == has(oldSelf.storageClassName)
                   tolerations:
                     description: Tolerations let the pods schedule onto tainted nodes
                     items:

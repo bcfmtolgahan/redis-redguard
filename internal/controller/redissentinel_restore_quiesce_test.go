@@ -170,6 +170,14 @@ var _ = Describe("RedisSentinel restore quiesce coordination", func() {
 			restore := &redisv1alpha1.RedisRestore{}
 			restore.Name, restore.Namespace = name, "default"
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, restore))).To(Succeed())
+			// A reconciled restore carries the payload-sweep finalizer and no
+			// manager runs its reconciler here, so drive the deletion pass by
+			// hand: a lingering Restoring-phase CR would hold the quiesce for
+			// every later spec of this cluster.
+			_, err := restoreReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: inDefault(name)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, inDefault(name), &redisv1alpha1.RedisRestore{})).NotTo(Succeed(),
+				"restore %s survived its deletion pass", name)
 		}
 		for _, name := range podNames {
 			pod := &corev1.Pod{}

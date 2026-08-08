@@ -141,10 +141,14 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.handleDeletion(ctx, rs)
 	}
 
-	// Add finalizer if not present
+	// Add finalizer if not present. A patch touching only metadata.finalizers,
+	// never a full-object update: a PUT re-serializes the spec, and a stored
+	// quantity respelled canonically (1024Mi as 1Gi) would trip the storage
+	// immutability rules on a CR the user never edited.
 	if !controllerutil.ContainsFinalizer(rs, finalizerName) {
+		patch := client.MergeFrom(rs.DeepCopy())
 		controllerutil.AddFinalizer(rs, finalizerName)
-		if err := r.Update(ctx, rs); err != nil {
+		if err := r.Patch(ctx, rs, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -183,7 +187,7 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	scaleDownDeferred, err := r.reconcileStatefulSets(ctx, rs)
+	scaleDownDeferred, rotationDegraded, err := r.reconcileStatefulSets(ctx, rs)
 	if err != nil {
 		logger.Error(err, "Failed to reconcile StatefulSets")
 		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "StatefulSetReconcileFailed", err.Error())
@@ -191,7 +195,7 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Update status
-	writeReady, err := r.updateStatus(ctx, rs)
+	writeReady, err := r.updateStatus(ctx, rs, rotationDegraded)
 	if err != nil {
 		logger.Error(err, "Failed to update status")
 		return ctrl.Result{}, err
@@ -218,8 +222,12 @@ func (r *RedisSentinelReconciler) handleDeletion(ctx context.Context, rs *redisv
 
 		// Cleanup logic here if needed (e.g., external resources)
 
+		// Same metadata-only patch as the add: a full-object update would
+		// re-serialize the spec and could be rejected by the immutability
+		// rules, leaving the CR stuck in Terminating.
+		patch := client.MergeFrom(rs.DeepCopy())
 		controllerutil.RemoveFinalizer(rs, finalizerName)
-		if err := r.Update(ctx, rs); err != nil {
+		if err := r.Patch(ctx, rs, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -308,16 +316,19 @@ func (r *RedisSentinelReconciler) reconcileServices(ctx context.Context, rs *red
 // reconcileStatefulSets converges both StatefulSets. The bool reports that a
 // Redis scale-down was held back because the master would have been deleted;
 // the caller retries on the fast requeue until the promotion has happened.
-func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
+// rotationDegraded carries a stuck credential push forward as a message rather
+// than an error, so the pass still reaches the status update and the master
+// label; see reconcileAuthCredentials.
+func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (scaleDownDeferred bool, rotationDegraded string, err error) {
 	logger := log.FromContext(ctx)
 
-	authVersion, err := r.reconcileAuthCredentials(ctx, rs)
+	authVersion, rotationDegraded, err := r.reconcileAuthCredentials(ctx, rs)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	tlsVersion, err := r.tlsSecretVersion(ctx, rs)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	// Redis StatefulSet
@@ -325,14 +336,14 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 	stampAuthSecretVersion(redisStatefulSet, authVersion)
 	stampTLSSecretVersion(redisStatefulSet, tlsVersion)
 	if err := controllerutil.SetControllerReference(rs, redisStatefulSet, r.Scheme); err != nil {
-		return false, err
+		return false, "", err
 	}
-	scaleDownDeferred := r.holdScaleDownUntilMasterMoves(ctx, rs, redisStatefulSet)
+	scaleDownDeferred = r.holdScaleDownUntilMasterMoves(ctx, rs, redisStatefulSet)
 	r.warnOnRollout(ctx, rs, redisStatefulSet,
 		"Redis pods restart in descending ordinal order to apply the new configuration; "+
 			"Sentinel promotes a replica when the master restarts")
 	if err := r.createOrUpdate(ctx, redisStatefulSet); err != nil {
-		return false, fmt.Errorf("failed to reconcile Redis StatefulSet: %w", err)
+		return false, "", fmt.Errorf("failed to reconcile Redis StatefulSet: %w", err)
 	}
 	logger.Info("Reconciled Redis StatefulSet", "name", redisStatefulSet.Name)
 
@@ -341,7 +352,7 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 	stampAuthSecretVersion(sentinelStatefulSet, authVersion)
 	stampTLSSecretVersion(sentinelStatefulSet, tlsVersion)
 	if err := controllerutil.SetControllerReference(rs, sentinelStatefulSet, r.Scheme); err != nil {
-		return false, err
+		return false, "", err
 	}
 	r.warnOnSentinelScaleDown(ctx, rs, sentinelStatefulSet)
 	r.warnOnRollout(ctx, rs, sentinelStatefulSet,
@@ -349,11 +360,11 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 			"learned state on the volume is kept, and the monitor parameters are "+
 			"converged to the spec at runtime rather than by this restart")
 	if err := r.createOrUpdate(ctx, sentinelStatefulSet); err != nil {
-		return false, fmt.Errorf("failed to reconcile Sentinel StatefulSet: %w", err)
+		return false, "", fmt.Errorf("failed to reconcile Sentinel StatefulSet: %w", err)
 	}
 	logger.Info("Reconciled Sentinel StatefulSet", "name", sentinelStatefulSet.Name)
 
-	return scaleDownDeferred, nil
+	return scaleDownDeferred, rotationDegraded, nil
 }
 
 func (r *RedisSentinelReconciler) reconcilePodDisruptionBudgets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
@@ -606,39 +617,64 @@ func appliedAuthSecretName(rs *redisv1alpha1.RedisSentinel) string {
 // durable. The password last pushed is kept in an operator-owned Secret,
 // because the user Secret holds only the new value and the operator must still
 // authenticate against nodes that accept the old one.
-func (r *RedisSentinelReconciler) reconcileAuthCredentials(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
+//
+// A failed push degrades the pass instead of failing it: it is reported as the
+// non-empty degraded message and the previously applied stamp is carried
+// forward, so the pods do not roll onto a password their peers never accepted.
+// The push often fails during a partition, which is exactly when the rest of
+// the pass -- the status update and the master role label -- must still run.
+func (r *RedisSentinelReconciler) reconcileAuthCredentials(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (version, degraded string, err error) {
 	auth := rs.Spec.RedisConfig.Auth
 	if auth == nil || auth.SecretName == "" {
-		return "", nil
+		return "", "", nil
 	}
 
 	userSecret := &corev1.Secret{}
 	key := types.NamespacedName{Name: auth.SecretName, Namespace: rs.Namespace}
 	if err := r.Get(ctx, key, userSecret); err != nil {
 		if errors.IsNotFound(err) {
-			return "", nil
+			return "", "", nil
 		}
-		return "", fmt.Errorf("read auth secret %s: %w", auth.SecretName, err)
+		return "", "", fmt.Errorf("read auth secret %s: %w", auth.SecretName, err)
 	}
 	desired := string(userSecret.Data["password"])
 
+	// Rejected before anything is pushed or stamped. Both failure modes are
+	// worse than refusing: an empty value renders the default ACL user nopass
+	// on every node, and a value the config parser cannot carry becomes, once
+	// the rotation narrowed the old password away, the only accepted
+	// credential no pod can boot with. The previously applied stamp is
+	// carried forward so the pods do not roll onto the rejected value.
+	if verr := builder.ValidateAuthPassword(desired); verr != nil {
+		msg := fmt.Sprintf("auth secret %s: %v", auth.SecretName, verr)
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "InvalidAuthPassword", msg)
+		r.setDegraded(ctx, rs, "InvalidAuthPassword", msg)
+		applied := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: appliedAuthSecretName(rs), Namespace: rs.Namespace}, applied); err == nil {
+			return string(applied.Data[appliedVersionKey]), msg, nil
+		}
+		return "", msg, nil
+	}
+
 	applied := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{Name: appliedAuthSecretName(rs), Namespace: rs.Namespace}, applied)
+	err = r.Get(ctx, types.NamespacedName{Name: appliedAuthSecretName(rs), Namespace: rs.Namespace}, applied)
 	if errors.IsNotFound(err) {
 		// First contact: converge the runtime state (idempotent when it
 		// already matches, and it also carries a cluster that predates auth
 		// into requiring it) and record what the cluster accepts from now on.
+		// No stamp has ever been applied, so there is none to carry forward.
 		if pushErr := r.pushCredentials(ctx, rs, desired, ""); pushErr != nil {
+			pushErr = fmt.Errorf("online credential push: %w", pushErr)
 			r.reportRotationFailure(ctx, rs, pushErr)
-			return "", fmt.Errorf("online credential push: %w", pushErr)
+			return "", pushErr.Error(), nil
 		}
 		if err := r.writeAppliedAuth(ctx, rs, desired, userSecret.ResourceVersion); err != nil {
-			return "", err
+			return "", "", err
 		}
-		return userSecret.ResourceVersion, nil
+		return userSecret.ResourceVersion, "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read applied credentials secret: %w", err)
+		return "", "", fmt.Errorf("read applied credentials secret: %w", err)
 	}
 
 	previous := string(applied.Data[appliedPasswordKey])
@@ -648,23 +684,24 @@ func (r *RedisSentinelReconciler) reconcileAuthCredentials(ctx context.Context, 
 		// misreads an unchanged password as a pending rotation.
 		if string(applied.Data[appliedVersionKey]) != userSecret.ResourceVersion {
 			if err := r.writeAppliedAuth(ctx, rs, desired, userSecret.ResourceVersion); err != nil {
-				return "", err
+				return "", "", err
 			}
 		}
-		return userSecret.ResourceVersion, nil
+		return userSecret.ResourceVersion, "", nil
 	}
 
 	if pushErr := r.pushCredentials(ctx, rs, desired, previous); pushErr != nil {
+		pushErr = fmt.Errorf("online credential rotation: %w", pushErr)
 		r.reportRotationFailure(ctx, rs, pushErr)
-		return "", fmt.Errorf("online credential rotation: %w", pushErr)
+		return string(applied.Data[appliedVersionKey]), pushErr.Error(), nil
 	}
 	if err := r.writeAppliedAuth(ctx, rs, desired, userSecret.ResourceVersion); err != nil {
-		return "", err
+		return "", "", err
 	}
 	recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "CredentialsRotated",
 		"Pushed the rotated password to every running Redis node and Sentinel; "+
 			"the pods now restart only to make the change durable")
-	return userSecret.ResourceVersion, nil
+	return userSecret.ResourceVersion, "", nil
 }
 
 // reportRotationFailure surfaces an incomplete push. The cluster still agrees
@@ -986,7 +1023,10 @@ func (r *RedisSentinelReconciler) reconcileNetworkPolicies(ctx context.Context, 
 // label. The returned bool reports whether a running pod currently backs the
 // write Service; false asks the caller for a fast requeue so the label chases
 // an in-flight failover instead of waiting for the periodic pass.
-func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
+// rotationDegraded, when non-empty, is a credential push that could not finish
+// this pass; it keeps the Degraded condition true instead of letting a
+// completed pass clear it while the rotation is still pending.
+func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1alpha1.RedisSentinel, rotationDegraded string) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	// Get Redis StatefulSet
@@ -1104,14 +1144,23 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	}
 	conditions = append(conditions, haCondition)
 
-	// The previous pass may have ended in setDegraded; a completed pass clears it.
-	conditions = append(conditions, metav1.Condition{
+	// The previous pass may have ended in setDegraded; a completed pass clears
+	// it -- unless a credential push is still stuck, which this pass tolerated
+	// but must keep reporting.
+	degradedCondition := metav1.Condition{
 		Type:               "Degraded",
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: rs.Generation,
 		Reason:             "ReconcileSuccess",
 		Message:            "The spec was accepted and applied",
-	})
+	}
+	if rotationDegraded != "" {
+		degradedCondition.Status = metav1.ConditionTrue
+		degradedCondition.Reason = "CredentialRotationFailed"
+		degradedCondition.Message = rotationDegraded
+		rs.Status.Phase = phaseDegraded
+	}
+	conditions = append(conditions, degradedCondition)
 
 	// Available condition
 	availableCondition := metav1.Condition{

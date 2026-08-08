@@ -6,11 +6,37 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// ValidateAuthPassword rejects a password no rendered credential path could
+// carry safely. An empty value makes the init script write the default ACL
+// user as nopass while the CR reads as auth-enabled. Whitespace, double quote,
+// backslash and control bytes are refused rather than escaped because the
+// config files are only one consumer: the probes expand REDIS_PASSWORD
+// unquoted on a shell command line, where quoting in the config cannot help.
+// Everything else is representable, since the init scripts emit the value as
+// a double-quoted redis.conf string.
+func ValidateAuthPassword(password string) error {
+	if password == "" {
+		return fmt.Errorf("password is empty, which would disable authentication for the default user")
+	}
+	for _, r := range password {
+		switch {
+		case r == '"':
+			return fmt.Errorf("password must not contain a double quote")
+		case r == '\\':
+			return fmt.Errorf("password must not contain a backslash")
+		case unicode.IsSpace(r), unicode.IsControl(r):
+			return fmt.Errorf("password must not contain whitespace or control characters")
+		}
+	}
+	return nil
+}
 
 // BuildRedisConfigMap creates a ConfigMap for Redis configuration
 func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
@@ -142,10 +168,21 @@ log "pod ordinal=$POD_ORDINAL ip=$MY_IP master-name=$MASTER_NAME"
 
 cp /etc/redis/redis.conf /data/redis.conf
 
-# The password reaches awk through the environment and is replaced with
-# index/substr rather than gsub, so & and \ in the value stay literal.
+# The password reaches awk through the environment and is emitted as one
+# double-quoted config token, escaped by hand (index/substr, no regex or gsub)
+# so every byte stays literal and the config parser decodes back exactly the
+# secret's value; unquoted, a ' or # in the value kills the server at parse.
 if [ -n "${REDIS_PASSWORD:-}" ]; then
-    awk 'BEGIN { pass = ENVIRON["REDIS_PASSWORD"]; ph = "${REDIS_PASSWORD}" }
+    awk 'BEGIN {
+             raw = ENVIRON["REDIS_PASSWORD"]; ph = "${REDIS_PASSWORD}"
+             pass = "\""
+             for (j = 1; j <= length(raw); j++) {
+                 ch = substr(raw, j, 1)
+                 if (ch == "\\" || ch == "\"") pass = pass "\\"
+                 pass = pass ch
+             }
+             pass = pass "\""
+         }
          {
              out = ""
              rest = $0
@@ -156,6 +193,16 @@ if [ -n "${REDIS_PASSWORD:-}" ]; then
              print out rest
          }' /data/redis.conf > /data/redis.conf.tmp
     mv /data/redis.conf.tmp /data/redis.conf
+fi
+
+# A surviving placeholder means the config demands a password the environment
+# does not carry (or substitution broke). Booting would set the literal
+# placeholder as requirepass and, below, write the default ACL user as nopass:
+# an open cluster that reports auth enabled. Refusing to start is the only
+# safe outcome.
+if grep -qF '${REDIS_PASSWORD}' /data/redis.conf; then
+    log "FATAL: config expects REDIS_PASSWORD but it is empty or was not substituted; refusing to boot unauthenticated"
+    exit 1
 fi
 
 # redis-server aborts at startup when aclfile is missing, and an ACL file that
@@ -181,14 +228,31 @@ chmod 600 "$ACL_FILE"
 # the dump, and AOF is disabled for this boot because redis-server with
 # appendonly yes never loads dump.rdb. The operator re-enables AOF after it
 # verified the restored dataset.
+#
+# The payload is consumed only while the marker staged beside it is current.
+# This branch runs on every boot, so a payload orphaned by a restore that
+# failed or was deleted before its cleanup ran would otherwise roll the
+# dataset back to that backup on any routine restart, weeks later, with no CR
+# left to explain it. A payload whose marker is missing, unparseable or past
+# its deadline is deleted instead, and the boot serves the current dataset.
 if [ -f /data/redguard-restore.rdb ]; then
-    log "restore payload found; loading it instead of the previous dataset"
-    rm -rf /data/appendonlydir.pre-restore
-    if [ -d /data/appendonlydir ]; then
-        mv /data/appendonlydir /data/appendonlydir.pre-restore
+    EXPIRES=$(sed -n 's/^expires=//p' /data/redguard-restore.marker 2>/dev/null | head -1)
+    case "$EXPIRES" in
+        ''|*[!0-9]*) EXPIRES=0 ;;
+    esac
+    if [ "$(date +%%s)" -le "$EXPIRES" ]; then
+        log "restore payload found; loading it instead of the previous dataset"
+        rm -rf /data/appendonlydir.pre-restore
+        if [ -d /data/appendonlydir ]; then
+            mv /data/appendonlydir /data/appendonlydir.pre-restore
+        fi
+        mv /data/redguard-restore.rdb /data/dump.rdb
+        rm -f /data/redguard-restore.marker
+        printf '\nappendonly no\n' >> /data/redis.conf
+    else
+        log "restore payload has no live marker; deleting it instead of loading it"
+        rm -f /data/redguard-restore.rdb /data/redguard-restore.marker
     fi
-    mv /data/redguard-restore.rdb /data/dump.rdb
-    printf '\nappendonly no\n' >> /data/redis.conf
 fi
 
 is_ipv4() {
@@ -343,6 +407,16 @@ SEED=/data/sentinel.conf.seed
 
 umask 077
 
+# The template carries the auth placeholder only when the CR configures a
+# password, and the StatefulSet then always projects REDIS_PASSWORD. An empty
+# value would boot sentinel with port 26379 open, because the credential
+# rebuild below appends nothing; checked on every start, since a restart skips
+# the seed path entirely.
+if grep -qF '${REDIS_PASSWORD}' /etc/sentinel/sentinel.conf && [ -z "${REDIS_PASSWORD:-}" ]; then
+    log "FATAL: sentinel config expects REDIS_PASSWORD but it is empty; refusing to boot unauthenticated"
+    exit 1
+fi
+
 if [ -f "$STATE" ]; then
     log "existing sentinel state found; keeping it"
 else
@@ -350,10 +424,20 @@ else
     cp /etc/sentinel/sentinel.conf "$SEED"
     chmod 600 "$SEED"
 
-    # The password reaches awk through the environment and is replaced with
-    # index/substr rather than gsub, so & and \ in the value stay literal.
+    # The password reaches awk through the environment and is emitted as one
+    # double-quoted config token, escaped by hand (index/substr, no regex or
+    # gsub) so every byte stays literal; see the redis init script.
     if [ -n "${REDIS_PASSWORD:-}" ]; then
-        awk 'BEGIN { pass = ENVIRON["REDIS_PASSWORD"]; ph = "${REDIS_PASSWORD}" }
+        awk 'BEGIN {
+                 raw = ENVIRON["REDIS_PASSWORD"]; ph = "${REDIS_PASSWORD}"
+                 pass = "\""
+                 for (j = 1; j <= length(raw); j++) {
+                     ch = substr(raw, j, 1)
+                     if (ch == "\\" || ch == "\"") pass = pass "\\"
+                     pass = pass ch
+                 }
+                 pass = pass "\""
+             }
              {
                  out = ""
                  rest = $0
@@ -401,14 +485,24 @@ fi
 # a rotated password would never reach sentinel. The default-user ACL line a
 # config rewrite emits is dropped with them because requirepass, appended last,
 # is what defines that account. The password reaches awk through the
-# environment, never through the program text or argv.
-awk -v master="%s" 'BEGIN { pass = ENVIRON["REDIS_PASSWORD"] }
+# environment, never through the program text or argv, and is emitted as one
+# double-quoted config token so every byte survives sentinel's own parser.
+awk -v master="%s" 'BEGIN {
+         raw = ENVIRON["REDIS_PASSWORD"]
+         pass = "\""
+         for (j = 1; j <= length(raw); j++) {
+             ch = substr(raw, j, 1)
+             if (ch == "\\" || ch == "\"") pass = pass "\\"
+             pass = pass ch
+         }
+         pass = pass "\""
+     }
      $1 == "requirepass" { next }
      $1 == "user" && $2 == "default" { next }
      $1 == "sentinel" && ($2 == "auth-pass" || $2 == "sentinel-pass") { next }
      { print }
      END {
-         if (pass != "") {
+         if (raw != "") {
              print "sentinel auth-pass " master " " pass
              print "sentinel sentinel-pass " pass
              print "requirepass " pass

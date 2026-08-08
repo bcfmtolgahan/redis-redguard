@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -52,7 +53,7 @@ var _ = Describe("RedisSentinel storage immutability", func() {
 
 	BeforeEach(func() {
 		rs := newTestSentinel(resourceName, "default")
-		rs.Spec.RedisConfig.Storage.StorageClassName = "fast"
+		rs.Spec.RedisConfig.Storage.StorageClassName = ptr.To("fast")
 		Expect(k8sClient.Create(ctx, rs)).To(Succeed())
 	})
 
@@ -65,15 +66,15 @@ var _ = Describe("RedisSentinel storage immutability", func() {
 			rs.Spec.RedisConfig.Storage.Size = resource.MustParse("2Gi")
 		})
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("storage is immutable"))
+		Expect(err.Error()).To(ContainSubstring("storage.size is immutable"))
 	})
 
 	It("rejects a storageClassName change", func() {
 		err := updateSentinel(ctx, key, func(rs *redisv1alpha1.RedisSentinel) {
-			rs.Spec.RedisConfig.Storage.StorageClassName = "slow"
+			rs.Spec.RedisConfig.Storage.StorageClassName = ptr.To("slow")
 		})
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("storage is immutable"))
+		Expect(err.Error()).To(ContainSubstring("storage.storageClassName is immutable"))
 	})
 
 	It("rejects dropping the storage block", func() {
@@ -113,7 +114,7 @@ var _ = Describe("RedisSentinel StatefulSet updates", func() {
 		planted := newTestSentinel(resourceName, "default")
 		planted.Spec.RedisConfig.Storage = &redisv1alpha1.StorageSpec{
 			Size:             resource.MustParse("8Gi"),
-			StorageClassName: "planted-class",
+			StorageClassName: ptr.To("planted-class"),
 		}
 		for _, sts := range []*appsv1.StatefulSet{
 			builder.BuildRedisStatefulSet(planted),
@@ -288,3 +289,103 @@ func deleteSentinelAndWait(ctx context.Context, key types.NamespacedName) {
 		g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, rs))).To(BeTrue())
 	}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
 }
+
+// The apiserver stores a quantity as the user wrote it, but a Go client
+// re-serializes it canonically: 1024Mi becomes 1Gi, 1.5Gi becomes 1536Mi, and
+// an empty storageClassName loses its key. A whole-struct self == oldSelf rule
+// therefore rejects the operator's own first write to such a CR, which is the
+// finalizer, so the CR never gets a single owned resource. Immutability has to
+// be enforced field-wise and quantities compared as quantities.
+var _ = Describe("RedisSentinel storage canonicalization", func() {
+	const resourceName = "storage-canonical-rs"
+
+	key := types.NamespacedName{Name: resourceName, Namespace: "default"}
+
+	// The CR is created as unstructured JSON: the typed client would canonicalize
+	// size before the apiserver ever sees the spelling under test.
+	BeforeEach(func() {
+		u := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "redis.redguard.io/v1alpha1",
+			"kind":       "RedisSentinel",
+			"metadata":   map[string]interface{}{"name": resourceName, "namespace": "default"},
+			"spec": map[string]interface{}{
+				"redisConfig": map[string]interface{}{
+					"replicas": int64(3),
+					"image":    "redis:7-alpine",
+					"storage": map[string]interface{}{
+						"size":             "1024Mi",
+						"storageClassName": "",
+					},
+				},
+				"sentinelConfig": map[string]interface{}{
+					"replicas":              int64(3),
+					"quorum":                int64(2),
+					"downAfterMilliseconds": int64(5000),
+					"failoverTimeout":       int64(10000),
+					"parallelSyncs":         int64(1),
+				},
+				"serviceType": "ClusterIP",
+			},
+		}}
+		Expect(k8sClient.Create(ctx, u)).To(Succeed())
+	})
+
+	AfterEach(func() {
+		deleteSentinelAndWait(ctx, key)
+	})
+
+	It("reconciles a CR whose stored quantity is not canonical", func() {
+		r := newImmutabilitySpecReconciler()
+
+		By("adding the finalizer without rewriting the spec")
+		Eventually(func(g Gomega) {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			rs := &redisv1alpha1.RedisSentinel{}
+			g.Expect(k8sClient.Get(ctx, key, rs)).To(Succeed())
+			g.Expect(rs.Finalizers).To(ContainElement(finalizerName),
+				"the finalizer write was rejected, so deletion would never be intercepted")
+		}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(redisv1alpha1.GroupVersion.WithKind("RedisSentinel"))
+		Expect(k8sClient.Get(ctx, key, u)).To(Succeed())
+		size, _, err := unstructured.NestedString(u.Object, "spec", "redisConfig", "storage", "size")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(size).To(Equal("1024Mi"),
+			"adding the finalizer rewrote the spec, canonicalizing the user's quantity")
+
+		By("creating the owned resources")
+		for _, name := range []string{resourceName + "-redis", resourceName + "-sentinel"} {
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, inDefault(name), sts)).To(Succeed(),
+				"%s was never created: the CR is wedged before its first resource", name)
+		}
+	})
+
+	It("accepts a semantically equal size respelling but rejects a real change", func() {
+		Expect(updateSentinel(ctx, key, func(rs *redisv1alpha1.RedisSentinel) {
+			rs.Spec.RedisConfig.Storage.Size = resource.MustParse("1Gi")
+		})).To(Succeed(), "1Gi and the stored 1024Mi are the same quantity")
+
+		err := updateSentinel(ctx, key, func(rs *redisv1alpha1.RedisSentinel) {
+			rs.Spec.RedisConfig.Storage.Size = resource.MustParse("2Gi")
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("immutable"))
+	})
+
+	It("distinguishes an empty storageClassName from an unset one", func() {
+		err := updateSentinel(ctx, key, func(rs *redisv1alpha1.RedisSentinel) {
+			rs.Spec.RedisConfig.Storage.StorageClassName = nil
+		})
+		Expect(err).To(HaveOccurred(),
+			"dropping storageClassName: \"\" must be a rejected class change, not an accepted no-op")
+
+		err = updateSentinel(ctx, key, func(rs *redisv1alpha1.RedisSentinel) {
+			rs.Spec.RedisConfig.Storage.StorageClassName = ptr.To("standard")
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("immutable"))
+	})
+})

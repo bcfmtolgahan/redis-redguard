@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 )
@@ -79,7 +80,7 @@ func TestBuildRedisStatefulSet_VolumeClaimTemplate(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.RedisConfig.Storage = &redisv1alpha1.StorageSpec{
 		Size:             resource.MustParse("10Gi"),
-		StorageClassName: "gp3",
+		StorageClassName: ptr.To("gp3"),
 	}
 
 	sts := BuildRedisStatefulSet(rs)
@@ -564,7 +565,7 @@ func TestBuildSentinelStatefulSet_StorageClassFollowsRedis(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.RedisConfig.Storage = &redisv1alpha1.StorageSpec{
 		Size:             resource.MustParse("10Gi"),
-		StorageClassName: "gp3",
+		StorageClassName: ptr.To("gp3"),
 	}
 
 	vct := BuildSentinelStatefulSet(rs).Spec.VolumeClaimTemplates[0]

@@ -253,14 +253,17 @@ func (p *SentinelClientPool) ResetMasterAll(ctx context.Context, masterName stri
 // SENTINEL FAILOVER is deliberately not broadcast: it forces a failover without
 // asking the other sentinels for agreement, so one acceptance is the whole
 // operation and sending it to every member would only start it again on a
-// cluster that is already mid-promotion.
+// cluster that is already mid-promotion. For the same reason an -INPROG refusal
+// is success, not a reason to try the next member: the promotion the caller
+// wants is already running, and a second forced one on another sentinel would
+// race it for the same replicas.
 func (p *SentinelClientPool) FailoverFromPool(ctx context.Context, masterName string) error {
 	errs := make([]error, 0, len(p.addresses))
 	for _, addr := range p.addresses {
 		client := p.newClient(addr)
 		err := client.Failover(ctx, masterName)
 		client.Close()
-		if err == nil {
+		if err == nil || failoverInProgress(err) {
 			return nil
 		}
 		errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
@@ -269,6 +272,12 @@ func (p *SentinelClientPool) FailoverFromPool(ctx context.Context, masterName st
 		return fmt.Errorf("no sentinels available")
 	}
 	return fmt.Errorf("no sentinel accepted the failover: %w", errors.Join(errs...))
+}
+
+// failoverInProgress reports the -INPROG reply to SENTINEL FAILOVER. go-redis
+// surfaces a Redis error reply verbatim minus the leading dash.
+func failoverInProgress(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "INPROG")
 }
 
 // newClient builds a client for one pool member with the pool's credentials.

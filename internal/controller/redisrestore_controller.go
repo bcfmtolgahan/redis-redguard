@@ -43,6 +43,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -67,6 +68,14 @@ import (
 const (
 	// restorePayloadPath is the staging name the init script consumes.
 	restorePayloadPath = "/data/redguard-restore.rdb"
+	// restoreMarkerPath sits beside the payload and carries the restore UID
+	// and a deadline; the init script refuses and deletes a payload whose
+	// marker is missing or expired, so a payload nobody cleaned up cannot
+	// replace the dataset on a routine restart weeks later.
+	restoreMarkerPath = "/data/redguard-restore.marker"
+	// restoreFinalizer holds the CR until the staged payload is swept from
+	// the Redis pods.
+	restoreFinalizer = "redis.redguard.io/redisrestore-finalizer"
 	// preRestoreAOFPath is where the init script parks the previous AOF.
 	preRestoreAOFPath = "/data/appendonlydir.pre-restore"
 	// quiesceDownAfterMilliseconds keeps the sentinels from reading the
@@ -122,6 +131,20 @@ func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		logger.Error(err, "Failed to get RedisRestore")
 		return ctrl.Result{}, err
+	}
+
+	if !redisRestore.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, redisRestore)
+	}
+
+	// The finalizer must be in place before anything can be staged: a deletion
+	// between staging and consumption would otherwise skip the sweep and leave
+	// the payload armed.
+	if !controllerutil.ContainsFinalizer(redisRestore, restoreFinalizer) {
+		controllerutil.AddFinalizer(redisRestore, restoreFinalizer)
+		if err := r.Update(ctx, redisRestore); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Terminal phases are sticky per spec generation: a requeue or operator
@@ -262,7 +285,7 @@ func (r *RedisRestoreReconciler) handleDownloadingPhase(ctx context.Context, res
 		return r.failRestore(ctx, restore, rs, "Downloaded object is not an RDB file")
 	}
 
-	if err := r.stageRestorePayload(ctx, rs, rdbData); err != nil {
+	if err := r.stageRestorePayload(ctx, rs, restore, rdbData); err != nil {
 		logger.Error(err, "Failed to stage restore payload")
 		return ctrl.Result{}, err
 	}
@@ -469,8 +492,34 @@ func (r *RedisRestoreReconciler) validateRestoreDestination(restore *redisv1alph
 // Failed phase is sticky per generation, so the sentinel reconciler resumes
 // converging any quiesce a stopped in-flight run left behind.
 func (r *RedisRestoreReconciler) markDestinationRejected(ctx context.Context, restore *redisv1alpha1.RedisRestore, cause error) (ctrl.Result, error) {
+	// An allowlist tightened mid-flight can stop a run that already staged its
+	// payload; Failed is terminal, so this is the last chance to disarm it.
+	r.sweepStagedPayload(ctx, restore)
+
+	message := cause.Error()
+
+	// The refusal is raised before the cluster is loaded, but a run stopped this
+	// way may already have replaced the dataset, and the restarted master is
+	// still running with AOF off. Nothing else reconverges that at runtime.
+	if restore.Status.DatasetReplaced {
+		rs := &redisv1alpha1.RedisSentinel{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      restore.Spec.RedisClusterRef,
+			Namespace: restore.Namespace,
+		}, rs); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to load the cluster to restore durability")
+			message += "; the master already loaded the restore payload and appendonly could not be re-enabled"
+		} else {
+			message += "; the master already loaded the restore payload, so the previous dataset is replaced"
+			if err := r.reenableAppendonly(ctx, rs); err != nil {
+				log.FromContext(ctx).Error(err, "Failed to re-enable appendonly after the dataset was replaced")
+				message += " and appendonly could not be re-enabled: the restored data has no durability until it is"
+			}
+		}
+	}
+
 	restore.Status.Phase = redisv1alpha1.RestorePhaseFailed
-	restore.Status.Message = cause.Error()
+	restore.Status.Message = message
 	restore.Status.ObservedGeneration = restore.Generation
 	meta.SetStatusCondition(&restore.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
@@ -516,6 +565,11 @@ func (r *RedisRestoreReconciler) reenableAppendonly(ctx context.Context, rs *red
 func (r *RedisRestoreReconciler) failRestore(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel, message string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// A failed run must not leave its payload armed: within the marker window
+	// the next pod restart would still load it. Unconditional because rm -f is
+	// idempotent and a run that staged nothing has nothing to lose.
+	r.sweepStagedPayload(ctx, restore)
+
 	if rs != nil && restore.Status.DatasetReplaced {
 		message += "; the master already loaded the restore payload, so the previous dataset is replaced"
 		if err := r.reenableAppendonly(ctx, rs); err != nil {
@@ -541,6 +595,51 @@ func (r *RedisRestoreReconciler) failRestore(ctx context.Context, restore *redis
 	}
 	recordEvent(r.Recorder, restore, corev1.EventTypeWarning, "RestoreFailed", message)
 	return ctrl.Result{}, nil
+}
+
+// handleDeletion sweeps the staged payload before the CR goes. The finalizer
+// is removed even when the sweep could not reach every pod: blocking deletion
+// on an unreachable pod would wedge the CR, and the marker deadline the init
+// script enforces bounds what a missed sweep can cost.
+func (r *RedisRestoreReconciler) handleDeletion(ctx context.Context, restore *redisv1alpha1.RedisRestore) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(restore, restoreFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	r.sweepStagedPayload(ctx, restore)
+	controllerutil.RemoveFinalizer(restore, restoreFinalizer)
+	if err := r.Update(ctx, restore); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// sweepStagedPayload removes the staged payload and its marker from every
+// running Redis pod of the referenced cluster. Best effort: rm -f is
+// idempotent, a failover can have moved the payload's pod so all of them are
+// swept, and a pod unreachable right now is covered by the marker deadline.
+func (r *RedisRestoreReconciler) sweepStagedPayload(ctx context.Context, restore *redisv1alpha1.RedisRestore) {
+	logger := log.FromContext(ctx)
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(restore.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/component": "redis",
+		"app.kubernetes.io/instance":  restore.Spec.RedisClusterRef,
+	}); err != nil {
+		logger.Error(err, "Cannot list Redis pods to remove the staged restore payload")
+		return
+	}
+
+	cmd := []string{"sh", "-c", "rm -f " + restorePayloadPath + " " + restoreMarkerPath}
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if _, stderr, err := r.execInPod(ctx, pod, cmd, nil); err != nil {
+			logger.V(1).Info("Could not remove the staged restore payload",
+				"pod", pod.Name, "error", err.Error(), "stderr", stderr)
+		}
+	}
 }
 
 // restoreExpired bounds the poll loops of the restart and verify phases.
@@ -762,15 +861,27 @@ func (r *RedisRestoreReconciler) createS3Client(ctx context.Context, restore *re
 
 // stageRestorePayload writes the RDB next to the master's data under the
 // staging name and renames it into place atomically, so the init script only
-// ever sees a complete file.
-func (r *RedisRestoreReconciler) stageRestorePayload(ctx context.Context, rs *redisv1alpha1.RedisSentinel, rdbData []byte) error {
+// ever sees a complete file. The marker lands first, because the payload must
+// never be visible unguarded: a crash right after would strand a payload the
+// init script then refuses instead of one it loads forever.
+//
+// The marker deadline is staging time + restoreTimeout. The payload is
+// normally consumed within seconds -- the shutdown follows in the same phase
+// -- and restoreTimeout already bounds how long this run may keep driving the
+// cluster at all: any boot later than that belongs to a run the controller
+// has declared failed (and tried to sweep) or to a deleted CR, never to a
+// live restore, so the init script must refuse it.
+func (r *RedisRestoreReconciler) stageRestorePayload(ctx context.Context, rs *redisv1alpha1.RedisSentinel, restore *redisv1alpha1.RedisRestore, rdbData []byte) error {
 	masterPod, err := r.getMasterPod(ctx, rs)
 	if err != nil {
 		return err
 	}
 
-	cmd := []string{"sh", "-c",
-		"cat > " + restorePayloadPath + ".tmp && mv " + restorePayloadPath + ".tmp " + restorePayloadPath}
+	// UID and deadline are safe to inline: a UID is hex and dashes, the
+	// deadline digits.
+	cmd := []string{"sh", "-c", fmt.Sprintf(
+		"cat > %[1]s.tmp && printf 'uid=%[3]s\\nexpires=%[4]d\\n' > %[2]s && mv %[1]s.tmp %[1]s",
+		restorePayloadPath, restoreMarkerPath, restore.UID, time.Now().Add(restoreTimeout).Unix())}
 	_, stderr, err := r.execInPod(ctx, masterPod, cmd, bytes.NewReader(rdbData))
 	if err != nil {
 		return fmt.Errorf("stage restore payload on %s: %w (stderr: %s)", masterPod.Name, err, stderr)

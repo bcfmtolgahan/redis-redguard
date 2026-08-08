@@ -1,16 +1,20 @@
 package builder
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // restoreSeedConf carries an explicit appendonly yes so the tests can assert
-// which appendonly directive wins after the script ran.
-const restoreSeedConf = seedRedisConf + "appendonly yes\nsave 900 1\n"
+// which appendonly directive wins after the script ran. It models a no-auth
+// cluster because masterEnv carries no REDIS_PASSWORD; with the auth seed the
+// placeholder guard would abort every run before the restore branch.
+const restoreSeedConf = seedRedisConfNoAuth + "appendonly yes\nsave 900 1\n"
 
 // runRestoreInitScript mirrors runInitScript but lets the caller seed the data
 // dir before the run and returns it for inspection, which the shared helper
@@ -88,6 +92,17 @@ func lastAppendonlyDirective(conf string) string {
 	return last
 }
 
+// seedMarker plants the staging marker the controller writes beside the
+// payload: the restore UID and the unix deadline after which no live restore
+// can own the payload.
+func seedMarker(t *testing.T, dataDir string, expires int64) {
+	t.Helper()
+	body := fmt.Sprintf("uid=8b9e0d1f-test\nexpires=%d\n", expires)
+	if err := os.WriteFile(filepath.Join(dataDir, "redguard-restore.marker"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInitScript_RestorePayload_LoadedAndAOFDisabled(t *testing.T) {
 	payload := []byte("REDIS0011-restore-payload")
 
@@ -95,6 +110,7 @@ func TestInitScript_RestorePayload_LoadedAndAOFDisabled(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dataDir, "redguard-restore.rdb"), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		seedMarker(t, dataDir, time.Now().Add(10*time.Minute).Unix())
 		if err := os.MkdirAll(filepath.Join(dataDir, "appendonlydir"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -116,6 +132,9 @@ func TestInitScript_RestorePayload_LoadedAndAOFDisabled(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(dataDir, "redguard-restore.rdb")); !os.IsNotExist(statErr) {
 		t.Error("staged payload must be consumed; its absence is the controller's restart signal")
 	}
+	if _, statErr := os.Stat(filepath.Join(dataDir, "redguard-restore.marker")); !os.IsNotExist(statErr) {
+		t.Error("consumed payload left its marker behind")
+	}
 	if _, statErr := os.Stat(filepath.Join(dataDir, "appendonlydir")); !os.IsNotExist(statErr) {
 		t.Error("old AOF dir left in place; redis-server would recreate state from it after appendonly is re-enabled")
 	}
@@ -130,11 +149,60 @@ func TestInitScript_RestorePayload_LoadedAndAOFDisabled(t *testing.T) {
 	}
 }
 
+// TestInitScript_RestorePayload_RefusedWithoutLiveMarker: a staged payload
+// nobody cleaned up is a landmine, because this branch runs on every boot. A
+// payload whose marker is missing, unparseable or expired belongs to a
+// restore that failed or was deleted before its cleanup ran; loading it would
+// silently roll the dataset back to that backup on a routine pod restart, so
+// it is deleted and the boot proceeds with the current dataset and AOF on.
+func TestInitScript_RestorePayload_RefusedWithoutLiveMarker(t *testing.T) {
+	cases := map[string]func(dataDir string){
+		"no marker": func(string) {},
+		"expired marker": func(dataDir string) {
+			seedMarker(t, dataDir, time.Now().Add(-time.Minute).Unix())
+		},
+		"garbage marker": func(dataDir string) {
+			if err := os.WriteFile(filepath.Join(dataDir, "redguard-restore.marker"), []byte("expires=soon\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, plant := range cases {
+		t.Run(name, func(t *testing.T) {
+			conf, out, dataDir, err := runRestoreInitScript(t, "test-redis-0", masterEnv(), func(dataDir string) {
+				if err := os.WriteFile(filepath.Join(dataDir, "redguard-restore.rdb"), []byte("REDIS0011"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				plant(dataDir)
+			})
+			if err != nil {
+				t.Fatalf("script failed: %v\noutput:\n%s", err, out)
+			}
+			if _, statErr := os.Stat(filepath.Join(dataDir, "redguard-restore.rdb")); !os.IsNotExist(statErr) {
+				t.Error("stale payload must be deleted, or the next restart loads it")
+			}
+			if _, statErr := os.Stat(filepath.Join(dataDir, "redguard-restore.marker")); !os.IsNotExist(statErr) {
+				t.Error("stale marker must be deleted with its payload")
+			}
+			if _, statErr := os.Stat(filepath.Join(dataDir, "dump.rdb")); !os.IsNotExist(statErr) {
+				t.Error("stale payload was loaded into dump.rdb")
+			}
+			if got := lastAppendonlyDirective(conf); got != "yes" {
+				t.Errorf("effective appendonly directive = %q, want yes: this boot serves the current dataset", got)
+			}
+			if !strings.Contains(out, "WOULD_EXEC redis-server") {
+				t.Errorf("refusing the payload must not stop the boot, output:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestInitScript_RestorePayload_ReplacesStalePreRestoreDir(t *testing.T) {
 	_, out, dataDir, err := runRestoreInitScript(t, "test-redis-0", masterEnv(), func(dataDir string) {
 		if err := os.WriteFile(filepath.Join(dataDir, "redguard-restore.rdb"), []byte("REDIS0011"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		seedMarker(t, dataDir, time.Now().Add(10*time.Minute).Unix())
 		for _, d := range []string{"appendonlydir", "appendonlydir.pre-restore"} {
 			if err := os.MkdirAll(filepath.Join(dataDir, d), 0o755); err != nil {
 				t.Fatal(err)

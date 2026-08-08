@@ -291,8 +291,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.RedisUserReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("redisuser-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisUser")
 		os.Exit(1)

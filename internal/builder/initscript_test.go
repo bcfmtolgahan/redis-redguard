@@ -22,6 +22,33 @@ masterauth ${REDIS_PASSWORD}
 requirepass ${REDIS_PASSWORD}
 `
 
+// seedRedisConfNoAuth mirrors the generated redis.conf when no auth is
+// configured: no placeholder lines, so the substitution guard demands nothing.
+const seedRedisConfNoAuth = `bind 0.0.0.0
+port 6379
+dir /data
+`
+
+// seedConfFor pairs the seed config with the env the way the operator does:
+// the builder emits the auth placeholders only when auth is configured, and
+// the StatefulSet then always projects REDIS_PASSWORD. Tests that break the
+// pairing on purpose call runInitScriptWithConf directly.
+func seedConfFor(env map[string]string) string {
+	if _, ok := env["REDIS_PASSWORD"]; ok {
+		return seedRedisConf
+	}
+	return seedRedisConfNoAuth
+}
+
+// quoteRedisArg renders a value the way the init scripts emit it into a
+// config file: double-quoted with backslash escapes, the form Redis's own
+// config parser decodes back to the original bytes.
+func quoteRedisArg(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
+}
+
 // runInitScript syntax-checks the generated script, rewrites its absolute
 // paths into a temp dir, replaces the final exec and the retry sleep, and runs
 // it under sh with the stub binaries from testdata/bin first on PATH. It
@@ -38,6 +65,14 @@ func runInitScript(t *testing.T, script, hostname string, env map[string]string)
 // inspect files other than redis.conf.
 func runInitScriptInDataDir(t *testing.T, script, hostname string, env map[string]string, seed func(dataDir string)) (dataDir, conf, output string, err error) {
 	t.Helper()
+	return runInitScriptWithConf(t, script, hostname, seedConfFor(env), env, seed)
+}
+
+// runInitScriptWithConf is the harness core: it takes the /etc/redis config
+// explicitly, so a test can model a config that demands a password the env
+// does not carry.
+func runInitScriptWithConf(t *testing.T, script, hostname, seedConf string, env map[string]string, seed func(dataDir string)) (dataDir, conf, output string, err error) {
+	t.Helper()
 
 	dir := t.TempDir()
 	dataDir = filepath.Join(dir, "data")
@@ -47,7 +82,7 @@ func runInitScriptInDataDir(t *testing.T, script, hostname string, env map[strin
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(etcDir, "redis.conf"), []byte(seedRedisConf), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(etcDir, "redis.conf"), []byte(seedConf), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if seed != nil {
@@ -350,8 +385,8 @@ func TestSentinelInitScript_FirstStart_SeedsSubstitutesResolves(t *testing.T) {
 	if strings.Contains(res.conf, sentinelMasterFQDN) {
 		t.Errorf("master hostname left unresolved in state:\n%s", res.conf)
 	}
-	if want := "sentinel auth-pass test-rs-master " + password; !strings.Contains(res.conf, want) {
-		t.Errorf("password not substituted literally, want %q in:\n%s", want, res.conf)
+	if want := "sentinel auth-pass test-rs-master " + quoteRedisArg(password); !strings.Contains(res.conf, want) {
+		t.Errorf("password not substituted as one quoted token, want %q in:\n%s", want, res.conf)
 	}
 	if strings.Contains(res.conf, "${REDIS_PASSWORD}") {
 		t.Errorf("placeholder left behind:\n%s", res.conf)
@@ -440,9 +475,9 @@ func TestSentinelInitScript_Restart_RebuildsCredentials(t *testing.T) {
 	}
 
 	want := []string{
-		"sentinel auth-pass test-rs-master " + password,
-		"sentinel sentinel-pass " + password,
-		"requirepass " + password,
+		"sentinel auth-pass test-rs-master " + quoteRedisArg(password),
+		"sentinel sentinel-pass " + quoteRedisArg(password),
+		"requirepass " + quoteRedisArg(password),
 	}
 	if got := sentinelCredentialLines(res.conf); !slices.Equal(got, want) {
 		t.Errorf("credential lines = %q, want exactly %q (in that order, after the monitor line):\n%s", got, want, res.conf)
@@ -494,9 +529,9 @@ func TestSentinelInitScript_FirstStart_WritesCredentials(t *testing.T) {
 		t.Fatalf("script failed: %v\noutput:\n%s", res.err, res.output)
 	}
 	want := []string{
-		"sentinel auth-pass test-rs-master " + password,
-		"sentinel sentinel-pass " + password,
-		"requirepass " + password,
+		"sentinel auth-pass test-rs-master " + quoteRedisArg(password),
+		"sentinel sentinel-pass " + quoteRedisArg(password),
+		"requirepass " + quoteRedisArg(password),
 	}
 	if got := sentinelCredentialLines(res.conf); !slices.Equal(got, want) {
 		t.Errorf("credential lines = %q, want exactly %q:\n%s", got, want, res.conf)
@@ -506,7 +541,10 @@ func TestSentinelInitScript_FirstStart_WritesCredentials(t *testing.T) {
 func TestSentinelInitScript_UnresolvableMaster_IsFatal(t *testing.T) {
 	script, seedConf := testSentinelInit(t)
 	// No REDGUARD_TEST_RESOLVE_IP: DNS never answers within the retry budget.
-	res := runSentinelInitScript(t, script, seedConf, "", nil)
+	// The password is present so the run reaches the DNS wait at all.
+	res := runSentinelInitScript(t, script, seedConf, "", map[string]string{
+		"REDIS_PASSWORD": "pw",
+	})
 
 	if res.err == nil {
 		t.Fatalf("script must exit non-zero when the master never resolves, output:\n%s", res.output)
@@ -521,9 +559,43 @@ func TestSentinelInitScript_UnresolvableMaster_IsFatal(t *testing.T) {
 	}
 }
 
+// TestSentinelInitScript_AuthTemplateWithoutPassword_Aborts: the template
+// demands a password the env does not carry. The credential rebuild would
+// append nothing, so sentinel would boot with port 26379 open while the CR
+// reads as auth-enabled; refusing to start is the only safe outcome. The
+// restart flavor matters separately, because there the seed path is skipped
+// and only an explicit guard can notice the mismatch.
+func TestSentinelInitScript_AuthTemplateWithoutPassword_Aborts(t *testing.T) {
+	existing := "port 26379\n" +
+		"sentinel monitor test-rs-master 10.9.9.9 6379 2\n" +
+		"sentinel current-epoch 5\n"
+
+	for name, state := range map[string]string{
+		"first start": "",
+		"restart":     existing,
+	} {
+		t.Run(name, func(t *testing.T) {
+			script, seedConf := testSentinelInit(t)
+			res := runSentinelInitScript(t, script, seedConf, state, map[string]string{
+				"REDGUARD_TEST_RESOLVE_IP": "10.244.0.7",
+			})
+			if res.err == nil {
+				t.Fatalf("script must exit non-zero without the configured password, output:\n%s", res.output)
+			}
+			if strings.Contains(res.output, "WOULD_EXEC") {
+				t.Errorf("script must not start sentinel unauthenticated, output:\n%s", res.output)
+			}
+			if state == "" && res.conf != "" {
+				t.Errorf("aborted first start left state behind, which a restart would then keep:\n%s", res.conf)
+			}
+		})
+	}
+}
+
 func TestInitScript_PasswordSubstitution_SpecialCharsStayLiteral(t *testing.T) {
 	// & is special in awk gsub replacements and \ starts escapes in awk -v
-	// assignments; both must survive verbatim.
+	// assignments; both must survive as exactly one config-parser token that
+	// decodes back to the original bytes.
 	const password = `sw&rd\fi&sh\\x`
 
 	conf, out, err := runInitScript(t, testInitScript(), "test-redis-1", map[string]string{
@@ -533,14 +605,63 @@ func TestInitScript_PasswordSubstitution_SpecialCharsStayLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("script failed: %v\noutput:\n%s", err, out)
 	}
-	if !strings.Contains(conf, "requirepass "+password) {
-		t.Errorf("password not substituted literally, got config:\n%s", conf)
+	// Exact escaped form pinned by hand: each backslash doubled, then quoted.
+	if want := `requirepass "sw&rd\\fi&sh\\\\x"`; !strings.Contains(conf, want) {
+		t.Errorf("want %q in config, got:\n%s", want, conf)
 	}
 	if strings.Contains(conf, "${REDIS_PASSWORD}") {
 		t.Errorf("placeholder left behind:\n%s", conf)
 	}
 	if strings.Contains(out, password) {
 		t.Errorf("password printed to stdout/stderr:\n%s", out)
+	}
+}
+
+// TestInitScript_PasswordEmittedQuotedForConfigParser: a bare ' or # inside an
+// unquoted redis.conf token starts a quoted string or reads as a glob; either
+// kills every pod at config parse. The emitted credential is double-quoted so
+// such legal-but-awkward passwords boot instead of being merely refused.
+func TestInitScript_PasswordEmittedQuotedForConfigParser(t *testing.T) {
+	const password = `p@ss'word#1&$`
+
+	conf, out, err := runInitScript(t, testInitScript(), "test-redis-1", map[string]string{
+		"REDGUARD_TEST_MASTER_IP": "10.244.0.5",
+		"REDIS_PASSWORD":          password,
+	})
+	if err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", err, out)
+	}
+	for _, want := range []string{
+		`requirepass "p@ss'word#1&$"`,
+		`masterauth "p@ss'word#1&$"`,
+	} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("want %q in config, got:\n%s", want, conf)
+		}
+	}
+	if strings.Contains(conf, "${REDIS_PASSWORD}") {
+		t.Errorf("placeholder left behind:\n%s", conf)
+	}
+}
+
+// TestInitScript_UnsubstitutedPlaceholderAbortsBoot: the config demands a
+// password the env does not carry, so substitution cannot run. Booting anyway
+// would set the literal placeholder as requirepass and write a nopass default
+// user into the ACL file: an open cluster that reports auth enabled.
+func TestInitScript_UnsubstitutedPlaceholderAbortsBoot(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"unset": nil,
+		"empty": {"REDIS_PASSWORD": ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, out, err := runInitScriptWithConf(t, testInitScript(), "test-redis-0", seedRedisConf, env, nil)
+			if err == nil {
+				t.Fatalf("script must exit non-zero when the placeholder survives, output:\n%s", out)
+			}
+			if strings.Contains(out, "WOULD_EXEC") {
+				t.Errorf("script must not boot redis-server on an unsubstituted config, output:\n%s", out)
+			}
+		})
 	}
 }
 

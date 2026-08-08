@@ -391,8 +391,8 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 	applyPlacement(&sts.Spec.Template.Spec, rs.Spec.RedisConfig.Placement, labels)
 
 	// Add storage class if specified
-	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != "" {
-		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = &rs.Spec.RedisConfig.Storage.StorageClassName
+	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != nil && *rs.Spec.RedisConfig.Storage.StorageClassName != "" {
+		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = rs.Spec.RedisConfig.Storage.StorageClassName
 	}
 
 	return sts
@@ -599,8 +599,8 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 	applyPlacement(&sts.Spec.Template.Spec, rs.Spec.SentinelConfig.Placement, labels)
 
 	// The state is one small file; only the storage class follows Redis.
-	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != "" {
-		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = &rs.Spec.RedisConfig.Storage.StorageClassName
+	if rs.Spec.RedisConfig.Storage != nil && rs.Spec.RedisConfig.Storage.StorageClassName != nil && *rs.Spec.RedisConfig.Storage.StorageClassName != "" {
+		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = rs.Spec.RedisConfig.Storage.StorageClassName
 	}
 
 	return sts

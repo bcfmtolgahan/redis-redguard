@@ -114,7 +114,11 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	testRecorder = record.NewFakeRecorder(100)
+	// Buffered far beyond what any spec records. FakeRecorder.Event blocks on a
+	// full channel, so a spec that reconciles inside an Eventually loop wedges
+	// the reconciler instead of failing, and the suite dies on the go test
+	// deadline with no useful assertion.
+	testRecorder = record.NewFakeRecorder(4096)
 
 	// The managed reconciler gets the Manager's real recorder rather than
 	// testRecorder: FakeRecorder.Event blocks once its buffer is full, which

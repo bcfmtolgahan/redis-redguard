@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	"github.com/redguard/redguard/internal/builder"
 	"github.com/redguard/redguard/internal/redisclient"
 	"github.com/redguard/redguard/internal/tlsutil"
 	custmetrics "github.com/redguard/redguard/pkg/metrics"
@@ -55,6 +57,9 @@ const userRetryInterval = 30 * time.Second
 type RedisUserReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Recorder emits warning events for rejected specs and credentials; nil
+	// drops them.
+	Recorder record.EventRecorder
 	// RedisFactory builds Redis clients; nil means DefaultFactory.
 	RedisFactory redisclient.Factory
 }
@@ -122,6 +127,19 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err != nil {
 		logger.Error(err, "Failed to get password from secret")
 		r.updateStatus(ctx, redisUser, "Error", nil, fmt.Sprintf("Password secret not readable: %v", err))
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
+	}
+
+	// Refused before any SETUSER: an empty value would create an account no
+	// password protects, and the other rejected bytes cannot survive every
+	// credential surface the operator renders. Reported and retried rather
+	// than terminal, because the Secret can be fixed without touching the CR
+	// and nothing watches it.
+	if err := builder.ValidateAuthPassword(password); err != nil {
+		msg := fmt.Sprintf("password secret %s: %v", redisUser.Spec.PasswordSecretRef, err)
+		logger.Error(err, "Rejecting RedisUser password")
+		recordEvent(r.Recorder, redisUser, corev1.EventTypeWarning, "InvalidPassword", msg)
+		r.setDegraded(ctx, redisUser, "InvalidPassword", msg)
 		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
@@ -793,6 +811,9 @@ func (r *RedisUserReconciler) updateStatus(ctx context.Context, redisUser *redis
 func (r *RedisUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RedisFactory == nil {
 		r.RedisFactory = redisclient.DefaultFactory{}
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("redisuser-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisUser{}).

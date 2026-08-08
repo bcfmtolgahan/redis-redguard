@@ -139,16 +139,28 @@ type SentinelConfig struct {
 	CustomConfig map[string]string `json:"customConfig,omitempty"`
 }
 
-// StorageSpec defines persistent storage configuration
-// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="redisConfig.storage is immutable: a StatefulSet volumeClaimTemplate cannot be resized or moved to another storage class after creation. Resize the PersistentVolumeClaims directly, or recreate the RedisSentinel."
+// StorageSpec defines persistent storage configuration.
+//
+// Immutability is enforced field-wise, never as self == oldSelf on the whole
+// struct: the apiserver stores a quantity as the user spelled it, while a Go
+// client re-serializes it canonically (1024Mi becomes 1Gi, 1.5Gi becomes
+// 1536Mi), so whole-struct equality rejects writes that change nothing
+// semantically -- including the operator's own first update to the CR.
+// +kubebuilder:validation:XValidation:rule="has(self.storageClassName) == has(oldSelf.storageClassName)",message="redisConfig.storage.storageClassName is immutable: a StatefulSet volumeClaimTemplate cannot be moved to another storage class after creation. Recreate the RedisSentinel."
 type StorageSpec struct {
-	// Size is the storage size
+	// Size is the storage size. Compared as a quantity, so a respelling of the
+	// same amount is not a change.
 	// +kubebuilder:default="1Gi"
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).compareTo(quantity(string(oldSelf))) == 0",message="redisConfig.storage.size is immutable: a StatefulSet volumeClaimTemplate cannot be resized after creation. Resize the PersistentVolumeClaims directly, or recreate the RedisSentinel."
 	Size resource.Quantity `json:"size,omitempty"`
 
-	// StorageClassName is the storage class name
+	// StorageClassName is the storage class name. Unset selects the cluster's
+	// default StorageClass. A pointer keeps an explicit "" distinguishable from
+	// unset: a plain string with omitempty drops the key when a Go client
+	// re-serializes the object, which the immutability rules would reject.
 	// +optional
-	StorageClassName string `json:"storageClassName,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="redisConfig.storage.storageClassName is immutable: a StatefulSet volumeClaimTemplate cannot be moved to another storage class after creation. Recreate the RedisSentinel."
+	StorageClassName *string `json:"storageClassName,omitempty"`
 }
 
 // AuthConfig defines authentication configuration
