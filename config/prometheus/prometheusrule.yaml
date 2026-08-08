@@ -167,20 +167,22 @@ spec:
             runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redishighchangessincelastsave"
 
     # Performance alerts
+    #
+    # There is no "no commands processed" alert: the operator itself issues
+    # INFO against every node on each pass, so the command rate of a reachable
+    # node is never zero and such an alert could not fire.
     - name: redis-performance
       rules:
-        - alert: RedisSlowCommands
-          expr: rate(redis_total_commands_processed[5m]) == 0 and redis_connected_clients > 0
-          for: 5m
-          labels:
-            severity: warning
-          annotations:
-            summary: "No commands processed on {{ $labels.pod }}"
-            description: "Redis {{ $labels.pod }} has connected clients but no commands are being processed."
-            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisslowcommands"
-
+        # Rates, not the raw counters: their ratio is the hit rate over the
+        # whole lifetime of the series, which a bad hour can never move. The
+        # second term keeps a nearly idle instance from alerting on a handful
+        # of lookups.
         - alert: RedisLowHitRatio
-          expr: redis_keyspace_hits_total / (redis_keyspace_hits_total + redis_keyspace_misses_total) < 0.5
+          expr: |
+            rate(redis_keyspace_hits_total[30m])
+              / (rate(redis_keyspace_hits_total[30m]) + rate(redis_keyspace_misses_total[30m])) < 0.5
+            and
+            (rate(redis_keyspace_hits_total[30m]) + rate(redis_keyspace_misses_total[30m])) > 1
           for: 30m
           labels:
             severity: warning
@@ -225,8 +227,10 @@ spec:
     # Operator alerts
     - name: redis-operator
       rules:
+        # controller-runtime counts these for every controller the Manager
+        # runs; the operator does not duplicate them.
         - alert: RedisOperatorReconciliationErrors
-          expr: increase(redis_controller_reconciliation_errors_total[5m]) > 5
+          expr: increase(controller_runtime_reconcile_errors_total{controller=~"redissentinel|redisbackup|redisrestore|redisuser"}[5m]) > 5
           for: 5m
           labels:
             severity: warning

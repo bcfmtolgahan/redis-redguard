@@ -208,6 +208,10 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 func (r *RedisSentinelReconciler) handleDeletion(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Nothing rewrites these once the CR is gone, so a cluster that is being
+	// deleted would otherwise keep reporting its last state forever.
+	custmetrics.DeleteClusterSeries(rs.Namespace, rs.Name)
+
 	if controllerutil.ContainsFinalizer(rs, finalizerName) {
 		logger.Info("Performing cleanup before deletion")
 
@@ -233,10 +237,11 @@ func (r *RedisSentinelReconciler) validateSpec(rs *redisv1alpha1.RedisSentinel) 
 	return nil
 }
 
-// setDegraded reports a terminal, spec-caused failure. The next successful
-// reconcile rebuilds the condition set and clears it.
+// setDegraded reports a terminal, spec-caused failure. The next pass that
+// reaches updateStatus flips the condition back to False.
 func (r *RedisSentinelReconciler) setDegraded(ctx context.Context, rs *redisv1alpha1.RedisSentinel, reason, message string) {
 	rs.Status.Phase = "Degraded"
+	rs.Status.ObservedGeneration = rs.Generation
 	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 		Type:               "Degraded",
 		Status:             metav1.ConditionTrue,
@@ -1077,15 +1082,40 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 		}
 	}
 
-	// Build detailed conditions
-	now := metav1.Now()
+	// Conditions are merged, never rebuilt: meta.SetStatusCondition keeps
+	// LastTransitionTime when the state is unchanged, so an unchanged pass writes
+	// nothing and the status watch does not schedule the next pass.
 	conditions := []metav1.Condition{}
+
+	// A promotion needs a second instance to promote. One is a legal spec, so
+	// this is reported rather than refused.
+	haCondition := metav1.Condition{
+		Type:               "HighlyAvailable",
+		ObservedGeneration: rs.Generation,
+		Status:             metav1.ConditionTrue,
+		Reason:             "FailoverTargetAvailable",
+		Message:            fmt.Sprintf("%d Redis instances, so Sentinel has a replica to promote", rs.Spec.RedisConfig.Replicas),
+	}
+	if rs.Spec.RedisConfig.Replicas < 2 {
+		haCondition.Status = metav1.ConditionFalse
+		haCondition.Reason = "NoFailoverTarget"
+		haCondition.Message = "redisConfig.replicas is 1: there is no replica to promote, so losing the master loses the cluster until it comes back"
+	}
+	conditions = append(conditions, haCondition)
+
+	// The previous pass may have ended in setDegraded; a completed pass clears it.
+	conditions = append(conditions, metav1.Condition{
+		Type:               "Degraded",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: rs.Generation,
+		Reason:             "ReconcileSuccess",
+		Message:            "The spec was accepted and applied",
+	})
 
 	// Available condition
 	availableCondition := metav1.Condition{
 		Type:               "Available",
 		ObservedGeneration: rs.Generation,
-		LastTransitionTime: now,
 	}
 	if rs.Status.Phase == "Running" {
 		availableCondition.Status = metav1.ConditionTrue
@@ -1102,7 +1132,6 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	replicationCondition := metav1.Condition{
 		Type:               "ReplicationHealthy",
 		ObservedGeneration: rs.Generation,
-		LastTransitionTime: now,
 	}
 	if redisStatefulSet.Status.ReadyReplicas >= rs.Spec.RedisConfig.Replicas {
 		replicationCondition.Status = metav1.ConditionTrue
@@ -1119,7 +1148,6 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 	sentinelCondition := metav1.Condition{
 		Type:               "SentinelHealthy",
 		ObservedGeneration: rs.Generation,
-		LastTransitionTime: now,
 	}
 
 	minQuorum := rs.Spec.SentinelConfig.Replicas/2 + 1
@@ -1155,7 +1183,10 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 		conditions = append(conditions, r.syncSentinelMonitorConfig(ctx, rs, adminPassword, tlsCfg))
 	}
 
-	rs.Status.Conditions = conditions
+	for _, cond := range conditions {
+		meta.SetStatusCondition(&rs.Status.Conditions, cond)
+	}
+	rs.Status.ObservedGeneration = rs.Generation
 
 	if err := r.Status().Update(ctx, rs); err != nil {
 		return false, err
@@ -1241,7 +1272,6 @@ func (r *RedisSentinelReconciler) syncSentinelMonitorConfig(ctx context.Context,
 		Type:               "SentinelConfigInSync",
 		Status:             metav1.ConditionTrue,
 		ObservedGeneration: rs.Generation,
-		LastTransitionTime: metav1.Now(),
 		Reason:             "InSync",
 		Message:            "Every running sentinel applies the monitor parameters in the spec",
 	}
@@ -1622,10 +1652,11 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 	if rs.Status.Phase == "Running" {
 		clusterUp = 1.0
 	}
-	custmetrics.RedisClusterInfo.WithLabelValues(namespace, name, rs.Status.MasterNode).Set(clusterUp)
+	custmetrics.RedisClusterInfo.WithLabelValues(namespace, name).Set(clusterUp)
 
-	// Update connected replicas
-	custmetrics.RedisConnectedReplicas.WithLabelValues(namespace, name).Set(float64(rs.Status.ReadyReplicas))
+	// Instantiated here so alerts on increase() have a series to evaluate
+	// before this cluster has ever failed over.
+	custmetrics.RedisFailoverTotal.WithLabelValues(namespace, name).Add(0)
 
 	// Resolved once for every connection this collection pass makes. Metrics
 	// are best-effort, so a TLS resolution failure skips collection instead of
@@ -1645,15 +1676,9 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 	}
 	custmetrics.SentinelStatus.WithLabelValues(namespace, name).Set(sentinelHealthy)
 	custmetrics.SentinelQuorumHealth.WithLabelValues(namespace, name).Set(sentinelHealthy)
-	custmetrics.SentinelMonitoredMasters.WithLabelValues(namespace, name).Set(1.0)
 
 	// Get sentinel master info for additional metrics
 	r.updateSentinelMetrics(ctx, rs, adminPassword, tlsCfg)
-
-	// Track failovers (initialized to 0)
-	if rs.Status.LastFailoverTime != nil {
-		custmetrics.RedisFailoverTotal.WithLabelValues(namespace, name).Add(0)
-	}
 
 	// List Redis pods with correct labels
 	podList := &corev1.PodList{}
@@ -1666,13 +1691,19 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 	}
 
 	// Collect metrics from each Redis pod
+	collected := make([]string, 0, len(podList.Items))
 	for _, pod := range podList.Items {
 		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 			continue
 		}
 
 		r.collectPodMetrics(ctx, rs, &pod, adminPassword, tlsCfg)
+		collected = append(collected, pod.Name)
 	}
+
+	// A scaled-down or deleted pod would otherwise keep exporting the last
+	// sample taken from it for as long as the operator runs.
+	custmetrics.SyncClusterPods(namespace, name, collected)
 
 	logger.V(1).Info("Metrics updated", "quorumHealthy", quorumOK, "quorumMessage", message)
 }
@@ -1686,8 +1717,12 @@ func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs 
 	masterInfo, err := pool.GetMasterFromPool(ctx, masterName)
 	if err != nil {
 		logger.V(1).Info("Failed to get master info from sentinel", "error", err)
+		// The operator monitors exactly one master per cluster, so this is a
+		// 0/1 answer to "does Sentinel still know it".
+		custmetrics.SentinelMonitoredMasters.WithLabelValues(rs.Namespace, rs.Name).Set(0)
 		return
 	}
+	custmetrics.SentinelMonitoredMasters.WithLabelValues(rs.Namespace, rs.Name).Set(1)
 
 	// Parse sentinel counts
 	if masterInfo.NumOtherSentinels != "" {
@@ -1788,6 +1823,13 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 				fmt.Sscanf(offset, "%f", &val)
 				custmetrics.RedisReplicationOffset.WithLabelValues(namespace, name, podName, "master").Set(val)
 			}
+			// Read off the master rather than derived from ready pod count:
+			// a pod can be ready and still not be replicating.
+			if replicas, ok := replInfo["connected_slaves"]; ok {
+				var val float64
+				fmt.Sscanf(replicas, "%f", &val)
+				custmetrics.RedisConnectedReplicas.WithLabelValues(namespace, name).Set(val)
+			}
 		} else {
 			// Slave/replica
 			if offset, ok := replInfo["slave_repl_offset"]; ok {
@@ -1819,29 +1861,29 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 	}
 
 	// --- Stats Metrics ---
+	// INFO reports these as absolute values that restart at zero with the
+	// node, so each one is advanced by its increase since the last pass.
 	statsInfo, err := redisClient.GetStatsInfo(ctx)
 	if err == nil {
 		if totalCmds, ok := statsInfo["total_commands_processed"]; ok {
 			var val float64
 			fmt.Sscanf(totalCmds, "%f", &val)
-			// Note: For counters, we should track the value and compute the delta
-			// For now, we set the absolute value (Prometheus will compute rate)
-			custmetrics.RedisTotalCommandsProcessed.WithLabelValues(namespace, name, podName).Add(0)
+			custmetrics.AddCounterDelta(custmetrics.RedisTotalCommandsProcessed, val, namespace, name, podName)
 		}
 		if hits, ok := statsInfo["keyspace_hits"]; ok {
 			var val float64
 			fmt.Sscanf(hits, "%f", &val)
-			custmetrics.RedisKeyspaceHits.WithLabelValues(namespace, name, podName).Add(0)
+			custmetrics.AddCounterDelta(custmetrics.RedisKeyspaceHits, val, namespace, name, podName)
 		}
 		if misses, ok := statsInfo["keyspace_misses"]; ok {
 			var val float64
 			fmt.Sscanf(misses, "%f", &val)
-			custmetrics.RedisKeyspaceMisses.WithLabelValues(namespace, name, podName).Add(0)
+			custmetrics.AddCounterDelta(custmetrics.RedisKeyspaceMisses, val, namespace, name, podName)
 		}
 		if rejectedConns, ok := statsInfo["rejected_connections"]; ok {
 			var val float64
 			fmt.Sscanf(rejectedConns, "%f", &val)
-			custmetrics.RedisRejectedConnections.WithLabelValues(namespace, name, podName).Add(0)
+			custmetrics.AddCounterDelta(custmetrics.RedisRejectedConnections, val, namespace, name, podName)
 		}
 	}
 

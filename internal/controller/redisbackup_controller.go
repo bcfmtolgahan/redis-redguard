@@ -31,6 +31,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -59,6 +60,11 @@ import (
 )
 
 const redisBackupFinalizer = "redis.redguard.io/redisbackup-finalizer"
+
+// backupRetryInterval paces a retry after a failed run. A backup forks the
+// Redis process, so the interval has to stay far away from the rate limiter's
+// millisecond backoff even when the cause is permanent.
+const backupRetryInterval = 30 * time.Minute
 
 // RedisBackupReconciler reconciles a RedisBackup object
 type RedisBackupReconciler struct {
@@ -132,6 +138,15 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
+	// A schedule the parser cannot read fires no backup ever. Without this gate
+	// the CR sits in Pending forever while status advertises a next run.
+	if _, err := parseSchedule(redisBackup.Spec.Schedule); err != nil {
+		logger.Error(err, "Rejecting an unparsable backup schedule")
+		recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "InvalidSchedule", err.Error())
+		r.setDegraded(ctx, redisBackup, "InvalidSchedule", err.Error())
+		return ctrl.Result{}, nil
+	}
+
 	// Check if suspended
 	if redisBackup.Spec.Suspend {
 		logger.Info("Backup is suspended")
@@ -165,9 +180,15 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	duration := time.Since(startTime)
 
 	if err != nil {
+		// The error stays on the CR instead of being returned: controller-runtime
+		// handles a non-nil error first and requeues through the rate limiter,
+		// discarding RequeueAfter. A backup that fails on, say, rejected S3
+		// credentials would then retry every few milliseconds, forking the Redis
+		// process with BGSAVE each time.
 		logger.Error(err, "Backup failed")
 		r.updateStatus(ctx, redisBackup, "Failed", "", 0, "", err)
-		return ctrl.Result{RequeueAfter: 30 * time.Minute}, err
+		recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "BackupFailed", err.Error())
+		return ctrl.Result{RequeueAfter: backupRetryInterval}, nil
 	}
 
 	// The backup itself succeeded; a retention failure deletes nothing and is
@@ -181,7 +202,6 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	r.updateStatus(ctx, redisBackup, "Completed", backupLocation, backupSize, duration.String(), nil)
 
 	// Update metrics
-	custmetrics.RedisBackupStatus.WithLabelValues(redisBackup.Namespace, redisBackup.Name, redisBackup.Spec.RedisClusterRef).Set(1)
 	custmetrics.RedisBackupDuration.WithLabelValues(redisBackup.Namespace, redisBackup.Name).Observe(duration.Seconds())
 	custmetrics.RedisBackupSize.WithLabelValues(redisBackup.Namespace, redisBackup.Name).Set(float64(backupSize))
 
@@ -223,22 +243,63 @@ func (r *RedisBackupReconciler) validateBackupDestination(redisBackup *redisv1al
 // events under its own reason, distinguishable from a run that failed.
 func (r *RedisBackupReconciler) markDestinationRejected(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, cause error) {
 	redisBackup.Status.Phase = "Failed"
-	redisBackup.Status.Conditions = []metav1.Condition{
-		{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "DestinationNotAllowed",
-			Message:            cause.Error(),
-		},
-	}
+	redisBackup.Status.ObservedGeneration = redisBackup.Generation
+	r.reportBackupStatus(redisBackup, "Failed")
+	meta.SetStatusCondition(&redisBackup.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: redisBackup.Generation,
+		Reason:             "DestinationNotAllowed",
+		Message:            cause.Error(),
+	})
 	recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "DestinationNotAllowed", cause.Error())
 	if err := r.Status().Update(ctx, redisBackup); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to update RedisBackup status")
 	}
 }
 
+// setDegraded reports a terminal, spec-caused failure: only a spec edit can
+// clear it, and that edit triggers its own reconcile.
+func (r *RedisBackupReconciler) setDegraded(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, reason, message string) {
+	redisBackup.Status.Phase = "Degraded"
+	redisBackup.Status.ObservedGeneration = redisBackup.Generation
+	redisBackup.Status.NextBackupTime = nil
+	r.reportBackupStatus(redisBackup, "Degraded")
+	for _, cond := range []metav1.Condition{
+		{Type: "Ready", Status: metav1.ConditionFalse},
+		{Type: "Degraded", Status: metav1.ConditionTrue},
+	} {
+		cond.ObservedGeneration = redisBackup.Generation
+		cond.Reason = reason
+		cond.Message = message
+		meta.SetStatusCondition(&redisBackup.Status.Conditions, cond)
+	}
+	if err := r.Status().Update(ctx, redisBackup); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update RedisBackup status")
+	}
+}
+
+// parseSchedule reads the spec's cron expression. An empty schedule is a
+// one-time backup and yields no schedule. The parser is deliberately built
+// without cron.Descriptor: @daily and friends are not part of the documented
+// field, and accepting them here would make the CRD pattern a lie.
+func parseSchedule(schedule string) (cron.Schedule, error) {
+	if schedule == "" {
+		return nil, nil
+	}
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	parsed, err := parser.Parse(schedule)
+	if err != nil {
+		return nil, fmt.Errorf("spec.schedule %q is not a valid cron expression: %w", schedule, err)
+	}
+	return parsed, nil
+}
+
 func (r *RedisBackupReconciler) handleDeletion(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (ctrl.Result, error) {
+	// Nothing updates these once the CR is gone; a deleted backup that failed
+	// its last run would keep alerting forever.
+	custmetrics.DeleteBackupSeries(redisBackup.Namespace, redisBackup.Name)
+
 	if controllerutil.ContainsFinalizer(redisBackup, redisBackupFinalizer) {
 		// Optionally delete S3 backups here
 		controllerutil.RemoveFinalizer(redisBackup, redisBackupFinalizer)
@@ -259,10 +320,10 @@ func (r *RedisBackupReconciler) shouldBackup(redisBackup *redisv1alpha1.RedisBac
 		return false, time.Time{}
 	}
 
-	// Parse cron schedule
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	schedule, err := parser.Parse(redisBackup.Spec.Schedule)
-	if err != nil {
+	// Reconcile refuses an unparsable schedule before reaching this point; the
+	// guard stays so a future caller cannot turn a parse error into a backup.
+	schedule, err := parseSchedule(redisBackup.Spec.Schedule)
+	if err != nil || schedule == nil {
 		return false, time.Now().Add(1 * time.Hour)
 	}
 
@@ -872,8 +933,33 @@ func (r *RedisBackupReconciler) cleanupOldBackups(ctx context.Context, redisBack
 	return errors.Join(deleteErrs...)
 }
 
+// reportBackupStatus mirrors the reported phase onto redis_backup_status, so
+// that a failed run is distinguishable from a healthy one. Driven from the
+// phase rather than written at each call site: a failure path that forgot the
+// gauge would leave the last success standing.
+func (r *RedisBackupReconciler) reportBackupStatus(redisBackup *redisv1alpha1.RedisBackup, phase string) {
+	var value float64
+	switch phase {
+	case "Completed":
+		value = 1
+	case "Failed":
+		value = 0
+	case "Running":
+		value = -1
+	default:
+		// Suspended and any future phase say nothing about the last run, so
+		// the gauge keeps reporting it.
+		return
+	}
+	custmetrics.RedisBackupStatus.
+		WithLabelValues(redisBackup.Namespace, redisBackup.Name, redisBackup.Spec.RedisClusterRef).
+		Set(value)
+}
+
 func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, phase, location string, size int64, duration string, err error) {
 	redisBackup.Status.Phase = phase
+	redisBackup.Status.ObservedGeneration = redisBackup.Generation
+	r.reportBackupStatus(redisBackup, phase)
 
 	now := metav1.Now()
 	if phase == "Completed" {
@@ -890,29 +976,32 @@ func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *r
 			redisBackup.Status.NextBackupTime = &nextTimeMeta
 		}
 
-		redisBackup.Status.Conditions = []metav1.Condition{
-			{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				LastTransitionTime: now,
-				Reason:             "BackupCompleted",
-				Message:            fmt.Sprintf("Backup completed successfully at %s", location),
-			},
-		}
+		meta.SetStatusCondition(&redisBackup.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: redisBackup.Generation,
+			Reason:             "BackupCompleted",
+			Message:            fmt.Sprintf("Backup completed successfully at %s", location),
+		})
+		meta.SetStatusCondition(&redisBackup.Status.Conditions, metav1.Condition{
+			Type:               "Degraded",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: redisBackup.Generation,
+			Reason:             "BackupCompleted",
+			Message:            "The schedule was accepted and the last run succeeded",
+		})
 	} else if phase == "Failed" {
 		errMsg := ""
 		if err != nil {
 			errMsg = err.Error()
 		}
-		redisBackup.Status.Conditions = []metav1.Condition{
-			{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				LastTransitionTime: now,
-				Reason:             "BackupFailed",
-				Message:            errMsg,
-			},
-		}
+		meta.SetStatusCondition(&redisBackup.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: redisBackup.Generation,
+			Reason:             "BackupFailed",
+			Message:            errMsg,
+		})
 	}
 
 	if err := r.Status().Update(ctx, redisBackup); err != nil {

@@ -27,6 +27,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,6 +45,11 @@ import (
 )
 
 const redisUserFinalizer = "redis.redguard.io/redisuser-finalizer"
+
+// userRetryInterval paces a retry after a failure that is recorded on the CR
+// rather than returned, so that controller-runtime keeps the delay instead of
+// replacing it with rate-limited backoff.
+const userRetryInterval = 30 * time.Second
 
 // RedisUserReconciler reconciles a RedisUser object
 type RedisUserReconciler struct {
@@ -94,6 +100,11 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
+	// Every failure below is reported on the CR and retried after
+	// userRetryInterval. Returning the error instead would make
+	// controller-runtime discard the interval and retry through the rate
+	// limiter, which starts at 5ms.
+
 	// Get the RedisSentinel cluster
 	redisSentinel := &redisv1alpha1.RedisSentinel{}
 	if err := r.Get(ctx, types.NamespacedName{
@@ -101,30 +112,31 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		Namespace: redisUser.Namespace,
 	}, redisSentinel); err != nil {
 		logger.Error(err, "Failed to get RedisSentinel cluster")
-		r.updateStatus(ctx, redisUser, "Error", nil, "RedisSentinel cluster not found")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		r.updateStatus(ctx, redisUser, "Error", nil,
+			fmt.Sprintf("RedisSentinel %q not readable: %v", redisUser.Spec.RedisClusterRef, err))
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
 	// Get password from secret
 	password, err := r.getPasswordFromSecret(ctx, redisUser)
 	if err != nil {
 		logger.Error(err, "Failed to get password from secret")
-		r.updateStatus(ctx, redisUser, "Error", nil, "Password secret not found")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		r.updateStatus(ctx, redisUser, "Error", nil, fmt.Sprintf("Password secret not readable: %v", err))
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
 	// Get all Redis pod addresses (ACL must be applied to all nodes, not just master)
 	allAddresses, err := r.getAllRedisPodAddresses(ctx, redisSentinel)
 	if err != nil {
 		logger.Error(err, "Failed to get Redis pod addresses")
-		r.updateStatus(ctx, redisUser, "Error", nil, "Redis pods not found")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		r.updateStatus(ctx, redisUser, "Error", nil, fmt.Sprintf("Redis pods not listable: %v", err))
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
 	if len(allAddresses) == 0 {
-		logger.Error(nil, "No running Redis pods found")
+		logger.Info("No running Redis pods found, will retry")
 		r.updateStatus(ctx, redisUser, "Error", nil, "No running Redis pods")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, fmt.Errorf("no running Redis pods")
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
 	// Get Redis admin password for connection
@@ -144,7 +156,7 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err != nil {
 		logger.Error(err, "Failed to resolve client TLS config")
 		r.updateStatus(ctx, redisUser, "Error", nil, err.Error())
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
 	// ACL commands are not replicated, so every node needs its own copy for the
@@ -171,15 +183,11 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		logger.Info("ACL application incomplete, will retry", "applied", len(appliedTo), "total", len(allAddresses))
 		redisUser.Status.AppliedTo = appliedTo
 		r.setDegraded(ctx, redisUser, "ACLPartiallyApplied", message)
-		custmetrics.RedisUserACLStatus.WithLabelValues(redisUser.Namespace, redisUser.Name, redisUser.Spec.Username).Set(0)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
 	// Update status
 	r.updateStatus(ctx, redisUser, "Ready", appliedTo, "")
-
-	// Update metrics
-	custmetrics.RedisUserACLStatus.WithLabelValues(redisUser.Namespace, redisUser.Name, redisUser.Spec.Username).Set(1)
 
 	logger.Info("Successfully reconciled RedisUser", "username", redisUser.Spec.Username)
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
@@ -191,6 +199,10 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 // every node that was unreachable at that moment.
 func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *redisv1alpha1.RedisUser) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// The CR is doomed from here, so its series go now rather than lingering
+	// as a permanent ACL alert for an object that no longer exists.
+	custmetrics.DeleteUserSeries(redisUser.Namespace, redisUser.Name)
 
 	if !controllerutil.ContainsFinalizer(redisUser, redisUserFinalizer) {
 		return ctrl.Result{}, nil
@@ -605,24 +617,33 @@ func (r *RedisUserReconciler) redisUsersForPod(ctx context.Context, obj client.O
 
 // setDegraded reports a terminal, spec-caused failure: only a spec edit can
 // clear it, and that edit triggers its own reconcile.
+// reportACLStatus publishes whether the user is applied on every node. The
+// CR's existing series are dropped first so a renamed spec.username leaves no
+// stale series claiming the old account is still applied.
+func (r *RedisUserReconciler) reportACLStatus(redisUser *redisv1alpha1.RedisUser, applied bool) {
+	custmetrics.DeleteUserSeries(redisUser.Namespace, redisUser.Name)
+
+	value := 0.0
+	if applied {
+		value = 1.0
+	}
+	custmetrics.RedisUserACLStatus.
+		WithLabelValues(redisUser.Namespace, redisUser.Name, redisUser.Spec.Username).
+		Set(value)
+}
+
 func (r *RedisUserReconciler) setDegraded(ctx context.Context, redisUser *redisv1alpha1.RedisUser, reason, message string) {
 	redisUser.Status.Phase = "Degraded"
-	now := metav1.Now()
-	redisUser.Status.Conditions = []metav1.Condition{
-		{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			LastTransitionTime: now,
-			Reason:             reason,
-			Message:            message,
-		},
-		{
-			Type:               "Degraded",
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: now,
-			Reason:             reason,
-			Message:            message,
-		},
+	redisUser.Status.ObservedGeneration = redisUser.Generation
+	r.reportACLStatus(redisUser, false)
+	for _, cond := range []metav1.Condition{
+		{Type: "Ready", Status: metav1.ConditionFalse},
+		{Type: "Degraded", Status: metav1.ConditionTrue},
+	} {
+		cond.ObservedGeneration = redisUser.Generation
+		cond.Reason = reason
+		cond.Message = message
+		meta.SetStatusCondition(&redisUser.Status.Conditions, cond)
 	}
 	if err := r.Status().Update(ctx, redisUser); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to update RedisUser status")
@@ -631,32 +652,46 @@ func (r *RedisUserReconciler) setDegraded(ctx context.Context, redisUser *redisv
 
 func (r *RedisUserReconciler) updateStatus(ctx context.Context, redisUser *redisv1alpha1.RedisUser, phase string, appliedTo []string, errorMsg string) {
 	redisUser.Status.Phase = phase
+	redisUser.Status.ObservedGeneration = redisUser.Generation
 	if appliedTo != nil {
 		redisUser.Status.AppliedTo = appliedTo
 	}
+	// Written here rather than at each call site so no failure path can leave
+	// the gauge at 1 and make a broken user look applied.
+	r.reportACLStatus(redisUser, phase == "Ready")
 
-	now := metav1.Now()
+	ready := metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: redisUser.Generation,
+		Reason:             "Error",
+		Message:            errorMsg,
+	}
 	if phase == "Ready" {
+		ready.Status = metav1.ConditionTrue
+		ready.Reason = "ACLApplied"
+		ready.Message = "ACL successfully applied to Redis cluster"
+	}
+
+	// The ACL is re-applied on every pass, so only a pass that actually moved the
+	// condition restamps the timestamp: a steady-state pass that changes nothing
+	// must leave the status byte-identical, or the controller's own watch turns
+	// each reconcile into the next one.
+	changed := meta.SetStatusCondition(&redisUser.Status.Conditions, ready)
+	if changed && phase == "Ready" {
+		now := metav1.Now()
 		redisUser.Status.LastPasswordChange = &now
-		redisUser.Status.Conditions = []metav1.Condition{
-			{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				LastTransitionTime: now,
-				Reason:             "ACLApplied",
-				Message:            "ACL successfully applied to Redis cluster",
-			},
-		}
-	} else {
-		redisUser.Status.Conditions = []metav1.Condition{
-			{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				LastTransitionTime: now,
-				Reason:             "Error",
-				Message:            errorMsg,
-			},
-		}
+	}
+
+	// Only a fully applied user proves the partial application is over.
+	if phase == "Ready" {
+		meta.SetStatusCondition(&redisUser.Status.Conditions, metav1.Condition{
+			Type:               "Degraded",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: redisUser.Generation,
+			Reason:             "ACLApplied",
+			Message:            "The user is applied on every ready Redis node",
+		})
 	}
 
 	if err := r.Status().Update(ctx, redisUser); err != nil {

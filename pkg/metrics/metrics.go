@@ -1,18 +1,25 @@
 package metrics
 
 import (
+	"math"
+	"strings"
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 var (
-	// RedisClusterInfo tracks Redis cluster information
+	// RedisClusterInfo tracks Redis cluster information. The master address is
+	// deliberately not a label: it changes on every failover and is a pod IP,
+	// so it would multiply the series of every cluster without bound. It is
+	// reported on the CR instead, in status.masterNode.
 	RedisClusterInfo = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "redis_cluster_info",
 			Help: "Redis cluster basic information (1=up, 0=down)",
 		},
-		[]string{"namespace", "name", "master_node"},
+		[]string{"namespace", "name"},
 	)
 
 	// RedisConnectedReplicas tracks number of connected replicas
@@ -28,7 +35,7 @@ var (
 	RedisReplicationLag = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "redis_replication_lag_seconds",
-			Help: "Redis replication lag in seconds",
+			Help: "Redis replication lag in seconds (-1 when the replica could not be queried)",
 		},
 		[]string{"namespace", "name", "pod"},
 	)
@@ -97,24 +104,10 @@ var (
 		[]string{"namespace", "name", "username"},
 	)
 
-	// ReconciliationDuration tracks controller reconciliation duration
-	ReconciliationDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "redis_controller_reconciliation_duration_seconds",
-			Help:    "Duration of controller reconciliation in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"controller", "namespace", "name"},
-	)
-
-	// ReconciliationErrors tracks reconciliation errors
-	ReconciliationErrors = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "redis_controller_reconciliation_errors_total",
-			Help: "Total number of reconciliation errors",
-		},
-		[]string{"controller", "namespace", "name", "error_type"},
-	)
+	// Reconcile duration and error counts are not declared here.
+	// controller-runtime already exports controller_runtime_reconcile_time_seconds
+	// and controller_runtime_reconcile_errors_total, labelled by controller,
+	// for every controller registered with the Manager.
 
 	// --- Memory Metrics ---
 
@@ -335,10 +328,6 @@ func init() {
 		// ACL
 		RedisUserACLStatus,
 
-		// Controller
-		ReconciliationDuration,
-		ReconciliationErrors,
-
 		// Memory
 		RedisUsedMemory,
 		RedisMaxMemory,
@@ -366,4 +355,194 @@ func init() {
 		RedisKeyspaceMisses,
 		RedisDBKeys,
 	)
+}
+
+// labelSep joins label values into a tracking key. No Kubernetes name or pod
+// name can contain it, so two different label sets can never collide on one
+// key.
+const labelSep = "\x00"
+
+// deletableVec is the shared surface of every *Vec type: they all embed
+// *prometheus.MetricVec.
+type deletableVec interface {
+	prometheus.Collector
+	DeletePartialMatch(prometheus.Labels) int
+}
+
+// clusterSeries are the vectors keyed by the namespace and name of a
+// RedisSentinel. Backup and ACL vectors are not here: their "name" is the
+// RedisBackup or RedisUser, not the cluster.
+var clusterSeries = []deletableVec{
+	RedisClusterInfo,
+	RedisConnectedReplicas,
+	RedisReplicationLag,
+	SentinelStatus,
+	SentinelMonitoredMasters,
+	SentinelQuorumHealth,
+	SentinelKnownSentinels,
+	SentinelKnownReplicas,
+	RedisFailoverTotal,
+	RedisUsedMemory,
+	RedisMaxMemory,
+	RedisMemoryFragmentationRatio,
+	RedisConnectedClients,
+	RedisBlockedClients,
+	RedisRejectedConnections,
+	RedisRDBLastSaveTime,
+	RedisRDBChangesSinceLastSave,
+	RedisAOFEnabled,
+	RedisAOFCurrentSize,
+	RedisReplicationOffset,
+	RedisReplicationLagBytes,
+	RedisMasterLinkStatus,
+	RedisTotalCommandsProcessed,
+	RedisKeyspaceHits,
+	RedisKeyspaceMisses,
+	RedisDBKeys,
+}
+
+// podSeries are the cluster vectors carrying a per-pod label, so they outlive
+// the pod itself unless they are dropped when it goes away.
+var podSeries = []deletableVec{
+	RedisReplicationLag,
+	RedisUsedMemory,
+	RedisMaxMemory,
+	RedisMemoryFragmentationRatio,
+	RedisConnectedClients,
+	RedisBlockedClients,
+	RedisRejectedConnections,
+	RedisRDBLastSaveTime,
+	RedisRDBChangesSinceLastSave,
+	RedisAOFEnabled,
+	RedisAOFCurrentSize,
+	RedisReplicationOffset,
+	RedisReplicationLagBytes,
+	RedisMasterLinkStatus,
+	RedisTotalCommandsProcessed,
+	RedisKeyspaceHits,
+	RedisKeyspaceMisses,
+	RedisDBKeys,
+}
+
+// state holds what the collectors themselves cannot: the previous sample of
+// each absolute Redis INFO counter, and the pods a cluster last reported.
+var state = struct {
+	mu       sync.Mutex
+	counters map[*prometheus.CounterVec]map[string]float64
+	pods     map[string]map[string]bool
+}{
+	counters: map[*prometheus.CounterVec]map[string]float64{},
+	pods:     map[string]map[string]bool{},
+}
+
+// AddCounterDelta advances a counter by the increase since the previous sample
+// of an absolute value read from Redis INFO.
+//
+// Those values are monotonic only within one process lifetime: a restarted
+// Redis starts them again at zero. A sample below the previous one is
+// therefore a restart, and the whole new value is the increase; subtracting
+// would produce a negative Add, which Prometheus rejects. The first sample of
+// a series only sets the baseline, so restarting the operator does not look
+// like a burst of millions of commands to rate() and increase().
+func AddCounterDelta(vec *prometheus.CounterVec, value float64, labelValues ...string) {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return
+	}
+
+	key := strings.Join(labelValues, labelSep)
+
+	state.mu.Lock()
+	series, ok := state.counters[vec]
+	if !ok {
+		series = map[string]float64{}
+		state.counters[vec] = series
+	}
+	previous, seen := series[key]
+	series[key] = value
+	state.mu.Unlock()
+
+	delta := 0.0
+	switch {
+	case !seen:
+		// Baseline only.
+	case value >= previous:
+		delta = value - previous
+	default:
+		delta = value
+	}
+	vec.WithLabelValues(labelValues...).Add(delta)
+}
+
+// DeleteClusterSeries drops every series a RedisSentinel owns. Without it a
+// deleted cluster keeps reporting itself up, and every alert written against
+// it keeps evaluating against a value nothing updates any more.
+func DeleteClusterSeries(namespace, name string) {
+	labels := prometheus.Labels{"namespace": namespace, "name": name}
+	for _, vec := range clusterSeries {
+		vec.DeletePartialMatch(labels)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	delete(state.pods, namespace+labelSep+name)
+	forgetCounterBaselines(namespace, name, "")
+}
+
+// DeleteBackupSeries drops the series of one RedisBackup.
+func DeleteBackupSeries(namespace, name string) {
+	labels := prometheus.Labels{"namespace": namespace, "name": name}
+	RedisBackupStatus.DeletePartialMatch(labels)
+	RedisBackupDuration.DeletePartialMatch(labels)
+	RedisBackupSize.DeletePartialMatch(labels)
+}
+
+// DeleteUserSeries drops the series of one RedisUser, including any left
+// behind by an earlier spec.username.
+func DeleteUserSeries(namespace, name string) {
+	RedisUserACLStatus.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "name": name})
+}
+
+// SyncClusterPods drops the per-pod series of pods the cluster no longer has.
+// A scale-down otherwise leaves the removed pods reporting their last sample
+// for as long as the operator runs.
+func SyncClusterPods(namespace, name string, live []string) {
+	cluster := namespace + labelSep + name
+	current := make(map[string]bool, len(live))
+	for _, pod := range live {
+		current[pod] = true
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	for pod := range state.pods[cluster] {
+		if current[pod] {
+			continue
+		}
+		labels := prometheus.Labels{"namespace": namespace, "name": name, "pod": pod}
+		for _, vec := range podSeries {
+			vec.DeletePartialMatch(labels)
+		}
+		forgetCounterBaselines(namespace, name, pod)
+	}
+
+	state.pods[cluster] = current
+}
+
+// forgetCounterBaselines drops the tracked samples for a cluster, or for one
+// of its pods when pod is set. The series are gone, so the next sample has to
+// baseline again rather than be charged as a delta against a value nothing is
+// counting from. Callers hold state.mu.
+func forgetCounterBaselines(namespace, name, pod string) {
+	prefix := namespace + labelSep + name
+	if pod != "" {
+		prefix += labelSep + pod
+	}
+	for _, series := range state.counters {
+		for key := range series {
+			if key == prefix || strings.HasPrefix(key, prefix+labelSep) {
+				delete(series, key)
+			}
+		}
+	}
 }
