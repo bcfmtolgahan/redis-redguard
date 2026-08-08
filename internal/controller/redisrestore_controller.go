@@ -137,7 +137,11 @@ func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// A breadcrumb surviving a failed unquiesce belongs to the previous
 		// run: carried over, it reads as "this run already shut the master
 		// down" and holds the sentinel reconciler off a quiesce nobody owns.
+		// The verification fields likewise describe the previous run.
 		redisRestore.Status.QuiescedDownAfterMilliseconds = 0
+		redisRestore.Status.DatasetReplaced = false
+		redisRestore.Status.ExpectedKeyCount = 0
+		redisRestore.Status.RestoredKeyCount = 0
 		if err := r.updateStatus(ctx, redisRestore, redisv1alpha1.RestorePhasePending, "Spec changed; starting a new restore run", 0); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -244,7 +248,9 @@ func (r *RedisRestoreReconciler) handleDownloadingPhase(ctx context.Context, res
 			return r.failRestore(ctx, restore, rs, "Backup is not valid gzip data: "+err.Error())
 		}
 		rdbData, err = io.ReadAll(gzipReader)
-		gzipReader.Close()
+		if cerr := gzipReader.Close(); err == nil {
+			err = cerr
+		}
 		if err != nil {
 			return r.failRestore(ctx, restore, rs, "Failed to decompress backup: "+err.Error())
 		}
@@ -304,6 +310,10 @@ func (r *RedisRestoreReconciler) handleRestoringPhase(ctx context.Context, resto
 			}
 			return ctrl.Result{Requeue: true}, nil
 		}
+		// The payload is gone after this restore's shutdown: the master now
+		// serves the restored data. Recorded before verification so every
+		// terminal path from here knows the old dataset no longer exists.
+		restore.Status.DatasetReplaced = true
 		if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseVerifying,
 			"Master restarted; verifying the restored dataset", 0); err != nil {
 			return ctrl.Result{}, err
@@ -399,13 +409,23 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 		return ctrl.Result{}, err
 	}
 
-	if expected := r.lookupBackupKeyCount(ctx, restore); expected != nil {
-		if total != *expected {
-			return r.failRestore(ctx, restore, rs, fmt.Sprintf(
-				"Restored key count %d does not match the %d recorded by the backup", total, *expected))
-		}
-	} else if total == 0 {
+	restore.Status.RestoredKeyCount = total
+	if total == 0 {
 		return r.failRestore(ctx, restore, rs, "Restore produced an empty dataset; the dump was not loaded")
+	}
+
+	// The backup records its count after BGSAVE completes, so a cluster taking
+	// writes drifts from the snapshot by design; a strict comparison would
+	// fail every such restore after the dataset was already replaced
+	// cluster-wide. Both counts go on record and a mismatch only warns.
+	driftNote := ""
+	if expected := r.lookupBackupKeyCount(ctx, restore); expected != nil {
+		restore.Status.ExpectedKeyCount = *expected
+		if total != *expected {
+			driftNote = fmt.Sprintf("; the backup recorded %d keys (counted after BGSAVE, so writes during the backup drift it)", *expected)
+			recordEvent(r.Recorder, restore, corev1.EventTypeWarning, "RestoreKeyCountDrift",
+				fmt.Sprintf("Restored %d keys, the backup recorded %d", total, *expected))
+		}
 	}
 
 	// Durability returns only after the restored dataset is in memory:
@@ -428,7 +448,7 @@ func (r *RedisRestoreReconciler) handleVerifyingPhase(ctx context.Context, resto
 	restore.Status.CompletionTime = &metav1.Time{Time: time.Now()}
 	restore.Status.RestoredFrom = restore.Spec.BackupSource.BackupPath
 
-	message := fmt.Sprintf("Restore completed: %d keys loaded", total)
+	message := fmt.Sprintf("Restore completed: %d keys loaded", total) + driftNote
 	if err := r.updateStatus(ctx, restore, redisv1alpha1.RestorePhaseCompleted, message, 0); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -467,10 +487,42 @@ func (r *RedisRestoreReconciler) markDestinationRejected(ctx context.Context, re
 	return ctrl.Result{}, nil
 }
 
+// reenableAppendonly turns AOF back on, on the current master. The restarted
+// master boots with AOF off so the staged payload survives the load; leaving
+// it off gives the dataset a durability window of up to the next rewrite.
+func (r *RedisRestoreReconciler) reenableAppendonly(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
+	adminPassword := r.getAdminPassword(ctx, rs)
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return fmt.Errorf("resolve client TLS config: %w", err)
+	}
+	masterPod, err := r.getMasterPod(ctx, rs)
+	if err != nil {
+		return err
+	}
+
+	addr := fmt.Sprintf("%s:6379", masterPod.Status.PodIP)
+	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
+	defer redisClient.Close()
+	return redisClient.ConfigSet(ctx, "appendonly", "yes")
+}
+
 // failRestore lifts the sentinel quiesce when possible and records a terminal
-// failure. No data-destroying step may follow a failRestore.
+// failure. No data-destroying step may follow a failRestore. When the failure
+// comes after the payload was consumed, the cluster serves the restored data
+// whatever status says, so durability is re-enabled and the replacement named:
+// the worst outcome is a master serving replaced data with AOF off while the
+// status reads as if the restore never happened.
 func (r *RedisRestoreReconciler) failRestore(ctx context.Context, restore *redisv1alpha1.RedisRestore, rs *redisv1alpha1.RedisSentinel, message string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	if rs != nil && restore.Status.DatasetReplaced {
+		message += "; the master already loaded the restore payload, so the previous dataset is replaced"
+		if err := r.reenableAppendonly(ctx, rs); err != nil {
+			logger.Error(err, "Failed to re-enable appendonly after the dataset was replaced")
+			message += " and appendonly could not be re-enabled: the restored data has no durability until it is"
+		}
+	}
 
 	if rs != nil && restore.Status.QuiescedDownAfterMilliseconds != 0 {
 		adminPassword := r.getAdminPassword(ctx, rs)
@@ -636,7 +688,7 @@ func (r *RedisRestoreReconciler) downloadBackup(ctx context.Context, restore *re
 	if err != nil {
 		return nil, err
 	}
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 
 	return io.ReadAll(result.Body)
 }

@@ -239,7 +239,7 @@ func TestRestore_IsIdempotentAfterCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile of a completed restore: %v", err)
 	}
-	if res.Requeue || res.RequeueAfter != 0 {
+	if res != (ctrl.Result{}) {
 		t.Errorf("completed restore requeued: %+v", res)
 	}
 	if calls := fx.factory.Calls(); len(calls) != 0 {
@@ -292,6 +292,9 @@ func TestRestore_SpecChangeClearsStaleQuiesceBreadcrumb(t *testing.T) {
 		r.Status.Phase = redisv1alpha1.RestorePhaseFailed
 		r.Status.ObservedGeneration = 1
 		r.Status.QuiescedDownAfterMilliseconds = 5000
+		r.Status.DatasetReplaced = true
+		r.Status.ExpectedKeyCount = 100
+		r.Status.RestoredKeyCount = 42
 	})
 
 	if _, err := fx.reconcile(t); err != nil {
@@ -304,6 +307,9 @@ func TestRestore_SpecChangeClearsStaleQuiesceBreadcrumb(t *testing.T) {
 	}
 	if restore.Status.QuiescedDownAfterMilliseconds != 0 {
 		t.Errorf("stale quiesce breadcrumb %d carried into the new run", restore.Status.QuiescedDownAfterMilliseconds)
+	}
+	if restore.Status.DatasetReplaced || restore.Status.ExpectedKeyCount != 0 || restore.Status.RestoredKeyCount != 0 {
+		t.Errorf("previous run's verification state carried into the new run: %+v", restore.Status)
 	}
 }
 
@@ -428,6 +434,9 @@ func TestRestore_RestoringPayloadConsumedMovesToVerifying(t *testing.T) {
 	if restore.Status.Phase != redisv1alpha1.RestorePhaseVerifying {
 		t.Fatalf("phase = %q, want Verifying after the payload was consumed", restore.Status.Phase)
 	}
+	if !restore.Status.DatasetReplaced {
+		t.Error("datasetReplaced not set: terminal failures after this point cannot know the master serves the payload")
+	}
 	for _, call := range fx.factory.Calls() {
 		if strings.Contains(call, "ShutdownNoSave") {
 			t.Errorf("master shut down again after it already restarted: %v", fx.factory.Calls())
@@ -453,6 +462,9 @@ func TestRestore_RestoringPayloadLostWithoutShutdownRestages(t *testing.T) {
 	restore := fx.get(t)
 	if restore.Status.Phase != redisv1alpha1.RestorePhaseDownloading {
 		t.Fatalf("phase = %q, want Downloading to re-stage the lost payload", restore.Status.Phase)
+	}
+	if restore.Status.DatasetReplaced {
+		t.Error("datasetReplaced set, but this restore never loaded its payload")
 	}
 	assertNoDestructiveCalls(t, fx.factory)
 }
@@ -516,9 +528,10 @@ func TestRestore_VerifyingSucceedsRestoresSentinelAndAOF(t *testing.T) {
 	}
 }
 
-func TestRestore_VerifyingComparesBackupKeyCountMismatch(t *testing.T) {
-	recorded := int64(100)
-	backup := &redisv1alpha1.RedisBackup{
+// sourceBackup returns a RedisBackup whose status names the restored object
+// and records keyCount, the way the backup controller writes it.
+func sourceBackup(keyCount int64) *redisv1alpha1.RedisBackup {
+	return &redisv1alpha1.RedisBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "source-backup", Namespace: restoreNS},
 		Spec: redisv1alpha1.RedisBackupSpec{
 			RedisClusterRef: restoreCluster,
@@ -526,15 +539,115 @@ func TestRestore_VerifyingComparesBackupKeyCountMismatch(t *testing.T) {
 		},
 		Status: redisv1alpha1.RedisBackupStatus{
 			BackupLocation: "s3://test-bucket/backups/restore-cluster/backup-1.rdb.gz",
-			KeyCount:       &recorded,
+			KeyCount:       &keyCount,
 		},
 	}
+}
+
+// TestRestore_VerifyingKeyCountDriftIsAdvisory pins the drift semantics: the
+// backup counts keys after BGSAVE completes, so a backup taken under write
+// load always drifts from the snapshot. Failing on the mismatch would fail
+// every such restore after the dataset was already replaced; instead both
+// counts land in status and the restore completes with the drift on record.
+func TestRestore_VerifyingKeyCountDriftIsAdvisory(t *testing.T) {
 	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
 		r.Status.Phase = redisv1alpha1.RestorePhaseVerifying
 		r.Status.ObservedGeneration = 1
 		r.Status.StartTime = &metav1.Time{Time: time.Now()}
 		r.Status.QuiescedDownAfterMilliseconds = 5000
-	}, backup)
+	}, sourceBackup(100))
+	fx.factory.SetKeyspace(restoreMasterAddr, map[int]int64{0: 42})
+
+	if _, err := fx.reconcile(t); err != nil {
+		t.Fatalf("verifying reconcile: %v", err)
+	}
+
+	restore := fx.get(t)
+	if restore.Status.Phase != redisv1alpha1.RestorePhaseCompleted {
+		t.Fatalf("phase = %q (message %q), want Completed: the count drift is advisory", restore.Status.Phase, restore.Status.Message)
+	}
+	if restore.Status.ExpectedKeyCount != 100 || restore.Status.RestoredKeyCount != 42 {
+		t.Errorf("counts = expected %d restored %d, want 100 and 42 recorded in status",
+			restore.Status.ExpectedKeyCount, restore.Status.RestoredKeyCount)
+	}
+	if !strings.Contains(restore.Status.Message, "42") || !strings.Contains(restore.Status.Message, "100") {
+		t.Errorf("message %q does not state both counts", restore.Status.Message)
+	}
+	if got := fx.factory.Configs(restoreMasterAddr)["appendonly"]; got != "yes" {
+		t.Errorf("appendonly = %q, want yes after a completed restore", got)
+	}
+	if got := fx.factory.MasterOptions()["down-after-milliseconds"]; got != "5000" {
+		t.Errorf("sentinel down-after-milliseconds = %q, want the recorded 5000 restored", got)
+	}
+}
+
+func TestRestore_VerifyingComparesBackupKeyCountMatch(t *testing.T) {
+	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
+		r.Status.Phase = redisv1alpha1.RestorePhaseVerifying
+		r.Status.ObservedGeneration = 1
+		r.Status.StartTime = &metav1.Time{Time: time.Now()}
+		r.Status.QuiescedDownAfterMilliseconds = 5000
+	}, sourceBackup(42))
+	fx.factory.SetKeyspace(restoreMasterAddr, map[int]int64{0: 42})
+
+	if _, err := fx.reconcile(t); err != nil {
+		t.Fatalf("verifying reconcile: %v", err)
+	}
+
+	restore := fx.get(t)
+	if restore.Status.Phase != redisv1alpha1.RestorePhaseCompleted {
+		t.Fatalf("phase = %q (message %q), want Completed when the counts match", restore.Status.Phase, restore.Status.Message)
+	}
+	if restore.Status.ExpectedKeyCount != 42 || restore.Status.RestoredKeyCount != 42 {
+		t.Errorf("counts = expected %d restored %d, want both 42",
+			restore.Status.ExpectedKeyCount, restore.Status.RestoredKeyCount)
+	}
+}
+
+// TestRestore_EmptyDatasetFailureReenablesAOF pins the terminal-path cleanup:
+// once the payload was consumed the master serves whatever it loaded, so a
+// failure here must still re-enable appendonly and say the dataset changed,
+// or the cluster runs without durability while status claims nothing happened.
+func TestRestore_EmptyDatasetFailureReenablesAOF(t *testing.T) {
+	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
+		r.Status.Phase = redisv1alpha1.RestorePhaseVerifying
+		r.Status.ObservedGeneration = 1
+		r.Status.StartTime = &metav1.Time{Time: time.Now()}
+		r.Status.QuiescedDownAfterMilliseconds = 5000
+		r.Status.DatasetReplaced = true
+	})
+
+	if _, err := fx.reconcile(t); err != nil {
+		t.Fatalf("verifying reconcile: %v", err)
+	}
+
+	restore := fx.get(t)
+	if restore.Status.Phase != redisv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase = %q, want Failed on an empty dataset", restore.Status.Phase)
+	}
+	if got := fx.factory.Configs(restoreMasterAddr)["appendonly"]; got != "yes" {
+		t.Errorf("appendonly = %q, want yes: the replaced dataset must regain durability even on failure", got)
+	}
+	if !restore.Status.DatasetReplaced {
+		t.Error("datasetReplaced must survive the failure so operators know the cluster no longer serves the old data")
+	}
+	if !strings.Contains(restore.Status.Message, "replaced") {
+		t.Errorf("message %q does not record that the dataset was replaced", restore.Status.Message)
+	}
+}
+
+// TestRestore_MasterRoleLostFailureReenablesAOF covers the same cleanup on the
+// failover path: the restarted pod booted with AOF off and must not keep
+// running that way after the restore is declared failed.
+func TestRestore_MasterRoleLostFailureReenablesAOF(t *testing.T) {
+	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
+		r.Status.Phase = redisv1alpha1.RestorePhaseVerifying
+		r.Status.ObservedGeneration = 1
+		r.Status.StartTime = &metav1.Time{Time: time.Now()}
+		r.Status.QuiescedDownAfterMilliseconds = 5000
+		r.Status.DatasetReplaced = true
+	})
+	fx.factory.SetMaster("10.244.0.99:6379")
 	fx.factory.SetKeyspace(restoreMasterAddr, map[int]int64{0: 42})
 
 	if _, err := fx.reconcile(t); err != nil {
@@ -543,40 +656,35 @@ func TestRestore_VerifyingComparesBackupKeyCountMismatch(t *testing.T) {
 
 	restore := fx.get(t)
 	if restore.Status.Phase != redisv1alpha1.RestorePhaseFailed {
-		t.Fatalf("phase = %q, want Failed on a key count mismatch", restore.Status.Phase)
+		t.Fatalf("phase = %q, want Failed when the master role was lost", restore.Status.Phase)
 	}
-	if !strings.Contains(restore.Status.Message, "42") || !strings.Contains(restore.Status.Message, "100") {
-		t.Errorf("message %q does not state both counts", restore.Status.Message)
+	if got := fx.factory.Configs(restoreMasterAddr)["appendonly"]; got != "yes" {
+		t.Errorf("appendonly = %q, want yes on the pod that booted with AOF off", got)
 	}
 }
 
-func TestRestore_VerifyingComparesBackupKeyCountMatch(t *testing.T) {
-	recorded := int64(42)
-	backup := &redisv1alpha1.RedisBackup{
-		ObjectMeta: metav1.ObjectMeta{Name: "source-backup", Namespace: restoreNS},
-		Spec: redisv1alpha1.RedisBackupSpec{
-			RedisClusterRef: restoreCluster,
-			S3:              redisv1alpha1.S3Config{Bucket: "test-bucket"},
-		},
-		Status: redisv1alpha1.RedisBackupStatus{
-			BackupLocation: "s3://test-bucket/backups/restore-cluster/backup-1.rdb.gz",
-			KeyCount:       &recorded,
-		},
-	}
+// TestRestore_VerifyTimeoutReenablesAOF covers the deadline path: the timeout
+// fires after the dataset was replaced, so the failure must restore
+// durability like every other terminal path.
+func TestRestore_VerifyTimeoutReenablesAOF(t *testing.T) {
 	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
 		r.Status.Phase = redisv1alpha1.RestorePhaseVerifying
 		r.Status.ObservedGeneration = 1
-		r.Status.StartTime = &metav1.Time{Time: time.Now()}
+		r.Status.StartTime = &metav1.Time{Time: time.Now().Add(-restoreTimeout - time.Minute)}
 		r.Status.QuiescedDownAfterMilliseconds = 5000
-	}, backup)
-	fx.factory.SetKeyspace(restoreMasterAddr, map[int]int64{0: 42})
+		r.Status.DatasetReplaced = true
+	})
 
 	if _, err := fx.reconcile(t); err != nil {
 		t.Fatalf("verifying reconcile: %v", err)
 	}
 
-	if restore := fx.get(t); restore.Status.Phase != redisv1alpha1.RestorePhaseCompleted {
-		t.Fatalf("phase = %q (message %q), want Completed when the counts match", restore.Status.Phase, restore.Status.Message)
+	restore := fx.get(t)
+	if restore.Status.Phase != redisv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase = %q, want Failed after the restore timeout", restore.Status.Phase)
+	}
+	if got := fx.factory.Configs(restoreMasterAddr)["appendonly"]; got != "yes" {
+		t.Errorf("appendonly = %q, want yes after a timed-out restore that replaced the dataset", got)
 	}
 }
 

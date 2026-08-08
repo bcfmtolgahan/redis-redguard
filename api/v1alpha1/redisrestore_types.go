@@ -91,6 +91,25 @@ type RedisRestoreStatus struct {
 	// +optional
 	QuiescedDownAfterMilliseconds int32 `json:"quiescedDownAfterMilliseconds,omitempty"`
 
+	// DatasetReplaced is set once the master has restarted and consumed the
+	// restore payload: from that point the cluster serves the restored data,
+	// even if the restore later fails, so a Failed phase with this set means
+	// the previous dataset is gone.
+	// +optional
+	DatasetReplaced bool `json:"datasetReplaced,omitempty"`
+
+	// ExpectedKeyCount is the key count the source RedisBackup recorded for
+	// the restored object; zero when no backup in the namespace records it.
+	// The backup counts after BGSAVE completes, so a cluster taking writes
+	// drifts from the snapshot: a mismatch with restoredKeyCount is advisory.
+	// +optional
+	ExpectedKeyCount int64 `json:"expectedKeyCount,omitempty"`
+
+	// RestoredKeyCount is the key count observed across all databases after
+	// the restored dataset was loaded.
+	// +optional
+	RestoredKeyCount int64 `json:"restoredKeyCount,omitempty"`
+
 	// StartTime is when the restore operation started
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
