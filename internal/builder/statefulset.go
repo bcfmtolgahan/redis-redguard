@@ -144,6 +144,55 @@ func tmpVolume() corev1.Volume {
 	}
 }
 
+// tlsCertsVolume backs the single TLS directory a managed pod mounts. A CA in
+// its own Secret is projected into that directory rather than subPath-mounted
+// into it: a subPath file targeting a path inside a directory another volume
+// already occupies is refused by the kubelet ("not a directory") and the
+// container never starts. One directory also keeps the paths in redis.conf,
+// sentinel.conf, the probes and the init script identical in both Secret
+// layouts. Items are pinned so a bundle Secret carrying its own ca.crt cannot
+// collide with the CA Secret's copy, which the kubelet rejects as a duplicate
+// path. 0440 with fsGroup: the files are root:1000 and the server (uid 1000)
+// reads via the group bit; 0400 leaves the key readable by root only.
+func tlsCertsVolume(tls *redisv1alpha1.TLSConfig) corev1.Volume {
+	if tls.CASecretRef == "" || tls.CASecretRef == tls.CertificateSecretRef {
+		return corev1.Volume{
+			Name: "tls-certs",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  tls.CertificateSecretRef,
+					DefaultMode: int32Ptr(0440),
+				},
+			},
+		}
+	}
+	return corev1.Volume{
+		Name: "tls-certs",
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: int32Ptr(0440),
+				Sources: []corev1.VolumeProjection{
+					{
+						Secret: &corev1.SecretProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: tls.CertificateSecretRef},
+							Items: []corev1.KeyToPath{
+								{Key: "tls.crt", Path: "tls.crt"},
+								{Key: "tls.key", Path: "tls.key"},
+							},
+						},
+					},
+					{
+						Secret: &corev1.SecretProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: tls.CASecretRef},
+							Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 // BuildRedisStatefulSet creates a StatefulSet for Redis servers
 func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet {
 	labels := buildLabels(rs, "redis")
@@ -220,42 +269,12 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 	// Add TLS volumes and mounts if enabled
 	tlsEnabled := rs.Spec.TLS != nil && rs.Spec.TLS.Enabled
 	if tlsEnabled && rs.Spec.TLS.CertificateSecretRef != "" {
-		// TLS certificate volume
-		volumes = append(volumes, corev1.Volume{
-			Name: "tls-certs",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  rs.Spec.TLS.CertificateSecretRef,
-					DefaultMode: int32Ptr(0440),
-				},
-			},
-		})
+		volumes = append(volumes, tlsCertsVolume(rs.Spec.TLS))
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      "tls-certs",
 			MountPath: "/etc/redis/tls",
 			ReadOnly:  true,
 		})
-
-		// CA certificate volume if specified (separate from cert/key secret)
-		if rs.Spec.TLS.CASecretRef != "" && rs.Spec.TLS.CASecretRef != rs.Spec.TLS.CertificateSecretRef {
-			volumes = append(volumes, corev1.Volume{
-				Name: "tls-ca",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  rs.Spec.TLS.CASecretRef,
-						DefaultMode: int32Ptr(0440),
-					},
-				},
-			})
-			// Mount CA certificate at /etc/redis/tls/ca.crt
-			// This assumes the secret contains a key named "ca.crt"
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      "tls-ca",
-				MountPath: "/etc/redis/tls/ca.crt",
-				SubPath:   "ca.crt",
-				ReadOnly:  true,
-			})
-		}
 	}
 
 	sts := &appsv1.StatefulSet{
@@ -300,6 +319,26 @@ func BuildRedisStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulSet 
 								},
 							},
 							Resources: resources,
+							// The init script may wait up to 60s (30 x 2s) for
+							// a sentinel before redis-server ever execs, and
+							// the AOF replays after that. Liveness counts from
+							// container start, so on its own its 45s budget
+							// kills every such boot mid-init; the startup
+							// probe defers liveness and readiness until the
+							// server first answers, which removes the race
+							// between the two budgets instead of tuning one
+							// against the other. 60 x 5s dominates the
+							// sentinel wait with room for the dataset load.
+							StartupProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									Exec: &corev1.ExecAction{
+										Command: probes.livenessCommand(),
+									},
+								},
+								PeriodSeconds:    5,
+								TimeoutSeconds:   5,
+								FailureThreshold: 60,
+							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
@@ -431,41 +470,12 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 
 	// Add TLS volumes and mounts if enabled
 	if tlsEnabled && rs.Spec.TLS.CertificateSecretRef != "" {
-		volumes = append(volumes, corev1.Volume{
-			Name: "tls-certs",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  rs.Spec.TLS.CertificateSecretRef,
-					DefaultMode: int32Ptr(0440),
-				},
-			},
-		})
+		volumes = append(volumes, tlsCertsVolume(rs.Spec.TLS))
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      "tls-certs",
 			MountPath: "/etc/sentinel/tls",
 			ReadOnly:  true,
 		})
-
-		// CA certificate volume if specified (separate from cert/key secret)
-		if rs.Spec.TLS.CASecretRef != "" && rs.Spec.TLS.CASecretRef != rs.Spec.TLS.CertificateSecretRef {
-			volumes = append(volumes, corev1.Volume{
-				Name: "tls-ca",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  rs.Spec.TLS.CASecretRef,
-						DefaultMode: int32Ptr(0440),
-					},
-				},
-			})
-			// Mount CA certificate at /etc/sentinel/tls/ca.crt
-			// This assumes the secret contains a key named "ca.crt"
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      "tls-ca",
-				MountPath: "/etc/sentinel/tls/ca.crt",
-				SubPath:   "ca.crt",
-				ReadOnly:  true,
-			})
-		}
 	}
 
 	sts := &appsv1.StatefulSet{
@@ -510,6 +520,21 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 								},
 							},
 							Resources: resources,
+							// Same ordering constraint as the Redis container:
+							// the sentinel init script waits up to 60s for the
+							// master's DNS record before the server execs, so
+							// liveness must not start counting until sentinel
+							// first answers.
+							StartupProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									Exec: &corev1.ExecAction{
+										Command: sentinelProbeCommand,
+									},
+								},
+								PeriodSeconds:    5,
+								TimeoutSeconds:   5,
+								FailureThreshold: 60,
+							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
@@ -601,6 +626,20 @@ type probeCLI struct {
 	cacert bool
 }
 
+// cliTLSFlags renders the client-side flags every redis-cli in a TLS-enabled
+// pod must carry: the probes and the init script's sentinel query alike, so
+// one renderer keeps them agreeing on the mounted paths. --cacert only when a
+// CA secret is configured; without one redis-cli verifies against the system
+// trust store, and pointing --cacert at a file that is not mounted fails every
+// call.
+func cliTLSFlags(tlsDir string, cacert bool) string {
+	flags := "--tls --cert " + tlsDir + "/tls.crt --key " + tlsDir + "/tls.key"
+	if cacert {
+		flags += " --cacert " + tlsDir + "/ca.crt"
+	}
+	return flags
+}
+
 // call renders a single redis-cli invocation. The password travels in
 // REDISCLI_AUTH because argv is readable by every process in the pod.
 func (p probeCLI) call(args string) string {
@@ -609,10 +648,7 @@ func (p probeCLI) call(args string) string {
 		cmd += " -p " + p.port
 	}
 	if p.tls {
-		cmd += " --tls --cert " + p.tlsDir + "/tls.crt --key " + p.tlsDir + "/tls.key"
-		if p.cacert {
-			cmd += " --cacert " + p.tlsDir + "/ca.crt"
-		}
+		cmd += " " + cliTLSFlags(p.tlsDir, p.cacert)
 	}
 	if p.auth {
 		// A bare assignment prefix is not field-split, so a password

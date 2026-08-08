@@ -1,7 +1,15 @@
 #!/bin/sh
 # Stub redis-cli for init-script tests.
+# REDGUARD_TEST_REQUIRE_TLS set: refuse a query without --tls the way a
+# `port 0` + `tls-port 26379` sentinel refuses plaintext (I/O error, exit 1).
 # REDGUARD_TEST_MASTER_IP unset: behave as if no sentinel answers (exit 1).
 # Set: reply like SENTINEL get-master-addr-by-name, IP then port.
+if [ -n "${REDGUARD_TEST_REQUIRE_TLS:-}" ]; then
+    case " $* " in
+        *" --tls "*) ;;
+        *) exit 1 ;;
+    esac
+fi
 if [ -z "${REDGUARD_TEST_MASTER_IP:-}" ]; then
     exit 1
 fi

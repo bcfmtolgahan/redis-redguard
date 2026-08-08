@@ -77,7 +77,16 @@ func BuildRedisConfigMap(rs *redisv1alpha1.RedisSentinel) *corev1.ConfigMap {
 	bootstrapMasterHost := fmt.Sprintf("%s-redis-0.%s-redis-headless.%s.svc.cluster.local",
 		rs.Name, rs.Name, rs.Namespace)
 
-	initScript := buildRedisInitScript(sentinelHosts, masterName, bootstrapMasterHost)
+	// The sentinel query runs inside the Redis pod, so it presents that pod's
+	// own client material. When TLS is enabled sentinel listens only on
+	// tls-port; a plaintext query gets an I/O error on every attempt and the
+	// pod falls back to the bootstrap topology even when sentinels know better.
+	sentinelTLSFlags := ""
+	if rs.Spec.TLS != nil && rs.Spec.TLS.Enabled {
+		sentinelTLSFlags = cliTLSFlags("/etc/redis/tls", rs.Spec.TLS.CASecretRef != "")
+	}
+
+	initScript := buildRedisInitScript(sentinelHosts, masterName, bootstrapMasterHost, sentinelTLSFlags)
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -114,7 +123,7 @@ func renderCustomConfig(cfg map[string]string) []string {
 // abort the retry loop under set -e, the password never appears in output or in
 // a process argument list, and the ACL file always exists and always defines the
 // default user.
-func buildRedisInitScript(sentinelHosts []string, masterName, bootstrapMasterHost string) string {
+func buildRedisInitScript(sentinelHosts []string, masterName, bootstrapMasterHost, tlsFlags string) string {
 	sentinelHostsStr := strings.Join(sentinelHosts, ",")
 
 	return fmt.Sprintf(`#!/bin/sh
@@ -125,6 +134,7 @@ log() { echo "[redguard-init] $*" >&2; }
 SENTINEL_HOSTS="%s"
 MASTER_NAME="%s"
 BOOTSTRAP_MASTER_HOST="%s"
+SENTINEL_TLS_FLAGS="%s"
 POD_ORDINAL=${HOSTNAME##*-}
 MY_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
 
@@ -190,7 +200,9 @@ is_ipv4() {
 get_master_from_sentinel() {
     for sentinel in $(echo "$SENTINEL_HOSTS" | tr ',' ' '); do
         log "querying sentinel $sentinel"
-        reply=$(REDISCLI_AUTH="${REDIS_PASSWORD:-}" redis-cli -h "$sentinel" -p 26379 \
+        # $SENTINEL_TLS_FLAGS is deliberately unquoted: it must split into
+        # words, and the paths it carries contain no whitespace.
+        reply=$(REDISCLI_AUTH="${REDIS_PASSWORD:-}" redis-cli -h "$sentinel" -p 26379 $SENTINEL_TLS_FLAGS \
             SENTINEL get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -1 | tr -d '"\r') || reply=""
         if [ -n "$reply" ] && [ "$reply" != "nil" ] && is_ipv4 "$reply"; then
             log "sentinel $sentinel reports master $reply"
@@ -233,7 +245,7 @@ fi
 
 log "replication config: $(grep -E '^(replicaof|slaveof)' /data/redis.conf || echo master)"
 exec redis-server /data/redis.conf
-`, sentinelHostsStr, masterName, bootstrapMasterHost)
+`, sentinelHostsStr, masterName, bootstrapMasterHost, tlsFlags)
 }
 
 // BuildSentinelConfigMap creates a ConfigMap for Sentinel configuration

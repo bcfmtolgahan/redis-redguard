@@ -104,6 +104,7 @@ func testInitScript() string {
 		[]string{"s0.example.svc", "s1.example.svc"},
 		"test-master",
 		"test-redis-0.example.svc",
+		"",
 	)
 }
 
@@ -166,6 +167,63 @@ func TestInitScript_NoSentinel_Ordinal1_FollowsBootstrapMaster(t *testing.T) {
 	}
 	if !strings.Contains(out, "WOULD_EXEC redis-server") {
 		t.Errorf("script must reach the exec, output:\n%s", out)
+	}
+}
+
+// tlsInitScript builds the init script through BuildRedisConfigMap so the
+// wiring from spec.tls to the script is what gets tested, not the script
+// builder in isolation.
+func tlsInitScript(t *testing.T, withCA bool) string {
+	t.Helper()
+	rs := testSentinel()
+	rs.Spec.TLS = &redisv1alpha1.TLSConfig{Enabled: true, CertificateSecretRef: "redis-tls"}
+	if withCA {
+		rs.Spec.TLS.CASecretRef = "redis-ca"
+	}
+	return BuildRedisConfigMap(rs).Data["init.sh"]
+}
+
+// TestInitScript_TLS_QueriesSentinelOverTLS: with spec.tls enabled the sentinel
+// config is `port 0` plus `tls-port 26379`, so a plaintext query gets an I/O
+// error on every attempt. The stub refuses non-TLS queries the same way; a
+// script without client TLS flags falls back to the bootstrap topology here and
+// never learns the real master.
+func TestInitScript_TLS_QueriesSentinelOverTLS(t *testing.T) {
+	conf, out, err := runInitScript(t, tlsInitScript(t, true), "test-redis-1", map[string]string{
+		"REDGUARD_TEST_MASTER_IP":   "10.244.0.5",
+		"REDGUARD_TEST_REQUIRE_TLS": "1",
+	})
+	if err != nil {
+		t.Fatalf("script failed: %v\noutput:\n%s", err, out)
+	}
+	if !strings.Contains(conf, "replicaof 10.244.0.5 6379") {
+		t.Errorf("TLS-only sentinel was never reached; the pod fell back to the bootstrap topology:\n%s", conf)
+	}
+}
+
+// TestInitScript_TLSFlagsMatchMountedPaths pins the sentinel query to the exact
+// certificate paths the StatefulSet mounts and to the probes' CA rule: --cacert
+// only when a CA secret is configured, because pointing it at a file that is
+// not mounted fails every query.
+func TestInitScript_TLSFlagsMatchMountedPaths(t *testing.T) {
+	withCA := tlsInitScript(t, true)
+	for _, want := range []string{
+		"--tls",
+		"--cert /etc/redis/tls/tls.crt",
+		"--key /etc/redis/tls/tls.key",
+		"--cacert /etc/redis/tls/ca.crt",
+	} {
+		if !strings.Contains(withCA, want) {
+			t.Errorf("TLS init script does not carry %q", want)
+		}
+	}
+
+	if noCA := tlsInitScript(t, false); strings.Contains(noCA, "--cacert") {
+		t.Errorf("no CA secret configured but the init script passes --cacert")
+	}
+
+	if plain := BuildRedisConfigMap(testSentinel()).Data["init.sh"]; strings.Contains(plain, "--tls") {
+		t.Errorf("TLS disabled but the init script passes --tls")
 	}
 }
 

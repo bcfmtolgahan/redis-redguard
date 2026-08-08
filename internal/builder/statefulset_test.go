@@ -265,7 +265,13 @@ func TestBuildRedisStatefulSet_TLSDisabled(t *testing.T) {
 	}
 }
 
-func TestBuildRedisStatefulSet_TLSEnabled(t *testing.T) {
+// TestBuildRedisStatefulSet_TLSSeparateCASecret covers the layout that used to
+// make every pod unstartable: a CA in its own Secret was subPath-mounted at
+// /etc/redis/tls/ca.crt, inside the directory the certificate volume already
+// occupies, which the kubelet refuses ("not a directory", StartError exit 128).
+// Both Secrets are projected into one volume instead, so every consumer keeps
+// the same /etc/redis/tls paths regardless of the Secret layout.
+func TestBuildRedisStatefulSet_TLSSeparateCASecret(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.TLS = &redisv1alpha1.TLSConfig{
 		Enabled:              true,
@@ -280,31 +286,43 @@ func TestBuildRedisStatefulSet_TLSEnabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("no tls-certs volume, got %v", sts.Spec.Template.Spec.Volumes)
 	}
-	if vol.Secret == nil || vol.Secret.SecretName != "redis-tls" {
-		t.Errorf("tls-certs volume secret = %+v, want secretName redis-tls", vol.Secret)
+	if vol.Projected == nil {
+		t.Fatalf("tls-certs = %+v, want a projected volume combining both Secrets", vol.VolumeSource)
 	}
 	// 0440 with fsGroup 1000: the secret files are root:1000, and the redis
 	// process (uid 1000, supplementary gid 1000) reads via the group bit.
 	// 0400 leaves the key readable by root only and TLS never comes up.
-	if vol.Secret.DefaultMode == nil || *vol.Secret.DefaultMode != 0440 {
-		t.Errorf("tls-certs defaultMode = %v, want 0440 so the non-root redis user can read the key", vol.Secret.DefaultMode)
+	if vol.Projected.DefaultMode == nil || *vol.Projected.DefaultMode != 0440 {
+		t.Errorf("tls-certs defaultMode = %v, want 0440 so the non-root redis user can read the key", vol.Projected.DefaultMode)
 	}
+	if len(vol.Projected.Sources) != 2 ||
+		vol.Projected.Sources[0].Secret == nil || vol.Projected.Sources[0].Secret.Name != "redis-tls" ||
+		vol.Projected.Sources[1].Secret == nil || vol.Projected.Sources[1].Secret.Name != "redis-ca" {
+		t.Fatalf("tls-certs sources = %+v, want the cert Secret and the CA Secret", vol.Projected.Sources)
+	}
+	// Pinned items keep a bundle Secret's own ca.crt from colliding with the
+	// CA Secret's copy, which the kubelet rejects as a duplicate path.
+	wantItems := map[int][]string{0: {"tls.crt", "tls.key"}, 1: {"ca.crt"}}
+	for i, keys := range wantItems {
+		var got []string
+		for _, item := range vol.Projected.Sources[i].Secret.Items {
+			got = append(got, item.Key)
+		}
+		if !slices.Equal(got, keys) {
+			t.Errorf("source %d projects keys %v, want %v", i, got, keys)
+		}
+	}
+
 	if !hasVolumeMount(c, "tls-certs", "/etc/redis/tls") {
 		t.Errorf("tls-certs not mounted at /etc/redis/tls: %v", c.VolumeMounts)
 	}
-
-	caVol, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-ca")
-	if !ok {
-		t.Fatalf("CASecretRef set but no tls-ca volume, got %v", sts.Spec.Template.Spec.Volumes)
+	if _, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-ca"); ok {
+		t.Error("a separate tls-ca volume exists; its subPath mount is what the kubelet refuses")
 	}
-	if caVol.Secret == nil || caVol.Secret.SecretName != "redis-ca" {
-		t.Errorf("tls-ca volume secret = %+v, want secretName redis-ca", caVol.Secret)
-	}
-	if caVol.Secret.DefaultMode == nil || *caVol.Secret.DefaultMode != 0440 {
-		t.Errorf("tls-ca defaultMode = %v, want 0440 so the non-root redis user can read it", caVol.Secret.DefaultMode)
-	}
-	if !hasVolumeMount(c, "tls-ca", "/etc/redis/tls/ca.crt") {
-		t.Errorf("tls-ca not mounted at /etc/redis/tls/ca.crt: %v", c.VolumeMounts)
+	for _, m := range c.VolumeMounts {
+		if m.SubPath != "" {
+			t.Errorf("mount %s uses subPath %q inside another volume's directory", m.Name, m.SubPath)
+		}
 	}
 
 	cmd := strings.Join(c.LivenessProbe.Exec.Command, " ")
@@ -336,8 +354,9 @@ func TestBuildRedisStatefulSet_TLSWithoutCAOmitsCacert(t *testing.T) {
 	}
 }
 
-// When the CA lives in the same Secret as the cert, no second volume is needed.
-func TestBuildRedisStatefulSet_TLSSharedCASecretHasNoSecondVolume(t *testing.T) {
+// When the CA lives in the same Secret as the cert, a plain secret volume
+// serves the whole directory and no projection is needed.
+func TestBuildRedisStatefulSet_TLSSharedCASecretMountsOneVolume(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.TLS = &redisv1alpha1.TLSConfig{
 		Enabled:              true,
@@ -346,9 +365,56 @@ func TestBuildRedisStatefulSet_TLSSharedCASecretHasNoSecondVolume(t *testing.T) 
 	}
 
 	sts := BuildRedisStatefulSet(rs)
+	c := sts.Spec.Template.Spec.Containers[0]
 
 	if _, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-ca"); ok {
 		t.Error("CA shares the cert Secret but a separate tls-ca volume was created")
+	}
+	vol, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-certs")
+	if !ok || vol.Secret == nil || vol.Secret.SecretName != "redis-tls" {
+		t.Fatalf("tls-certs = %+v, want a plain secret volume for the bundle Secret", vol.VolumeSource)
+	}
+	if vol.Secret.DefaultMode == nil || *vol.Secret.DefaultMode != 0440 {
+		t.Errorf("tls-certs defaultMode = %v, want 0440 so the non-root redis user can read the key", vol.Secret.DefaultMode)
+	}
+	if !hasVolumeMount(c, "tls-certs", "/etc/redis/tls") {
+		t.Errorf("tls-certs not mounted at /etc/redis/tls: %v", c.VolumeMounts)
+	}
+	if cmd := strings.Join(c.LivenessProbe.Exec.Command, " "); !strings.Contains(cmd, "--cacert /etc/redis/tls/ca.crt") {
+		t.Errorf("CA secret configured but probe does not pass --cacert: %q", cmd)
+	}
+}
+
+// TestStatefulSets_StartupProbeCoversInitWait: both init scripts may wait up to
+// 60s (30 attempts x 2s) for sentinels or master DNS before the server ever
+// execs, but liveness counts from container start and its 45s budget would kill
+// every such boot mid-init. The startup probe makes the liveness clock start at
+// the first successful answer instead of at container start, so the two budgets
+// no longer race; its own window must dominate the 60s init wait with room for
+// the dataset load that follows exec.
+func TestStatefulSets_StartupProbeCoversInitWait(t *testing.T) {
+	rs := testSentinel()
+
+	for name, sts := range map[string]*appsv1.StatefulSet{
+		"redis":    BuildRedisStatefulSet(rs),
+		"sentinel": BuildSentinelStatefulSet(rs),
+	} {
+		c := sts.Spec.Template.Spec.Containers[0]
+		probe := c.StartupProbe
+		if probe == nil {
+			t.Errorf("%s: no startup probe, so liveness races the init script's 60s sentinel wait", name)
+			continue
+		}
+		if probe.Exec == nil || len(probe.Exec.Command) == 0 {
+			t.Errorf("%s: startup probe has no exec command", name)
+			continue
+		}
+		if got, want := strings.Join(probe.Exec.Command, "\x00"), strings.Join(c.LivenessProbe.Exec.Command, "\x00"); got != want {
+			t.Errorf("%s: startup probe runs %q, want the liveness command %q so both assert the same thing", name, got, want)
+		}
+		if budget := probe.PeriodSeconds * probe.FailureThreshold; budget < 120 {
+			t.Errorf("%s: startup budget %ds does not dominate the init script's 60s retry loop", name, budget)
+		}
 	}
 }
 
@@ -603,11 +669,20 @@ func TestBuildSentinelStatefulSet_TLS(t *testing.T) {
 	if !hasVolumeMount(c, "tls-certs", "/etc/sentinel/tls") {
 		t.Errorf("tls-certs not mounted at /etc/sentinel/tls: %v", c.VolumeMounts)
 	}
-	if vol, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-certs"); !ok || vol.Secret.DefaultMode == nil || *vol.Secret.DefaultMode != 0440 {
-		t.Errorf("tls-certs defaultMode = %+v, want 0440 so the non-root redis user can read the key", vol.Secret)
+	vol, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-certs")
+	if !ok || vol.Projected == nil {
+		t.Fatalf("tls-certs = %+v, want a projected volume combining both Secrets", vol.VolumeSource)
 	}
-	if !hasVolumeMount(c, "tls-ca", "/etc/sentinel/tls/ca.crt") {
-		t.Errorf("tls-ca not mounted at /etc/sentinel/tls/ca.crt: %v", c.VolumeMounts)
+	if vol.Projected.DefaultMode == nil || *vol.Projected.DefaultMode != 0440 {
+		t.Errorf("tls-certs defaultMode = %v, want 0440 so the non-root redis user can read the key", vol.Projected.DefaultMode)
+	}
+	if _, ok := findVolume(sts.Spec.Template.Spec.Volumes, "tls-ca"); ok {
+		t.Error("a separate tls-ca volume exists; its subPath mount is what the kubelet refuses")
+	}
+	for _, m := range c.VolumeMounts {
+		if m.SubPath != "" {
+			t.Errorf("mount %s uses subPath %q inside another volume's directory", m.Name, m.SubPath)
+		}
 	}
 	cmd := strings.Join(c.LivenessProbe.Exec.Command, " ")
 	if !strings.Contains(cmd, "--tls") {
@@ -828,6 +903,19 @@ func TestManagedPodsMountSecretsReadableByRuntimeUser(t *testing.T) {
 				}
 				if *v.Secret.DefaultMode&0o004 != 0 {
 					t.Errorf("%s: secret volume %s mode %#o is world-readable", name, v.Name, *v.Secret.DefaultMode)
+				}
+			case v.Projected != nil:
+				if v.Projected.DefaultMode == nil {
+					t.Errorf("%s: projected volume %s has no defaultMode; 0644 leaks the key to every uid",
+						name, v.Name)
+					continue
+				}
+				if *v.Projected.DefaultMode&0o040 == 0 {
+					t.Errorf("%s: projected volume %s mode %#o is not group-readable, so uid %d cannot read it",
+						name, v.Name, *v.Projected.DefaultMode, *psc.RunAsUser)
+				}
+				if *v.Projected.DefaultMode&0o004 != 0 {
+					t.Errorf("%s: projected volume %s mode %#o is world-readable", name, v.Name, *v.Projected.DefaultMode)
 				}
 			case v.ConfigMap != nil:
 				if v.ConfigMap.DefaultMode == nil || *v.ConfigMap.DefaultMode&0o050 != 0o050 {
