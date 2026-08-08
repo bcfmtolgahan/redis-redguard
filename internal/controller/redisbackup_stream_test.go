@@ -59,11 +59,27 @@ func fakeRDBStream(payload []byte, execErr error, stderr string) podStreamFn {
 	}
 }
 
-func TestUploadStreamSmallObjectUsesSinglePut(t *testing.T) {
+// uploadAll drives an s3UploadWriter the way the exec copy does: successive
+// writes, then finish, aborting on failure like streamBackupToS3.
+func uploadAll(fakeS3 *fakeS3Store, key string, payload []byte) (int64, error) {
+	w := &s3UploadWriter{ctx: context.Background(), client: fakeS3, bucket: "corp-backups", key: key}
+	if _, err := w.Write(payload); err != nil {
+		w.abort()
+		return 0, err
+	}
+	size, err := w.finish()
+	if err != nil {
+		w.abort()
+		return 0, err
+	}
+	return size, nil
+}
+
+func TestUploadWriterSmallObjectUsesSinglePut(t *testing.T) {
 	fakeS3 := newFakeS3Store()
 	payload := []byte("REDIS0011-single-part-payload")
 
-	size, err := uploadStream(context.Background(), fakeS3, "corp-backups", "k", bytes.NewReader(payload))
+	size, err := uploadAll(fakeS3, "k", payload)
 	if err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
@@ -78,7 +94,7 @@ func TestUploadStreamSmallObjectUsesSinglePut(t *testing.T) {
 	}
 }
 
-func TestUploadStreamLargeObjectUsesMultipart(t *testing.T) {
+func TestUploadWriterLargeObjectUsesMultipart(t *testing.T) {
 	old := backupUploadPartSize
 	backupUploadPartSize = 8
 	defer func() { backupUploadPartSize = old }()
@@ -86,7 +102,7 @@ func TestUploadStreamLargeObjectUsesMultipart(t *testing.T) {
 	fakeS3 := newFakeS3Store()
 	payload := []byte("REDIS0011-a-payload-larger-than-one-part")
 
-	size, err := uploadStream(context.Background(), fakeS3, "corp-backups", "k", bytes.NewReader(payload))
+	size, err := uploadAll(fakeS3, "k", payload)
 	if err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
@@ -104,7 +120,7 @@ func TestUploadStreamLargeObjectUsesMultipart(t *testing.T) {
 	}
 }
 
-func TestUploadStreamAbortsOnPartFailure(t *testing.T) {
+func TestUploadWriterAbortsOnPartFailure(t *testing.T) {
 	old := backupUploadPartSize
 	backupUploadPartSize = 8
 	defer func() { backupUploadPartSize = old }()
@@ -112,8 +128,7 @@ func TestUploadStreamAbortsOnPartFailure(t *testing.T) {
 	fakeS3 := newFakeS3Store()
 	fakeS3.partErrs[2] = errors.New("part quota exceeded")
 
-	_, err := uploadStream(context.Background(), fakeS3, "corp-backups", "k",
-		bytes.NewReader([]byte("REDIS0011-a-payload-larger-than-one-part")))
+	_, err := uploadAll(fakeS3, "k", []byte("REDIS0011-a-payload-larger-than-one-part"))
 	if err == nil {
 		t.Fatal("a failed part must fail the upload")
 	}

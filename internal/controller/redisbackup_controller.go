@@ -392,33 +392,9 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 	// into the S3 upload: peak memory stays at one upload part regardless of
 	// dataset size, where buffering held roughly twice the dataset and OOM
 	// killed the operator on any dataset near the pod's memory limit.
-	rdbStream, err := r.openRDBStream(ctx, backupPod)
+	backupLocation, backupSize, err := r.streamBackupToS3(ctx, redisBackup, backupPod)
 	if err != nil {
-		return "", 0, nil, fmt.Errorf("failed to get RDB data: %w", err)
-	}
-	defer func() { _ = rdbStream.Close() }()
-
-	body := io.Reader(rdbStream)
-	if redisBackup.Spec.Compression {
-		gzPr, gzPw := io.Pipe()
-		go func() {
-			gz := gzip.NewWriter(gzPw)
-			_, err := io.Copy(gz, rdbStream)
-			// Close writes the gzip footer. Propagating a copy error instead
-			// keeps a truncated archive from being stored as a valid one.
-			if cerr := gz.Close(); err == nil {
-				err = cerr
-			}
-			gzPw.CloseWithError(err)
-		}()
-		// Unblocks the gzip goroutine if the upload fails mid-stream.
-		defer func() { _ = gzPr.Close() }()
-		body = gzPr
-	}
-
-	backupLocation, backupSize, err := r.uploadToS3(ctx, redisBackup, body)
-	if err != nil {
-		return "", 0, nil, fmt.Errorf("S3 upload failed: %w", err)
+		return "", 0, nil, err
 	}
 
 	return backupLocation, backupSize, keyCount, nil
@@ -656,14 +632,6 @@ func (r *RedisBackupReconciler) waitForBGSave(ctx context.Context, redisSentinel
 	}
 }
 
-// rdbStream is the validated RDB byte stream; Close releases the exec pipe.
-type rdbStream struct {
-	io.Reader
-	pr *io.PipeReader
-}
-
-func (s *rdbStream) Close() error { return s.pr.Close() }
-
 // spdyPodStream is the production podStreamFn: it execs the command over SPDY
 // and copies stdout into the writer as it arrives.
 func spdyPodStream(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, container string, command []string, stdout io.Writer) (string, error) {
@@ -702,41 +670,6 @@ func spdyPodStream(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, conta
 	return stderr.String(), err
 }
 
-// openRDBStream starts streaming /data/dump.rdb out of the pod and validates
-// the RDB magic before returning the stream, so a missing or corrupt dump is
-// refused without the file ever being held in memory.
-func (r *RedisBackupReconciler) openRDBStream(ctx context.Context, pod *corev1.Pod) (io.ReadCloser, error) {
-	streamFn := r.PodStream
-	if streamFn == nil {
-		streamFn = spdyPodStream
-	}
-
-	pr, pw := io.Pipe()
-	go func() {
-		stderr, err := streamFn(ctx, r.RESTConfig, pod, "redis", []string{"cat", "/data/dump.rdb"}, pw)
-		if err != nil && strings.TrimSpace(stderr) != "" {
-			err = fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr))
-		}
-		// A nil error closes the pipe with EOF; anything else surfaces on the
-		// reader side, failing the upload mid-stream instead of truncating it.
-		pw.CloseWithError(err)
-	}()
-
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(pr, header); err != nil {
-		_ = pr.Close()
-		if err == io.EOF {
-			return nil, fmt.Errorf("RDB file is empty or not found")
-		}
-		return nil, fmt.Errorf("failed to read RDB file: %w", err)
-	}
-	if string(header) != "REDIS" {
-		_ = pr.Close()
-		return nil, fmt.Errorf("invalid RDB file format")
-	}
-	return &rdbStream{Reader: io.MultiReader(bytes.NewReader(header), pr), pr: pr}, nil
-}
-
 // backupUploadPartSize is the buffer one in-flight upload part occupies: the
 // peak memory of a backup no longer scales with the dataset. 16MiB stays well
 // inside the operator's memory limit and puts S3's 10000-part ceiling at
@@ -744,117 +677,230 @@ func (r *RedisBackupReconciler) openRDBStream(ctx context.Context, pod *corev1.P
 // with small payloads.
 var backupUploadPartSize = 16 << 20
 
-// uploadStream uploads body to bucket/key one part at a time. An object that
-// fits one buffer goes through a single PutObject; larger ones use a
-// multipart upload that is aborted on failure, because unaborted parts are
-// invisible in listings and accrue storage charges forever.
-func uploadStream(ctx context.Context, s3Client s3API, bucket, key string, body io.Reader) (int64, error) {
-	buf := make([]byte, backupUploadPartSize)
-	n, err := io.ReadFull(body, buf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		_, perr := s3Client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-			Body:   bytes.NewReader(buf[:n]),
-		})
-		if perr != nil {
-			return 0, perr
-		}
-		return int64(n), nil
-	}
-	if err != nil {
-		return 0, err
-	}
-
-	create, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return 0, err
-	}
-	abort := func() {
-		_, _ = s3Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(bucket),
-			Key:      aws.String(key),
-			UploadId: create.UploadId,
-		})
-	}
-
-	var completed []s3types.CompletedPart
-	var total int64
-	partNumber := int32(0)
-	for {
-		partNumber++
-		part, perr := s3Client.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:        aws.String(bucket),
-			Key:           aws.String(key),
-			UploadId:      create.UploadId,
-			PartNumber:    aws.Int32(partNumber),
-			Body:          bytes.NewReader(buf[:n]),
-			ContentLength: aws.Int64(int64(n)),
-		})
-		if perr != nil {
-			abort()
-			return 0, perr
-		}
-		completed = append(completed, s3types.CompletedPart{
-			ETag:       part.ETag,
-			PartNumber: aws.Int32(partNumber),
-		})
-		total += int64(n)
-
-		n, err = io.ReadFull(body, buf)
-		if n == 0 {
-			if err == io.EOF {
-				break
-			}
-			abort()
-			return 0, err
-		}
-		if err != nil && err != io.ErrUnexpectedEOF {
-			abort()
-			return 0, err
-		}
-	}
-
-	if _, err := s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:          aws.String(bucket),
-		Key:             aws.String(key),
-		UploadId:        create.UploadId,
-		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completed},
-	}); err != nil {
-		abort()
-		return 0, err
-	}
-	return total, nil
+// rdbHeaderWriter passes writes through after checking the stream starts with
+// the RDB magic. The first five bytes are held back until the check passes,
+// so a corrupt dump is refused before a single byte reaches the upload; the
+// refusal error aborts the exec copy mid-stream.
+type rdbHeaderWriter struct {
+	dst      io.Writer
+	header   [5]byte
+	filled   int
+	total    int64
+	rejected bool
 }
 
-func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, body io.Reader) (string, int64, error) {
-	// Create S3 client
+func (w *rdbHeaderWriter) Write(p []byte) (int, error) {
+	written := len(p)
+	w.total += int64(len(p))
+	if w.filled < len(w.header) {
+		n := copy(w.header[w.filled:], p)
+		w.filled += n
+		p = p[n:]
+		if w.filled < len(w.header) {
+			return written, nil
+		}
+		if string(w.header[:]) != "REDIS" {
+			w.rejected = true
+			return 0, fmt.Errorf("invalid RDB file format")
+		}
+		if _, err := w.dst.Write(w.header[:]); err != nil {
+			return 0, err
+		}
+	}
+	if len(p) > 0 {
+		if _, err := w.dst.Write(p); err != nil {
+			return 0, err
+		}
+	}
+	return written, nil
+}
+
+// s3UploadWriter uploads whatever is written to it one part at a time: an
+// object that fits one buffer becomes a single PutObject on finish, anything
+// larger a multipart upload. The first S3 failure is kept in err so the
+// caller can tell an upload failure from an exec one, and abort discards a
+// started multipart upload, whose parts are otherwise invisible in listings
+// and accrue storage charges forever.
+type s3UploadWriter struct {
+	ctx      context.Context
+	client   s3API
+	bucket   string
+	key      string
+	buf      []byte
+	uploadID *string
+	parts    []s3types.CompletedPart
+	total    int64
+	err      error
+}
+
+func (w *s3UploadWriter) Write(p []byte) (int, error) {
+	written := len(p)
+	for len(p) > 0 {
+		if w.buf == nil {
+			w.buf = make([]byte, 0, backupUploadPartSize)
+		}
+		n := backupUploadPartSize - len(w.buf)
+		if n > len(p) {
+			n = len(p)
+		}
+		w.buf = append(w.buf, p[:n]...)
+		p = p[n:]
+		if len(w.buf) == backupUploadPartSize {
+			if err := w.flushPart(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return written, nil
+}
+
+func (w *s3UploadWriter) flushPart() error {
+	if w.uploadID == nil {
+		create, err := w.client.CreateMultipartUpload(w.ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(w.bucket),
+			Key:    aws.String(w.key),
+		})
+		if err != nil {
+			w.err = err
+			return err
+		}
+		w.uploadID = create.UploadId
+	}
+	partNumber := int32(len(w.parts) + 1)
+	part, err := w.client.UploadPart(w.ctx, &s3.UploadPartInput{
+		Bucket:        aws.String(w.bucket),
+		Key:           aws.String(w.key),
+		UploadId:      w.uploadID,
+		PartNumber:    aws.Int32(partNumber),
+		Body:          bytes.NewReader(w.buf),
+		ContentLength: aws.Int64(int64(len(w.buf))),
+	})
+	if err != nil {
+		w.err = err
+		return err
+	}
+	w.parts = append(w.parts, s3types.CompletedPart{
+		ETag:       part.ETag,
+		PartNumber: aws.Int32(partNumber),
+	})
+	w.total += int64(len(w.buf))
+	w.buf = w.buf[:0]
+	return nil
+}
+
+// finish stores what was written and returns the object's size. The caller
+// must abort on error.
+func (w *s3UploadWriter) finish() (int64, error) {
+	if w.uploadID == nil {
+		if _, err := w.client.PutObject(w.ctx, &s3.PutObjectInput{
+			Bucket: aws.String(w.bucket),
+			Key:    aws.String(w.key),
+			Body:   bytes.NewReader(w.buf),
+		}); err != nil {
+			w.err = err
+			return 0, err
+		}
+		return int64(len(w.buf)), nil
+	}
+	if len(w.buf) > 0 {
+		if err := w.flushPart(); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := w.client.CompleteMultipartUpload(w.ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(w.bucket),
+		Key:             aws.String(w.key),
+		UploadId:        w.uploadID,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: w.parts},
+	}); err != nil {
+		w.err = err
+		return 0, err
+	}
+	return w.total, nil
+}
+
+func (w *s3UploadWriter) abort() {
+	if w.uploadID == nil {
+		return
+	}
+	_, _ = w.client.AbortMultipartUpload(w.ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(w.bucket),
+		Key:      aws.String(w.key),
+		UploadId: w.uploadID,
+	})
+	w.uploadID = nil
+}
+
+// streamBackupToS3 execs the RDB out of the pod directly into the upload:
+// the exec pushes into header validation, optional gzip and the part-sized
+// upload buffer, all inside this call, so no goroutine and no whole-file
+// buffer is involved.
+func (r *RedisBackupReconciler) streamBackupToS3(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, pod *corev1.Pod) (string, int64, error) {
 	s3Client, err := r.s3ClientFor(ctx, redisBackup)
 	if err != nil {
 		return "", 0, err
 	}
-
 	prefix, err := backupObjectPrefix(redisBackup)
 	if err != nil {
 		return "", 0, err
 	}
-
-	timestamp := time.Now().Format("20060102-150405")
-	key := prefix + fmt.Sprintf("backup-%s.rdb", timestamp)
+	key := prefix + fmt.Sprintf("backup-%s.rdb", time.Now().Format("20060102-150405"))
 	if redisBackup.Spec.Compression {
 		key += ".gz"
 	}
 
-	size, err := uploadStream(ctx, s3Client, redisBackup.Spec.S3.Bucket, key, body)
+	upload := &s3UploadWriter{ctx: ctx, client: s3Client, bucket: redisBackup.Spec.S3.Bucket, key: key}
+	sink := io.Writer(upload)
+	var gz *gzip.Writer
+	if redisBackup.Spec.Compression {
+		gz = gzip.NewWriter(upload)
+		sink = gz
+	}
+	validated := &rdbHeaderWriter{dst: sink}
+
+	streamFn := r.PodStream
+	if streamFn == nil {
+		streamFn = spdyPodStream
+	}
+	stderr, err := streamFn(ctx, r.RESTConfig, pod, "redis", []string{"cat", "/data/dump.rdb"}, validated)
 	if err != nil {
-		return "", 0, err
+		upload.abort()
+		switch {
+		case validated.rejected:
+			return "", 0, fmt.Errorf("invalid RDB file format")
+		case upload.err != nil:
+			return "", 0, fmt.Errorf("S3 upload failed: %w", upload.err)
+		case strings.TrimSpace(stderr) != "":
+			return "", 0, fmt.Errorf("failed to read RDB file: %w (stderr: %s)", err, strings.TrimSpace(stderr))
+		}
+		return "", 0, fmt.Errorf("failed to read RDB file: %w", err)
+	}
+	if validated.total == 0 {
+		upload.abort()
+		return "", 0, fmt.Errorf("RDB file is empty or not found")
+	}
+	if validated.filled < 5 {
+		upload.abort()
+		return "", 0, fmt.Errorf("invalid RDB file format")
+	}
+	if gz != nil {
+		// Close writes the gzip footer; without it the stored archive is one
+		// no reader, including the restore path, can decompress.
+		if err := gz.Close(); err != nil {
+			upload.abort()
+			if upload.err != nil {
+				return "", 0, fmt.Errorf("S3 upload failed: %w", upload.err)
+			}
+			return "", 0, fmt.Errorf("compression failed: %w", err)
+		}
+	}
+	size, err := upload.finish()
+	if err != nil {
+		upload.abort()
+		return "", 0, fmt.Errorf("S3 upload failed: %w", err)
 	}
 
-	location := fmt.Sprintf("s3://%s/%s", redisBackup.Spec.S3.Bucket, key)
-	return location, size, nil
+	return fmt.Sprintf("s3://%s/%s", redisBackup.Spec.S3.Bucket, key), size, nil
 }
 
 func (r *RedisBackupReconciler) createS3Client(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (*s3.Client, error) {

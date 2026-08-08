@@ -31,10 +31,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -457,7 +459,11 @@ func TestUploadKeyIsNamespaceAndClusterScoped(t *testing.T) {
 	fakeS3 := newFakeS3Store()
 	r := backupReconcilerWithS3(fakeS3)
 
-	location, _, err := r.uploadToS3(context.Background(), backup, strings.NewReader("REDIS0011-not-really"))
+	r.PodStream = func(_ context.Context, _ *rest.Config, _ *corev1.Pod, _ string, _ []string, stdout io.Writer) (string, error) {
+		_, err := stdout.Write([]byte("REDIS0011-not-really"))
+		return "", err
+	}
+	location, _, err := r.streamBackupToS3(context.Background(), backup, &corev1.Pod{})
 	if err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
