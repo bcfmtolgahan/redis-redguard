@@ -138,6 +138,19 @@ A 0.2.1 user will hit all of these.
 - Documentation: the `redis.redguard.io/redis-name` selector, the metrics
   Service name, the plain-HTTP metrics instructions and the `clientCertRequired`
   and `podAntiAffinity` fields never existed.
+- The published chart repository indexed 0.2.1 only, so the documented
+  `--version 0.3.0` could not resolve and an unpinned install silently got the
+  version that cannot start. 0.2.1 is now deprecated in the index and its
+  tarball withdrawn; the release workflow publishes each tag's chart and then
+  fails the release if the repository does not serve it.
+- The documented upgrade order ran `helm upgrade` before the CRD apply. 0.2.1
+  shipped no `redisrestores` CRD and the manager registers that controller
+  unconditionally, so the new manager blocked on cache sync for about two
+  minutes and exited, taking all four controllers down until the CRDs were
+  applied.
+- `docs/security.md` claimed `--watch-namespace` shrinks the operator's RBAC.
+  It scopes the informer caches; the chart emits a ClusterRole either way, and
+  isolation between tenants is one operator install per tenant.
 
 ### Known limitations
 
@@ -161,7 +174,8 @@ A 0.2.1 user will hit all of these.
 
 Chart packaging only, published to the Helm repository. The operator it installs
 cannot start: the chart contained no ClusterRole for the manager, so every
-reconcile failed with `Forbidden`. Do not install this version.
+reconcile failed with `Forbidden`. Deprecated as of 0.3.0 and its tarball
+withdrawn from the repository, so `--version 0.2.1` fails on the download.
 
 ## [0.2.0] - 2026-01-09
 

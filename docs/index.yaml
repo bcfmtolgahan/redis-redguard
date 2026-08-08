@@ -4,7 +4,10 @@ entries:
   - apiVersion: v2
     appVersion: 0.2.1
     created: "2026-01-14T11:47:34.448899+03:00"
-    description: A Kubernetes operator for Redis with Sentinel for high availability
+    deprecated: true
+    description: 'DEPRECATED and withdrawn: this version cannot start, because its
+      chart never granted the operator the RBAC its controllers need. Install 0.3.0
+      or later.'
     digest: 18a70f5fca32655a6a57481039bb9691b47d90d5b0b08afe79420229af7d0bee
     home: https://github.com/bcfmtolgahan/redis-redguard
     keywords:

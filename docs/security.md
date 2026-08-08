@@ -184,16 +184,39 @@ equivalent to a shell in any Redis pod the operator manages. `secrets` is read
 across every watched namespace, because the auth password, the TLS certificates
 and the S3 credentials are user-created and carry no operator label.
 
-Both shrink with `--watch-namespace`, which is the main reason to set it:
+Neither shrinks with `--watch-namespace`. The chart emits a ClusterRole and a
+ClusterRoleBinding whatever the value is; the flag scopes the manager's
+informer caches, so the operator lists, watches and reconciles only the named
+namespaces, but its ServiceAccount still holds `secrets` and `pods/exec`
+everywhere. Anyone who can exec into the operator pod, or read its
+ServiceAccount token, reaches every namespace in the cluster.
+
+So isolation is per install, not per namespace. To keep one tenant's operator
+away from another tenant's Secrets, run one release per tenant:
 
 ```sh
-helm upgrade --install redguard redguard/redguard -n redguard-system \
-  --set 'operator.watchNamespaces={team-a,team-b}'
+helm install redguard-team-a redguard/redguard \
+  --namespace redguard-team-a --create-namespace \
+  --set 'operator.watchNamespaces={team-a}'
 ```
+
+Each release gets its own ServiceAccount and its own name-prefixed ClusterRole,
+and reconciles only its tenant's namespaces. Give each one a namespace of its
+own: the leader-election lease name is fixed, so two releases sharing a
+namespace would elect against each other and only one would run.
+
+This bounds what an operator *does*, not what its token *could* do: every one
+of those ClusterRoles is still cluster-wide.
+
+Narrowing the permission itself means binding the generated ClusterRole with a
+RoleBinding in each watched namespace instead of a ClusterRoleBinding. The
+chart does not do this, and `rbac.create=false` drops every RBAC object it
+renders, so all of them become yours to write.
 
 Leader election adds a namespaced Role for `configmaps`, `leases` and `events`
 in the operator's own namespace. Metrics authentication adds a ClusterRole for
-creating `tokenreviews` and `subjectaccessreviews`.
+creating `tokenreviews` and `subjectaccessreviews`; those are cluster-scoped
+resources, so that one cannot be narrowed to a namespace at all.
 
 ## Pod Security
 

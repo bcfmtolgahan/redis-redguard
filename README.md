@@ -52,8 +52,16 @@ helm install redguard redguard/redguard \
   --wait
 ```
 
-Pin `--version`. 0.3.0 is the first release that starts; 0.2.1 is published but
-its chart never granted the operator the RBAC it needs.
+Pin `--version`. 0.3.0 is the first release that starts; 0.2.1 is deprecated in
+the index and its tarball withdrawn, because its chart never granted the
+operator the RBAC it needs.
+
+The repository is GitHub Pages serving `docs/`, and the release workflow
+publishes into it from a `v*` tag, so a version resolves only once its tag is
+released. `helm repo update` first if `--version` reports `no chart version
+found`. Upgrades of an existing install need the CRDs applied before
+`helm upgrade`; the ordering and what breaks without it are in
+[docs/install.md](docs/install.md#upgrade).
 
 With plain manifests:
 

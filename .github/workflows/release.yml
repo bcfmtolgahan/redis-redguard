@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# Publishing is not idempotent: two runs would race the image push and the
+# index commit. Never cancel one in flight — a half-published release leaves an
+# image without a chart entry.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   IMAGE: ghcr.io/bcfmtolgahan/redguard
   PAGES_URL: https://bcfmtolgahan.github.io/redis-redguard
@@ -24,6 +31,11 @@ jobs:
       - name: Clone the code
         uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: Install Helm
         uses: azure/setup-helm@v4
 
@@ -34,6 +46,11 @@ jobs:
             echo "::error::Chart version $chart does not match tag ${GITHUB_REF_NAME}."
             exit 1
           fi
+
+      # A tag can point at any commit, including one no branch run ever tested,
+      # and the chart is generated from config/ rather than written by hand.
+      - name: Run the tests, the linter and the chart drift gate
+        run: make test lint verify-chart
 
   image:
     name: Push the multi-arch image
@@ -146,10 +163,29 @@ jobs:
 
       - name: Rebuild the repository index
         run: |
+          cp pages/docs/index.yaml "${RUNNER_TEMP}/index-before.yaml"
           cp "${RUNNER_TEMP}"/chart/*.tgz pages/docs/
           # --merge keeps the entries of charts published earlier, whose .tgz
           # files are not necessarily still in the directory.
-          helm repo index pages/docs --url "${PAGES_URL}" --merge pages/docs/index.yaml
+          helm repo index pages/docs --url "${PAGES_URL}" --merge "${RUNNER_TEMP}/index-before.yaml"
+
+      - name: Check the index before committing it
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "redguard-${version}.tgz" pages/docs/index.yaml; then
+            echo "::error::The rebuilt index has no entry for redguard ${version}."
+            exit 1
+          fi
+          # 'helm repo index' regenerates an entry for every .tgz in the
+          # directory from that tarball's own Chart.yaml, and --merge only
+          # re-adds entries it did not regenerate. A withdrawn version keeps
+          # its deprecation only while its tarball stays out of docs/.
+          before="$(grep -c '^ *deprecated: true' "${RUNNER_TEMP}/index-before.yaml" || true)"
+          after="$(grep -c '^ *deprecated: true' pages/docs/index.yaml || true)"
+          if [ "$after" -lt "$before" ]; then
+            echo "::error::The rebuild dropped a deprecation marker ($before -> $after). A withdrawn chart's .tgz is back in docs/."
+            exit 1
+          fi
 
       - name: Commit the index
         working-directory: pages
@@ -163,3 +199,31 @@ jobs:
           fi
           git commit -m "chore: publish chart ${GITHUB_REF_NAME}"
           git push origin HEAD:main
+
+  # The install command in README.md and docs/install.md is only true once Pages
+  # serves the new index, which it rebuilds asynchronously after the commit
+  # above. Run that command against the real repository and fail the release if
+  # it does not resolve.
+  installable:
+    name: Install the published chart
+    needs: chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Pull the tag's chart from the chart repository
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          helm repo add redguard "${PAGES_URL}"
+          for attempt in $(seq 1 40); do
+            helm repo update redguard >/dev/null
+            if helm pull redguard/redguard --version "$version" -d "${RUNNER_TEMP}/pull"; then
+              echo "${PAGES_URL} serves redguard ${version}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: not published yet"
+            sleep 15
+          done
+          echo "::error::${PAGES_URL} does not serve redguard ${version}, but the docs tell users to install it from there."
+          exit 1
