@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -43,18 +42,24 @@ const (
 	// The operator image is built from this working tree and side-loaded into
 	// kind, so the chart must never try to pull it.
 	imageRepository = "redguard"
-	imageTag        = "e2e"
 )
 
-var projectImage = imageRepository + ":" + imageTag
+// imageTag is the cluster name, which is unique to this run. A shared tag
+// would let a second suite rebuild the image between this one's build and its
+// load into kind, so the cluster would come up on someone else's binary.
+var (
+	imageTag     string
+	projectImage string
+)
 
-// kindCluster and kindBinary follow the Makefile, which passes both through the
-// environment.
+// releaseKubeconfig removes the credentials this run copied out of kind.
+var releaseKubeconfig = func() {}
+
+// kindCluster is the cluster the Makefile created for this run. There is no
+// default: kind's own default is the cluster named "kind", and reaching for it
+// would mean operating on a cluster nobody asked for.
 func kindCluster() string {
-	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok && v != "" {
-		return v
-	}
-	return "kind"
+	return os.Getenv("KIND_CLUSTER")
 }
 
 func kindBinary() string {
@@ -64,25 +69,13 @@ func kindBinary() string {
 	return "kind"
 }
 
-// pinKubeconfig exports the kind cluster's credentials to a file only this
-// process reads, and points every command the suite spawns at it. Child
-// processes inherit the environment, so this covers kubectl and helm alike.
-func pinKubeconfig() error {
-	cluster := kindCluster()
-	out, err := run(kindBinary(), "get", "kubeconfig", "--name", cluster)
-	if err != nil {
-		return fmt.Errorf("read kubeconfig for kind cluster %s: %w", cluster, err)
+// containerTool has to match the one `make docker-build` used, or the image
+// this run built would be removed from the wrong store, or not at all.
+func containerTool() string {
+	if v, ok := os.LookupEnv("CONTAINER_TOOL"); ok && v != "" {
+		return v
 	}
-
-	dir, err := os.MkdirTemp("", "redguard-e2e-kubeconfig")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(dir, "config")
-	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
-		return err
-	}
-	return os.Setenv("KUBECONFIG", path)
+	return "docker"
 }
 
 // TestE2E runs the end-to-end suite against a live cluster. It requires a kind
@@ -99,21 +92,33 @@ func TestE2E(t *testing.T) {
 // exercises the generated RBAC; a kustomize install would test a different set
 // of permissions than the one users get.
 var _ = BeforeSuite(func() {
-	// Every kubectl and helm invocation resolves the current context afresh
-	// from the shared kubeconfig, and this suite deletes namespaces and
-	// cluster-scoped RBAC. Anything that switches contexts while it runs -- a
-	// second kind cluster being created, a person running kubectl -- would aim
-	// those deletes at whatever cluster is current at that moment. Pinning a
-	// kubeconfig of its own makes the target independent of that file.
-	By("pinning the suite to the kind cluster's own kubeconfig")
-	Expect(pinKubeconfig()).To(Succeed())
+	// kubectl and helm resolve the current context afresh on every call, and
+	// this suite deletes namespaces and cluster-scoped RBAC. Anything that
+	// switches contexts while it runs -- a second kind cluster being created,
+	// a person running kubectl -- would aim those deletes at whatever cluster
+	// is current at that moment. Copying the credentials into a file of this
+	// run's own and naming it on every command line removes that coupling.
+	By("pinning the suite to the kind cluster this run was given")
+	cluster := kindCluster()
+	Expect(cluster).NotTo(BeEmpty(),
+		"KIND_CLUSTER is unset; run the suite through 'make test-e2e', which creates a cluster for it")
+
+	var err error
+	activeCluster, releaseKubeconfig, err = utils.NewKindCluster(kindBinary(), cluster)
+	Expect(err).NotTo(HaveOccurred(), "failed to pin the kind cluster's kubeconfig")
+
+	By("confirming the pinned kubeconfig reaches that kind cluster and no other")
+	Expect(activeCluster.VerifyLive()).To(Succeed())
+
+	imageTag = cluster
+	projectImage = imageRepository + ":" + imageTag
 
 	By("building the operator image")
-	_, err := utils.Run(exec.Command("make", "docker-build", "IMG="+projectImage))
+	_, err = utils.Run(exec.Command("make", "docker-build", "IMG="+projectImage))
 	Expect(err).NotTo(HaveOccurred(), "failed to build the operator image")
 
 	By("loading the operator image into the kind cluster")
-	Expect(utils.LoadImageToKindClusterWithName(projectImage)).To(Succeed(),
+	Expect(utils.LoadImageToKindCluster(kindBinary(), cluster, projectImage)).To(Succeed(),
 		"failed to load the operator image into kind")
 
 	// Enforcement is turned on before anything is installed, so the API server
@@ -139,13 +144,9 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	// The pinned kubeconfig holds cluster credentials; it outlives the suite
-	// otherwise, since it sits in a temp directory of its own.
-	defer func() {
-		if path := os.Getenv("KUBECONFIG"); filepath.Base(path) == "config" {
-			_ = os.RemoveAll(filepath.Dir(path))
-		}
-	}()
+	// The pinned kubeconfig holds cluster credentials and would otherwise
+	// outlive the run.
+	defer releaseKubeconfig()
 
 	By("uninstalling the chart")
 	if _, err := run("helm", "uninstall", helmRelease, "--namespace", operatorNamespace, "--wait"); err != nil {
@@ -162,5 +163,13 @@ var _ = AfterSuite(func() {
 	By("clearing the Pod Security labels from the cluster namespace")
 	if err := clearPodSecurityLabels(clusterNamespace); err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "namespace unlabel failed: %v\n", err)
+	}
+
+	// The tag is unique per run, so nothing would ever overwrite it.
+	By("removing the operator image this run built")
+	if projectImage != "" {
+		if _, err := run(containerTool(), "image", "rm", "-f", projectImage); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "image removal failed: %v\n", err)
+		}
 	}
 })

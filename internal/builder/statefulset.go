@@ -40,11 +40,9 @@ const (
 	TLSSecretVersionAnnotation = "redis.redguard.io/tls-secret-version"
 )
 
-// configHash fingerprints rendered configuration files. A .conf value is
-// hashed as a sorted multiset of lines: the renderer walks customConfig as a Go
-// map, so an unchanged spec renders the same directives in a different order on
-// every call, and hashing the bytes verbatim would restart every pod on an
-// arbitrary reconcile. Everything else, scripts included, is hashed verbatim
+// configHash fingerprints rendered configuration files. A .conf value is hashed
+// as a sorted multiset of lines, so reordering directives without changing them
+// cannot roll the pods. Everything else, scripts included, is hashed verbatim
 // because there line order is meaning.
 func configHash(data map[string]string) string {
 	h := sha256.New()

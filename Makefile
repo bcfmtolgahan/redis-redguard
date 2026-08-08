@@ -57,20 +57,54 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# The controller envtest suite drives real failover and scaling timings and runs
+# past go test's 10m default, which would fail the run on the deadline alone.
+UNIT_TIMEOUT ?= 30m
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -timeout $(UNIT_TIMEOUT) -coverprofile cover.out
 
 # The e2e suite builds the operator image, side-loads it into kind and installs
 # the chart from charts/redguard, which is the path a user follows.
-KIND_CLUSTER ?= redguard-test-e2e
+#
+# Every run gets a cluster name of its own, so two suites running at once cannot
+# share a cluster or delete each other's. Passing KIND_CLUSTER reuses a named
+# cluster; cleanup then refuses to delete it, because this run did not make it.
+# The name is fixed per make invocation, so run the suite as `make test-e2e`:
+# `make setup-test-e2e` on its own creates a cluster no later run will reuse.
+ifndef E2E_RUN_ID
+E2E_RUN_ID := $(shell od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+endif
+KIND_CLUSTER ?= redguard-e2e-$(E2E_RUN_ID)
+
+# The kubeconfig the developer's own kubectl reads. The e2e path must leave it
+# byte for byte alone: an earlier revision switched its current context as a
+# side effect, which aimed a mid-suite `helm uninstall` at a live cluster.
+E2E_SHARED_KUBECONFIG := $(if $(KUBECONFIG),$(firstword $(subst :, ,$(KUBECONFIG))),$(HOME)/.kube/config)
+
+# LOCALBIN is defined further down, so these stay recursively expanded.
+E2E_RUN_DIR = $(LOCALBIN)/e2e/$(KIND_CLUSTER)
+# kind writes the shared kubeconfig and switches the current context unless it
+# is handed a file of its own. Nothing in the e2e path may touch ~/.kube/config.
+E2E_KUBECONFIG = $(E2E_RUN_DIR)/kubeconfig
+# Written only when this run created the cluster. cleanup-test-e2e refuses
+# without it, so a cluster belonging to someone else survives a stray cleanup.
+E2E_OWNED = $(E2E_RUN_DIR)/created-by-this-run
+# The suite names its own kubeconfig on every kubectl and helm command line.
+# This is what the environment holds meanwhile: a context that resolves to
+# nothing, so a call that escaped the pin fails instead of reaching a cluster.
+E2E_DECOY_KUBECONFIG = $(E2E_RUN_DIR)/decoy-kubeconfig
+# Digest of the shared kubeconfig taken before the cluster is created and
+# compared after, so a target that writes it is caught in the run that did it.
+E2E_SHARED_DIGEST = $(E2E_RUN_DIR)/shared-kubeconfig.cksum
 
 # Booting a Redis cluster and forcing a failover takes longer than the 10m
 # default go test deadline, which would kill the run mid-suite.
 E2E_TIMEOUT ?= 45m
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+setup-test-e2e: ## Create a Kind cluster for the e2e suite, reachable only through its own kubeconfig
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "kind is not installed. Install it before running the e2e suite."; \
 		exit 1; \
@@ -79,28 +113,69 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 		echo "$(CONTAINER_TOOL) is not running; the suite has to build the operator image."; \
 		exit 1; \
 	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
-	esac
-	@# The suite deletes namespaces and cluster-scoped RBAC. Pinning the context
-	@# keeps it from doing that to whichever cluster happens to be current.
-	$(KUBECTL) config use-context kind-$(KIND_CLUSTER)
-	$(KUBECTL) wait --for=condition=Ready node --all --timeout=300s
+	@mkdir -p "$(E2E_RUN_DIR)"
+	@if [ -f "$(E2E_SHARED_KUBECONFIG)" ]; then \
+		cksum < "$(E2E_SHARED_KUBECONFIG)" > "$(E2E_SHARED_DIGEST)"; \
+	else \
+		echo absent > "$(E2E_SHARED_DIGEST)"; \
+	fi
+	@if $(KIND) get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \
+		echo "Kind cluster '$(KIND_CLUSTER)' already exists and was not created by this run."; \
+		rm -f "$(E2E_OWNED)"; \
+	else \
+		echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
+		$(KIND) create cluster --name "$(KIND_CLUSTER)" --kubeconfig "$(E2E_KUBECONFIG)"; \
+		echo "$(KIND_CLUSTER)" > "$(E2E_OWNED)"; \
+	fi
+	@$(KIND) get kubeconfig --name "$(KIND_CLUSTER)" > "$(E2E_KUBECONFIG)"
+	@chmod 600 "$(E2E_KUBECONFIG)"
+	@printf '%s\n' 'apiVersion: v1' 'kind: Config' \
+		'current-context: redguard-e2e-decoy-never-use-this' \
+		'clusters: []' 'contexts: []' 'users: []' > "$(E2E_DECOY_KUBECONFIG)"
+	@KUBECONFIG="$(E2E_KUBECONFIG)" $(KUBECTL) --context "kind-$(KIND_CLUSTER)" \
+		wait --for=condition=Ready node --all --timeout=300s
+	@if [ -f "$(E2E_SHARED_KUBECONFIG)" ]; then \
+		after=$$(cksum < "$(E2E_SHARED_KUBECONFIG)"); \
+	else \
+		after=absent; \
+	fi; \
+	if [ "$$after" != "$$(cat "$(E2E_SHARED_DIGEST)")" ]; then \
+		echo "setup-test-e2e wrote $(E2E_SHARED_KUBECONFIG); the e2e path must never touch the shared kubeconfig."; \
+		exit 1; \
+	fi
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests against a Kind cluster of this run's own
 	@status=0; \
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -timeout $(E2E_TIMEOUT) -ginkgo.v || status=$$?; \
-	$(MAKE) cleanup-test-e2e; \
+	KUBECONFIG="$(E2E_DECOY_KUBECONFIG)" KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
+	CONTAINER_TOOL=$(CONTAINER_TOOL) \
+		go test -tags=e2e ./test/e2e/ -v -timeout $(E2E_TIMEOUT) -ginkgo.v || status=$$?; \
+	if [ -f "$(E2E_OWNED)" ]; then \
+		$(MAKE) cleanup-test-e2e KIND_CLUSTER=$(KIND_CLUSTER) || { [ $$status -ne 0 ] || status=1; }; \
+	else \
+		echo "Keeping kind cluster '$(KIND_CLUSTER)': this run did not create it."; \
+	fi; \
 	exit $$status
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+cleanup-test-e2e: ## Tear down the Kind cluster this run created, and only that one
+	@if [ ! -f "$(E2E_OWNED)" ]; then \
+		echo "Refusing to delete kind cluster '$(KIND_CLUSTER)': this run did not create it."; \
+		exit 1; \
+	fi
+	@owner=$$(cat "$(E2E_OWNED)"); \
+	if [ "$$owner" != "$(KIND_CLUSTER)" ]; then \
+		echo "Refusing to delete kind cluster '$(KIND_CLUSTER)': the marker names '$$owner'."; \
+		exit 1; \
+	fi
+	@before=$$(if [ -f "$(E2E_SHARED_KUBECONFIG)" ]; then cksum < "$(E2E_SHARED_KUBECONFIG)"; else echo absent; fi); \
+	$(KIND) delete cluster --name "$(KIND_CLUSTER)" --kubeconfig "$(E2E_KUBECONFIG)" || exit $$?; \
+	after=$$(if [ -f "$(E2E_SHARED_KUBECONFIG)" ]; then cksum < "$(E2E_SHARED_KUBECONFIG)"; else echo absent; fi); \
+	if [ "$$before" != "$$after" ]; then \
+		echo "cleanup-test-e2e wrote $(E2E_SHARED_KUBECONFIG); teardown must never touch the shared kubeconfig."; \
+		exit 1; \
+	fi
+	@rm -rf "$(E2E_RUN_DIR)"
 
 # Chart files written by hack/sync-chart.sh. Anything else under charts/ is
 # hand-maintained and is not part of the drift gate.

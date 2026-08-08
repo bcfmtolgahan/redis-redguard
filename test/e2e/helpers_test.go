@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -32,11 +33,45 @@ import (
 	"github.com/redguard/redguard/test/utils"
 )
 
+// activeCluster is the kind cluster every kubectl and helm invocation in this
+// suite is aimed at. BeforeSuite is the only place that assigns it, apart from
+// the isolation specs, which substitute an impostor to prove the guard bites.
+var activeCluster utils.Cluster
+
+// guardViolation ends the run when a command would reach a cluster this run did
+// not create. Cleanup nodes discard the error returned by their commands, so a
+// refusal that only returned an error would be silent; this writes to stderr
+// and fails the suite. The isolation specs replace it to observe a refusal.
+var guardViolation = func(name string, args []string, err error) {
+	msg := fmt.Sprintf("refusing to run %q: %v", name+" "+strings.Join(args, " "), err)
+	_, _ = fmt.Fprintln(os.Stderr, "e2e cluster guard: "+msg)
+	Fail(msg, 1)
+}
+
 // run executes a command from the project root and returns stdout only.
 // stderr is folded into the error instead of the result: kubectl writes
 // warnings there, and a warning mixed into a JSON document breaks parsing.
+//
+// Anything that talks to an API server is rewritten to carry this run's
+// kubeconfig and context, so neither the ambient KUBECONFIG nor whichever
+// context the shared kubeconfig happens to select can redirect it.
 func run(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
+
+	if utils.IsClusterCommand(name, args) {
+		if err := activeCluster.Verify(); err != nil {
+			guardViolation(name, args, err)
+			return "", err
+		}
+		if utils.IsMutating(name, args) {
+			if err := activeCluster.VerifyLive(); err != nil {
+				guardViolation(name, args, err)
+				return "", err
+			}
+		}
+		cmd = activeCluster.Command(name, args...)
+	}
+
 	if dir, err := utils.GetProjectDir(); err == nil {
 		cmd.Dir = dir
 	}

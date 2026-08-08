@@ -27,28 +27,34 @@ import (
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
 
-const (
-	certmanagerVersion = "v1.19.1"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
-
-	defaultKindBinary  = "kind"
-	defaultKindCluster = "kind"
-)
-
-func warnError(err error) {
-	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
-}
-
-// Run executes the provided command within this context
+// Run executes cmd from the project root. An environment already set on cmd is
+// kept: a command built by Cluster.Command carries the pinned KUBECONFIG there,
+// and replacing it would hand the command back to the ambient environment.
+//
+// A kubectl or helm invocation that was not built by Cluster.Command is
+// refused rather than executed: it would resolve its target from the ambient
+// environment, which is how a run reaches a cluster it did not create.
 func Run(cmd *exec.Cmd) (string, error) {
-	dir, _ := GetProjectDir()
-	cmd.Dir = dir
-
-	if err := os.Chdir(cmd.Dir); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %q\n", err)
+	if len(cmd.Args) > 0 {
+		if err := requirePinned(cmd.Args[0], cmd.Args[1:]); err != nil {
+			return "", err
+		}
 	}
 
-	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	if cmd.Dir == "" {
+		dir, err := GetProjectDir()
+		if err != nil {
+			return "", err
+		}
+		cmd.Dir = dir
+	}
+
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	cmd.Env = append(env, "GO111MODULE=on")
+
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
 	output, err := cmd.CombinedOutput()
@@ -59,93 +65,34 @@ func Run(cmd *exec.Cmd) (string, error) {
 	return string(output), nil
 }
 
-// UninstallCertManager uninstalls the cert manager
-func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
+// requirePinned reports an invocation that talks to an API server without
+// naming the kubeconfig it should use. Only Cluster.Command produces that flag,
+// so this is what keeps a new call site from quietly inheriting the ambient
+// context.
+func requirePinned(name string, args []string) error {
+	if !IsClusterCommand(name, args) {
+		return nil
 	}
-
-	// Delete leftover leases in kube-system (not cleaned by default)
-	kubeSystemLeases := []string{
-		"cert-manager-cainjector-leader-election",
-		"cert-manager-controller",
-	}
-	for _, lease := range kubeSystemLeases {
-		cmd = exec.Command("kubectl", "delete", "lease", lease,
-			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
-		if _, err := Run(cmd); err != nil {
-			warnError(err)
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--kubeconfig=") {
+			return nil
 		}
 	}
+	return fmt.Errorf("refusing to run %s: it is not pinned to a kubeconfig, build it with Cluster.Command",
+		binaryName(name))
 }
 
-// InstallCertManager installs the cert manager bundle.
-func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		return err
+// LoadImageToKindCluster side-loads a locally built image into one named kind
+// cluster. The name is required: kind's own default is the cluster literally
+// called "kind", which is never the cluster an e2e run created.
+func LoadImageToKindCluster(kindBin, cluster, image string) error {
+	if cluster == "" {
+		return fmt.Errorf("no kind cluster name given; refusing to load %s into kind's default cluster", image)
 	}
-	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
-	// was re-installed after uninstalling on a cluster.
-	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
-		"--for", "condition=Available",
-		"--namespace", "cert-manager",
-		"--timeout", "5m",
-	)
-
-	_, err := Run(cmd)
-	return err
-}
-
-// IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
-// by verifying the existence of key CRDs related to Cert Manager.
-func IsCertManagerCRDsInstalled() bool {
-	// List of common Cert Manager CRDs
-	certManagerCRDs := []string{
-		"certificates.cert-manager.io",
-		"issuers.cert-manager.io",
-		"clusterissuers.cert-manager.io",
-		"certificaterequests.cert-manager.io",
-		"orders.acme.cert-manager.io",
-		"challenges.acme.cert-manager.io",
+	if kindBin == "" {
+		kindBin = "kind"
 	}
-
-	// Execute the kubectl command to get all CRDs
-	cmd := exec.Command("kubectl", "get", "crds")
-	output, err := Run(cmd)
-	if err != nil {
-		return false
-	}
-
-	// Check if any of the Cert Manager CRDs are present
-	crdList := GetNonEmptyLines(output)
-	for _, crd := range certManagerCRDs {
-		for _, line := range crdList {
-			if strings.Contains(line, crd) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// LoadImageToKindClusterWithName loads a local docker image to the kind cluster
-func LoadImageToKindClusterWithName(name string) error {
-	cluster := defaultKindCluster
-	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
-		cluster = v
-	}
-	kindOptions := []string{"load", "docker-image", name, "--name", cluster}
-	kindBinary := defaultKindBinary
-	if v, ok := os.LookupEnv("KIND"); ok {
-		kindBinary = v
-	}
-	cmd := exec.Command(kindBinary, kindOptions...)
-	_, err := Run(cmd)
+	_, err := Run(exec.Command(kindBin, "load", "docker-image", image, "--name", cluster))
 	return err
 }
 
