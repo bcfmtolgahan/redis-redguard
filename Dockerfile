@@ -1,5 +1,9 @@
-# Build the manager binary
-FROM golang:1.24 AS builder
+# Build the manager binary.
+# GO_VERSION must be at least go.mod's directive or 'go mod download' refuses to
+# run; the Makefile passes the directive so a dependency that raises it cannot
+# leave this pin behind. The default is only for a bare 'docker build'.
+ARG GO_VERSION=1.25
+FROM golang:${GO_VERSION} AS builder
 ARG TARGETOS
 ARG TARGETARCH
 # .dockerignore excludes .git, so the version cannot be derived in the build.
