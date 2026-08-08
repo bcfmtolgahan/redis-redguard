@@ -215,15 +215,39 @@ jobs:
       - name: Pull the tag's chart from the chart repository
         run: |
           version="${GITHUB_REF_NAME#v}"
+          dest="${RUNNER_TEMP}/pull"
+          # helm pull writes through a temp file in -d and does not create the
+          # directory. Without this the pull fails on every attempt and the loop
+          # reports it as "not published yet", so the gate can never pass and
+          # says the wrong thing when it fails.
+          mkdir -p "$dest"
           helm repo add redguard "${PAGES_URL}"
           for attempt in $(seq 1 40); do
             helm repo update redguard >/dev/null
-            if helm pull redguard/redguard --version "$version" -d "${RUNNER_TEMP}/pull"; then
+            if err=$(helm pull redguard/redguard --version "$version" -d "$dest" 2>&1); then
               echo "${PAGES_URL} serves redguard ${version}"
               exit 0
             fi
-            echo "attempt ${attempt}: not published yet"
+            # Pages redeploys a few minutes after the index commit, so a missing
+            # chart is expected early. Anything else is a real failure and must
+            # not be hidden behind the retry.
+            case "$err" in
+              *"no chart version found"*|*404*|*"not found"*)
+                echo "attempt ${attempt}: not published yet" ;;
+              *)
+                echo "::error::helm pull failed for a reason other than the chart being absent: ${err}"
+                exit 1 ;;
+            esac
             sleep 15
           done
           echo "::error::${PAGES_URL} does not serve redguard ${version}, but the docs tell users to install it from there."
           exit 1
+
+      - name: Render the pulled chart
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          helm template redguard "${RUNNER_TEMP}/pull/redguard-${version}.tgz" > "${RUNNER_TEMP}/rendered.yaml"
+          # The chart is only installable if the image it names exists.
+          image=$(grep -m1 -oE 'ghcr\.io/[^"]+' "${RUNNER_TEMP}/rendered.yaml")
+          echo "chart renders and requests ${image}"
+          docker manifest inspect "$image" >/dev/null

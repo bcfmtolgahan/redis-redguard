@@ -1,7 +1,11 @@
 name: Tests
 
+# Branches are covered by the pull_request run; an unrestricted push trigger
+# duplicates every check on the branch and its pull request.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:

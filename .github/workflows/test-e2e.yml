@@ -1,7 +1,13 @@
 name: E2E Tests
 
+# A branch push and its pull request are different refs, so an unrestricted
+# push trigger runs the whole matrix twice for every proposed change. Branches
+# are covered by the pull_request run; the push trigger exists for what is
+# already merged or tagged.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 # The matrix triples the cost of a run; a superseded push does not need to
