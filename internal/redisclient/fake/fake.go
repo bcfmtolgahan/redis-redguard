@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/redguard/redguard/internal/redisclient"
-	"github.com/redguard/redguard/internal/sentinel"
+	"github.com/bcfmtolgahan/redis-redguard/internal/redisclient"
+	"github.com/bcfmtolgahan/redis-redguard/internal/sentinel"
 )
 
 var (

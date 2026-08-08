@@ -30,8 +30,8 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/redguard/redguard/internal/builder"
-	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
+	"github.com/bcfmtolgahan/redis-redguard/internal/builder"
+	redisfake "github.com/bcfmtolgahan/redis-redguard/internal/redisclient/fake"
 )
 
 // A Redis pod deleted while it is master comes back before Sentinel has

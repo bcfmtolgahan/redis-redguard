@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"slices"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 // validateS3Destination enforces the operator-level destination policy shared

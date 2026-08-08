@@ -30,7 +30,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 
-	"github.com/redguard/redguard/test/utils"
+	"github.com/bcfmtolgahan/redis-redguard/test/utils"
 )
 
 // activeCluster is the kind cluster every kubectl and helm invocation in this

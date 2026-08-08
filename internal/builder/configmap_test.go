@@ -11,7 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 // testSentinel returns a minimal, valid RedisSentinel mirroring newTestSentinel

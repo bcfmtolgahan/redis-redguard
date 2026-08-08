@@ -30,8 +30,8 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	redisfake "github.com/bcfmtolgahan/redis-redguard/internal/redisclient/fake"
 )
 
 // aclCase is one spec.aclRules field and the rules written under it. Validation

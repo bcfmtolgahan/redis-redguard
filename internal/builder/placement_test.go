@@ -9,7 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 // bothStatefulSets returns the two pod owners keyed by the component whose

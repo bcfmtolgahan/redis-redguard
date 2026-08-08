@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/redguard/redguard/internal/redisclient/fake"
+	"github.com/bcfmtolgahan/redis-redguard/internal/redisclient/fake"
 )
 
 func TestACLSetUserRecordsEveryAddress(t *testing.T) {

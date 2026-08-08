@@ -8,7 +8,7 @@ import (
 	"slices"
 	"strings"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"

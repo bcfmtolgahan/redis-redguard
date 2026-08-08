@@ -8,8 +8,8 @@ import (
 	"context"
 	"crypto/tls"
 
-	"github.com/redguard/redguard/internal/sentinel"
-	"github.com/redguard/redguard/pkg/redisutils"
+	"github.com/bcfmtolgahan/redis-redguard/internal/sentinel"
+	"github.com/bcfmtolgahan/redis-redguard/pkg/redisutils"
 )
 
 // Client is the exact method surface the controllers use from

@@ -14,7 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 // Key names inside the referenced Secrets, matching what the statefulset

@@ -26,8 +26,8 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	custmetrics "github.com/redguard/redguard/pkg/metrics"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	custmetrics "github.com/bcfmtolgahan/redis-redguard/pkg/metrics"
 )
 
 var _ = Describe("Metrics", func() {

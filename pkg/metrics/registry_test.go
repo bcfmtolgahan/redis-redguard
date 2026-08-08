@@ -15,7 +15,7 @@ import (
 )
 
 // metricsPkgPath is the import path controllers use to reach this package.
-const metricsPkgPath = "github.com/redguard/redguard/pkg/metrics"
+const metricsPkgPath = "github.com/bcfmtolgahan/redis-redguard/pkg/metrics"
 
 // writeMethods are the Prometheus calls that put a value into a series.
 // DeletePartialMatch, Reset and WithLabelValues alone do not.

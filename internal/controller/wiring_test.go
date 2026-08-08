@@ -28,7 +28,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 const (
@@ -221,8 +221,8 @@ func TestRecordEventToleratesNilRecorder(t *testing.T) {
 // directly. Controllers must go through redisclient.Factory instead, so the
 // TLS settings resolved per reconcile reach every connection.
 var protocolClientPackages = map[string]bool{
-	"github.com/redguard/redguard/pkg/redisutils":    true,
-	"github.com/redguard/redguard/internal/sentinel": true,
+	"github.com/bcfmtolgahan/redis-redguard/pkg/redisutils":    true,
+	"github.com/bcfmtolgahan/redis-redguard/internal/sentinel": true,
 }
 
 // TestNoControllerConstructsProtocolClientsDirectly guards the factory seam:

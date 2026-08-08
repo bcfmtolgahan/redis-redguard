@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"testing"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 var hexDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)

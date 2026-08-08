@@ -30,9 +30,9 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	"github.com/redguard/redguard/internal/builder"
-	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	"github.com/bcfmtolgahan/redis-redguard/internal/builder"
+	redisfake "github.com/bcfmtolgahan/redis-redguard/internal/redisclient/fake"
 )
 
 // The aclfile lives on the retained data volume, so deleting a RedisSentinel

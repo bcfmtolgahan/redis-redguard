@@ -27,8 +27,8 @@ linters:
       # nothing is buffered, so a failure cannot lose a write and no call site
       # can act on it. Every other Close stays checked.
       exclude-functions:
-        - (github.com/redguard/redguard/internal/redisclient.Client).Close
-        - (*github.com/redguard/redguard/internal/sentinel.SentinelClient).Close
+        - (github.com/bcfmtolgahan/redis-redguard/internal/redisclient.Client).Close
+        - (*github.com/bcfmtolgahan/redis-redguard/internal/sentinel.SentinelClient).Close
     revive:
       rules:
         - name: comment-spacings

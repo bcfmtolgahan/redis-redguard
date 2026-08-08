@@ -40,11 +40,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	"github.com/redguard/redguard/internal/builder"
-	"github.com/redguard/redguard/internal/redisclient"
-	"github.com/redguard/redguard/internal/tlsutil"
-	custmetrics "github.com/redguard/redguard/pkg/metrics"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	"github.com/bcfmtolgahan/redis-redguard/internal/builder"
+	"github.com/bcfmtolgahan/redis-redguard/internal/redisclient"
+	"github.com/bcfmtolgahan/redis-redguard/internal/tlsutil"
+	custmetrics "github.com/bcfmtolgahan/redis-redguard/pkg/metrics"
 )
 
 const redisUserFinalizer = "redis.redguard.io/redisuser-finalizer"

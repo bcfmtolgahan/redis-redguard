@@ -1,4 +1,4 @@
-module github.com/redguard/redguard
+module github.com/bcfmtolgahan/redis-redguard
 
 go 1.25.0
 

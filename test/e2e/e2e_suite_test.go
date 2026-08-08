@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/redguard/redguard/test/utils"
+	"github.com/bcfmtolgahan/redis-redguard/test/utils"
 )
 
 const (

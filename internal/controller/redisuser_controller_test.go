@@ -29,8 +29,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	redisfake "github.com/bcfmtolgahan/redis-redguard/internal/redisclient/fake"
 )
 
 var _ = Describe("RedisUser Controller", func() {

@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	custmetrics "github.com/redguard/redguard/pkg/metrics"
+	custmetrics "github.com/bcfmtolgahan/redis-redguard/pkg/metrics"
 )
 
 // infoFloat reads one INFO field as a sample. A field Redis spells in some

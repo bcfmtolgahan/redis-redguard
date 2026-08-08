@@ -52,9 +52,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	"github.com/redguard/redguard/internal/redisclient"
-	"github.com/redguard/redguard/internal/tlsutil"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	"github.com/bcfmtolgahan/redis-redguard/internal/redisclient"
+	"github.com/bcfmtolgahan/redis-redguard/internal/tlsutil"
 )
 
 // The restore replaces the master's dataset in place. Redis 7 with appendonly

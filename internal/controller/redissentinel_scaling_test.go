@@ -32,9 +32,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
-	"github.com/redguard/redguard/internal/builder"
-	"github.com/redguard/redguard/internal/redisclient/fake"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
+	"github.com/bcfmtolgahan/redis-redguard/internal/builder"
+	"github.com/bcfmtolgahan/redis-redguard/internal/redisclient/fake"
 )
 
 // A quorum above the number of Sentinels renders into sentinel.conf verbatim.

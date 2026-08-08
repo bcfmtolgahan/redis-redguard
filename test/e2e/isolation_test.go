@@ -27,7 +27,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/redguard/redguard/test/utils"
+	"github.com/bcfmtolgahan/redis-redguard/test/utils"
 )
 
 // probeNamespace exists only so a delete aimed at it would visibly succeed if

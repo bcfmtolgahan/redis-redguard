@@ -36,7 +36,7 @@ import (
 
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
+	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 )
 
 // The backup controller watches the object whose status it writes. A failed
