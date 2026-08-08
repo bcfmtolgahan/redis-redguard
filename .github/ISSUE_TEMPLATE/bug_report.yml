@@ -1,0 +1,47 @@
+name: Bug report
+description: Redguard does something it should not, or fails to do something it should
+labels:
+  - bug
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected instead, and what you got.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Manifest that reproduces it
+      description: The smallest RedisSentinel, RedisUser, RedisBackup or RedisRestore that shows the problem.
+      render: yaml
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Redguard version
+      description: Operator image tag and chart version.
+      placeholder: image v0.3.0, chart 0.3.0
+    validations:
+      required: true
+
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes version and platform
+      placeholder: v1.33.12, EKS
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Operator logs
+      description: kubectl logs -n redguard-system deploy/redguard. Remove passwords before pasting.
+      render: shell
+    validations:
+      required: false
