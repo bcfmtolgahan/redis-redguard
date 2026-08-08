@@ -531,6 +531,35 @@ func TestBuildSentinelStatefulSet_PersistsState(t *testing.T) {
 	}
 }
 
+// Sentinel state is derived: the master, the replicas and the failover epoch
+// are relearned from a live cluster. Kept past the CR it is worse than absent,
+// because a RedisSentinel recreated under the same name rebinds the old claims
+// and the sentinels come up monitoring a dead master's IP with a stale quorum,
+// with no repair path. Delete-and-recreate is what the CRD's immutability
+// messages tell a user to do after a storage change, so this is reachable.
+func TestBuildSentinelStatefulSet_PVCsDoNotOutliveTheCR(t *testing.T) {
+	policy := BuildSentinelStatefulSet(testSentinel()).Spec.PersistentVolumeClaimRetentionPolicy
+
+	if policy == nil {
+		t.Fatal("persistentVolumeClaimRetentionPolicy is nil; recreating the cluster would rebind the old sentinel state")
+	}
+	if policy.WhenDeleted != appsv1.DeletePersistentVolumeClaimRetentionPolicyType {
+		t.Errorf("whenDeleted = %q, want %q", policy.WhenDeleted, appsv1.DeletePersistentVolumeClaimRetentionPolicyType)
+	}
+	if policy.WhenScaled != appsv1.DeletePersistentVolumeClaimRetentionPolicyType {
+		t.Errorf("whenScaled = %q, want %q", policy.WhenScaled, appsv1.DeletePersistentVolumeClaimRetentionPolicyType)
+	}
+}
+
+// The Redis claims hold the dataset, the AOF and the ACL file. They are the
+// user's data, not derived state, so they keep the default retain behaviour and
+// survive both a delete and a scale-down.
+func TestBuildRedisStatefulSet_PVCsOutliveTheCR(t *testing.T) {
+	if policy := BuildRedisStatefulSet(testSentinel()).Spec.PersistentVolumeClaimRetentionPolicy; policy != nil {
+		t.Errorf("persistentVolumeClaimRetentionPolicy = %+v, want nil (retain); the data claims must not be reaped with the CR", policy)
+	}
+}
+
 func TestBuildSentinelStatefulSet_StorageClassFollowsRedis(t *testing.T) {
 	rs := testSentinel()
 	rs.Spec.RedisConfig.Storage = &redisv1alpha1.StorageSpec{

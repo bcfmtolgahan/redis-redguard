@@ -53,7 +53,8 @@ func configHash(data map[string]string) string {
 			slices.Sort(lines)
 			value = strings.Join(lines, "\n")
 		}
-		fmt.Fprintf(h, "%s\x00%s\x00", key, value)
+		// hash.Hash never fails a write.
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00", key, value)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -562,6 +563,15 @@ func BuildSentinelStatefulSet(rs *redisv1alpha1.RedisSentinel) *appsv1.StatefulS
 					},
 					Volumes: volumes,
 				},
+			},
+			// Sentinel state is derived and relearned from a live cluster, so it
+			// must not outlive the CR: a cluster recreated under the same name
+			// would rebind these claims and monitor the dead master's IP with a
+			// stale quorum. The Redis data claims keep the default retain
+			// behaviour instead, being the user's data.
+			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
 			},
 			// Sentinel rewrites its config with the learned master, replicas
 			// and failover epoch; without durable state a restarted pod would
