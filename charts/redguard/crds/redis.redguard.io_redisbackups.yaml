@@ -99,8 +99,9 @@ spec:
                   prefix:
                     description: |-
                       Prefix is the path prefix for backups. RedisBackup writes objects
-                      under <prefix>/<namespace>/<clusterName>/ and retention only ever
-                      deletes objects under that exact prefix.
+                      under <prefix>/<namespace>/<clusterName>/<backupName>/ and retention
+                      only ever deletes objects under that exact prefix, so two RedisBackups
+                      for one cluster never prune each other's objects.
                     type: string
                   region:
                     description: Region is the AWS region

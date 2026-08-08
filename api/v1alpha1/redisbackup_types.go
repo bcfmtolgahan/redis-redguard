@@ -36,8 +36,9 @@ type S3Config struct {
 	Endpoint string `json:"endpoint,omitempty"`
 
 	// Prefix is the path prefix for backups. RedisBackup writes objects
-	// under <prefix>/<namespace>/<clusterName>/ and retention only ever
-	// deletes objects under that exact prefix.
+	// under <prefix>/<namespace>/<clusterName>/<backupName>/ and retention
+	// only ever deletes objects under that exact prefix, so two RedisBackups
+	// for one cluster never prune each other's objects.
 	// +optional
 	Prefix string `json:"prefix,omitempty"`
 

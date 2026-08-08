@@ -212,15 +212,17 @@ func TestRetentionOnlyDeletesOwnClusterObjects(t *testing.T) {
 
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	own := []string{
-		"backups/prod/cluster-a/backup-20260101-000000.rdb.gz",
-		"backups/prod/cluster-a/backup-20260102-000000.rdb.gz",
-		"backups/prod/cluster-a/backup-20260103-000000.rdb.gz",
+		"backups/prod/cluster-a/nightly/backup-20260101-000000.rdb.gz",
+		"backups/prod/cluster-a/nightly/backup-20260102-000000.rdb.gz",
+		"backups/prod/cluster-a/nightly/backup-20260103-000000.rdb.gz",
 	}
 	foreign := []string{
-		"backups/staging/cluster-a/backup-20250101-000000.rdb.gz",
-		"backups/prod/cluster-a-canary/backup-20250601-000000.rdb.gz",
-		"backups/prod/cluster-a/wal/backup-20250101-000000.rdb.gz",
-		"backups/prod/cluster-a/notes.txt",
+		"backups/staging/cluster-a/nightly/backup-20250101-000000.rdb.gz",
+		"backups/prod/cluster-a-canary/nightly/backup-20250601-000000.rdb.gz",
+		"backups/prod/cluster-a/nightly-canary/backup-20250301-000000.rdb.gz",
+		"backups/prod/cluster-a/backup-20250201-000000.rdb.gz",
+		"backups/prod/cluster-a/nightly/wal/backup-20250101-000000.rdb.gz",
+		"backups/prod/cluster-a/nightly/notes.txt",
 	}
 
 	fakeS3 := newFakeS3Store()
@@ -244,13 +246,70 @@ func TestRetentionOnlyDeletesOwnClusterObjects(t *testing.T) {
 	}
 	for _, k := range foreign {
 		if _, ok := fakeS3.objects[k]; !ok {
-			t.Errorf("retention deleted %s, which belongs to another namespace, cluster, or was never written by the operator", k)
+			t.Errorf("retention deleted %s, which belongs to another namespace, cluster, backup CR, or was never written by the operator", k)
 		}
 	}
 	for _, p := range fakeS3.listPrefixes {
-		if p != "backups/prod/cluster-a/" {
-			t.Errorf("retention listed prefix %q, want the namespace-and-cluster-scoped %q", p, "backups/prod/cluster-a/")
+		if p != "backups/prod/cluster-a/nightly/" {
+			t.Errorf("retention listed prefix %q, want the namespace, cluster and CR scoped %q", p, "backups/prod/cluster-a/nightly/")
 		}
+	}
+}
+
+// TestRetentionIsolatesSiblingBackupCRs pins per-CR prefix isolation: a daily
+// and a weekly RedisBackup on the same cluster must never prune each other's
+// objects, or the shorter retention silently deletes the longer one's history.
+func TestRetentionIsolatesSiblingBackupCRs(t *testing.T) {
+	daily := testBackup()
+	daily.Name = "daily"
+	daily.Spec.RetentionPolicy = 1
+	weekly := testBackup()
+	weekly.Name = "weekly"
+	weekly.Spec.RetentionPolicy = 2
+
+	dailyPrefix, err := backupObjectPrefix(daily)
+	if err != nil {
+		t.Fatal(err)
+	}
+	weeklyPrefix, err := backupObjectPrefix(weekly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dailyPrefix == weeklyPrefix {
+		t.Fatalf("sibling CRs share the prefix %q; the shorter retention would prune the other's backups", dailyPrefix)
+	}
+
+	// The weekly objects are older than every daily one, so a shared prefix
+	// would delete them first.
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	weeklyKeys := []string{
+		weeklyPrefix + "backup-20260101-000000.rdb.gz",
+		weeklyPrefix + "backup-20260102-000000.rdb.gz",
+	}
+	dailyKeys := []string{
+		dailyPrefix + "backup-20260103-000000.rdb.gz",
+		dailyPrefix + "backup-20260104-000000.rdb.gz",
+	}
+	fakeS3 := newFakeS3Store()
+	for i, k := range append(append([]string{}, weeklyKeys...), dailyKeys...) {
+		fakeS3.objects[k] = t0.AddDate(0, 0, i)
+	}
+
+	r := backupReconcilerWithS3(fakeS3)
+	if err := r.cleanupOldBackups(context.Background(), daily); err != nil {
+		t.Fatalf("daily cleanup failed: %v", err)
+	}
+
+	for _, k := range weeklyKeys {
+		if _, ok := fakeS3.objects[k]; !ok {
+			t.Errorf("daily retention deleted the weekly backup %s", k)
+		}
+	}
+	if _, ok := fakeS3.objects[dailyKeys[0]]; ok {
+		t.Errorf("daily retention kept %s beyond its retention of 1", dailyKeys[0])
+	}
+	if _, ok := fakeS3.objects[dailyKeys[1]]; !ok {
+		t.Errorf("daily retention deleted its newest backup %s", dailyKeys[1])
 	}
 }
 
@@ -265,7 +324,7 @@ func TestRetentionPaginatesAcrossListPages(t *testing.T) {
 	fakeS3.pageSize = 2
 	var keys []string
 	for i := 1; i <= 5; i++ {
-		k := "backups/prod/cluster-a/backup-2026010" + strconv.Itoa(i) + "-000000.rdb.gz"
+		k := "backups/prod/cluster-a/nightly/backup-2026010" + strconv.Itoa(i) + "-000000.rdb.gz"
 		keys = append(keys, k)
 		fakeS3.objects[k] = t0.AddDate(0, 0, i)
 	}
@@ -291,9 +350,9 @@ func TestRetentionSurfacesDeleteErrors(t *testing.T) {
 	backup := testBackup()
 
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	oldest := "backups/prod/cluster-a/backup-20260101-000000.rdb.gz"
-	second := "backups/prod/cluster-a/backup-20260102-000000.rdb.gz"
-	newest := "backups/prod/cluster-a/backup-20260103-000000.rdb.gz"
+	oldest := "backups/prod/cluster-a/nightly/backup-20260101-000000.rdb.gz"
+	second := "backups/prod/cluster-a/nightly/backup-20260102-000000.rdb.gz"
+	newest := "backups/prod/cluster-a/nightly/backup-20260103-000000.rdb.gz"
 
 	fakeS3 := newFakeS3Store()
 	fakeS3.objects[oldest] = t0
@@ -331,7 +390,7 @@ func TestUploadKeyIsNamespaceAndClusterScoped(t *testing.T) {
 		t.Fatalf("expected exactly one PutObject, got %v", fakeS3.putKeys)
 	}
 	key := fakeS3.putKeys[0]
-	want := regexp.MustCompile(`^backups/prod/cluster-a/backup-\d{8}-\d{6}\.rdb\.gz$`)
+	want := regexp.MustCompile(`^backups/prod/cluster-a/nightly/backup-\d{8}-\d{6}\.rdb\.gz$`)
 	if !want.MatchString(key) {
 		t.Errorf("upload key = %q, want match for %v", key, want)
 	}

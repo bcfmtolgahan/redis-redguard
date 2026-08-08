@@ -803,19 +803,21 @@ func (r *RedisBackupReconciler) createS3Client(ctx context.Context, redisBackup 
 }
 
 // backupObjectPrefix is the exact key prefix this backup reads and writes:
-// <spec.prefix>/<namespace>/<clusterName>/. Namespace and cluster name are
-// always included so two clusters can never share a prefix, and the trailing
-// slash stops "cluster-a" matching "cluster-a-canary". Both segments are DNS
-// labels by API validation; anything else is refused rather than joined into
-// an ambiguous prefix.
+// <spec.prefix>/<namespace>/<clusterName>/<crName>/. The CR name is included
+// because two RedisBackups for one cluster (a daily and a weekly) must not
+// share a prefix: the one with the shorter retention would prune the other's
+// objects. The trailing slash stops "cluster-a" matching "cluster-a-canary".
+// All segments are DNS names by API validation; anything else is refused
+// rather than joined into an ambiguous prefix.
 func backupObjectPrefix(redisBackup *redisv1alpha1.RedisBackup) (string, error) {
-	for _, seg := range []string{redisBackup.Namespace, redisBackup.Spec.RedisClusterRef} {
+	for _, seg := range []string{redisBackup.Namespace, redisBackup.Spec.RedisClusterRef, redisBackup.Name} {
 		if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "/*") {
-			return "", fmt.Errorf("cannot compute an unambiguous S3 prefix from namespace %q and cluster %q",
-				redisBackup.Namespace, redisBackup.Spec.RedisClusterRef)
+			return "", fmt.Errorf("cannot compute an unambiguous S3 prefix from namespace %q, cluster %q and backup %q",
+				redisBackup.Namespace, redisBackup.Spec.RedisClusterRef, redisBackup.Name)
 		}
 	}
-	return path.Join(redisBackup.Spec.S3.Prefix, redisBackup.Namespace, redisBackup.Spec.RedisClusterRef) + "/", nil
+	return path.Join(redisBackup.Spec.S3.Prefix, redisBackup.Namespace,
+		redisBackup.Spec.RedisClusterRef, redisBackup.Name) + "/", nil
 }
 
 // isBackupObject reports whether key is an object this controller writes for
