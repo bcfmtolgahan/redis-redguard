@@ -4,10 +4,34 @@ on:
   push:
   pull_request:
 
+# The matrix triples the cost of a run; a superseded push does not need to
+# finish booting three Kubernetes clusters.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-e2e:
-    name: Run on Ubuntu
+    name: Kubernetes ${{ matrix.k8s }}
     runs-on: ubuntu-latest
+    strategy:
+      # One version failing is a result about that version, not a reason to stop
+      # testing the others.
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest minor still in standard support on the managed platforms
+          # (EKS, GKE, AKS). This is the floor the operator claims to run on.
+          - k8s: "1.33"
+            node-image: kindest/node:v1.33.12
+          # Matches k8s.io/api v0.34.x, which the operator is compiled against
+          # and which the envtest control plane of the unit suite runs.
+          - k8s: "1.34"
+            node-image: kindest/node:v1.34.8
+          # Newest node image kind publishes, so removed APIs and tightened
+          # admission defaults surface here before a user hits them.
+          - k8s: "1.36"
+            node-image: kindest/node:v1.36.1
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -19,14 +43,21 @@ jobs:
 
       - name: Install the latest version of kind
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
       - name: Verify kind installation
         run: kind version
 
+      # The suite installs the operator from charts/redguard, the path a user
+      # follows, so helm has to be present and not left to the runner image.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      # make test-e2e creates, owns and deletes a cluster of its own, with its
+      # own kubeconfig. Nothing here may create a cluster or set KUBECONFIG.
       - name: Running Test e2e
-        run: |
-          go mod tidy
-          make test-e2e
+        env:
+          KIND_NODE_IMAGE: ${{ matrix.node-image }}
+        run: make test-e2e

@@ -17,10 +17,39 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Running Tests
+      # CRDs, RBAC and deepcopy are generated from kubebuilder markers. A marker
+      # edited without regenerating ships a CRD that does not match the types.
+      - name: Verify generated code and manifests are committed
         run: |
-          go mod tidy
-          make test
+          make manifests generate
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are stale. Run 'make manifests generate' and commit the result."
+            exit 1
+          fi
+          untracked="$(git ls-files --others --exclude-standard)"
+          if [ -n "$untracked" ]; then
+            echo "$untracked"
+            echo "::error::'make manifests generate' produced new files. Commit them."
+            exit 1
+          fi
+
+      - name: Running Tests
+        run: make test
+
+      # -coverpkg ./... is set in the Makefile, so the number covers the whole
+      # module rather than each package measuring only its own tests.
+      - name: Report coverage
+        run: |
+          total="$(make --no-print-directory cover-report)"
+          echo "$total"
+          echo "$total" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cover.out
+          if-no-files-found: error
 
       - name: Install Helm
         uses: azure/setup-helm@v4

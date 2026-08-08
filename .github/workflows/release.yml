@@ -1,0 +1,165 @@
+name: Release
+
+# A version tag is the only trigger. Never a pull request, never a branch push:
+# the jobs below push an image, publish a chart and cut a GitHub release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/bcfmtolgahan/redguard
+  PAGES_URL: https://bcfmtolgahan.github.io/redis-redguard
+
+jobs:
+  # Runs before anything is published, so a tag that disagrees with the chart
+  # does not leave a pushed image behind.
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Verify the chart version matches the tag
+        run: |
+          chart="$(helm show chart charts/redguard | awk '/^version:/ {print $2}')"
+          if [ "$chart" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::Chart version $chart does not match tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+  image:
+    name: Push the multi-arch image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Derive the image tags
+        id: tags
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${GITHUB_REF_NAME}"
+            # A pre-release tag such as v0.3.0-rc1 must not move :latest.
+            case "${GITHUB_REF_NAME}" in
+              *-*) ;;
+              *) echo "${IMAGE}:latest" ;;
+            esac
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # arm64 is emulated on the amd64 runner; the binary is CGO-free static Go,
+      # so only the compiler runs under emulation.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+  release:
+    name: Create the GitHub release
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build the installer manifest
+        run: make build-installer IMG="${IMAGE}:${GITHUB_REF_NAME}"
+
+      - name: Package the chart
+        run: helm package charts/redguard --destination dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--generate-notes --title "${GITHUB_REF_NAME}")
+          case "${GITHUB_REF_NAME}" in
+            *-*) args+=(--prerelease) ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" "${args[@]}" \
+            dist/install.yaml dist/redguard-*.tgz
+
+  chart:
+    name: Publish the chart repository
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Clone the tag
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package the chart
+        run: helm package charts/redguard --destination "${RUNNER_TEMP}/chart"
+
+      # GitHub Pages serves docs/ on the default branch, so the index lives
+      # there and not on a gh-pages branch.
+      - name: Clone the branch that serves the chart repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: pages
+
+      - name: Rebuild the repository index
+        run: |
+          cp "${RUNNER_TEMP}"/chart/*.tgz pages/docs/
+          # --merge keeps the entries of charts published earlier, whose .tgz
+          # files are not necessarily still in the directory.
+          helm repo index pages/docs --url "${PAGES_URL}" --merge pages/docs/index.yaml
+
+      - name: Commit the index
+        working-directory: pages
+        run: |
+          git config user.name bcfmtolgahan
+          git config user.email tolgahan@bestcloudfor.me
+          git add docs
+          if git diff --cached --quiet; then
+            echo "chart repository already up to date"
+            exit 0
+          fi
+          git commit -m "chore: publish chart ${GITHUB_REF_NAME}"
+          git push origin HEAD:main

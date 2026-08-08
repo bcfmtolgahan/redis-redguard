@@ -1,6 +1,11 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 
+# Stamped into the binary so a running pod reports what it is. A release build
+# passes the tag explicitly; a local build describes the checkout.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS ?= -s -w -X main.version=$(VERSION)
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -61,9 +66,19 @@ vet: ## Run go vet against code.
 # past go test's 10m default, which would fail the run on the deadline alone.
 UNIT_TIMEOUT ?= 30m
 
+# Without -coverpkg every package only counts the lines its own tests execute,
+# so code exercised through another package's tests reads as zero.
+COVERPROFILE ?= cover.out
+COVERPKG ?= ./...
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -timeout $(UNIT_TIMEOUT) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -timeout $(UNIT_TIMEOUT) -coverprofile $(COVERPROFILE) -coverpkg $(COVERPKG)
+
+.PHONY: cover-report
+cover-report: ## Print total statement coverage from the last test run.
+	@test -f "$(COVERPROFILE)" || { echo "$(COVERPROFILE) not found; run 'make test' first."; exit 1; }
+	@go tool cover -func="$(COVERPROFILE)" | tail -n 1
 
 # The e2e suite builds the operator image, side-loads it into kind and installs
 # the chart from charts/redguard, which is the path a user follows.
@@ -103,6 +118,10 @@ E2E_SHARED_DIGEST = $(E2E_RUN_DIR)/shared-kubeconfig.cksum
 # default go test deadline, which would kill the run mid-suite.
 E2E_TIMEOUT ?= 45m
 
+# Node image the e2e cluster runs, e.g. kindest/node:v1.34.8. Empty keeps the
+# default of the installed kind; CI sets it to sweep Kubernetes versions.
+KIND_NODE_IMAGE ?=
+
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Create a Kind cluster for the e2e suite, reachable only through its own kubeconfig
 	@command -v $(KIND) >/dev/null 2>&1 || { \
@@ -124,7 +143,8 @@ setup-test-e2e: ## Create a Kind cluster for the e2e suite, reachable only throu
 		rm -f "$(E2E_OWNED)"; \
 	else \
 		echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-		$(KIND) create cluster --name "$(KIND_CLUSTER)" --kubeconfig "$(E2E_KUBECONFIG)"; \
+		$(KIND) create cluster --name "$(KIND_CLUSTER)" --kubeconfig "$(E2E_KUBECONFIG)" \
+			$(if $(KIND_NODE_IMAGE),--image "$(KIND_NODE_IMAGE)",); \
 		echo "$(KIND_CLUSTER)" > "$(E2E_OWNED)"; \
 	fi
 	@$(KIND) get kubeconfig --name "$(KIND_CLUSTER)" > "$(E2E_KUBECONFIG)"
@@ -221,7 +241,7 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -232,7 +252,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -251,7 +271,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name redguard-builder
 	$(CONTAINER_TOOL) buildx use redguard-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm redguard-builder
 	rm Dockerfile.cross
 

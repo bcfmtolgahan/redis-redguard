@@ -51,6 +51,10 @@ import (
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+
+	// Set at link time with -X main.version. Logged at startup so a running pod
+	// can be identified without inspecting the image it came from.
+	version = "dev"
 )
 
 func init() {
@@ -189,6 +193,8 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(opts)))
+
+	setupLog.Info("starting redguard", "version", version)
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
