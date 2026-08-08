@@ -1,36 +1,13 @@
-# Local test values for redguard operator
+# Overrides for 'make helm-install-local': install against the image the
+# default 'make docker-build' produces (IMG=controller:latest). Load it into
+# the cluster first, e.g. 'kind load docker-image controller:latest'.
+# Everything not set here inherits the defaults in values.yaml.
 
 operator:
-  replicas: 1
-
   image:
-    repository: redguard
-    tag: v0.1.3
-    pullPolicy: Never  # Use local image
+    repository: controller
+    tag: latest
+    pullPolicy: Never
 
-  resources:
-    limits:
-      cpu: 500m
-      memory: 256Mi
-    requests:
-      cpu: 100m
-      memory: 128Mi
-
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
-
-serviceAccount:
-  create: true
-  annotations: {}
-  name: ""
-
-rbac:
-  create: true
-
-metrics:
-  enabled: true
-  port: 8080
-
-health:
-  port: 8081
+  # Console debug logs read better than JSON while iterating locally.
+  devLogging: true

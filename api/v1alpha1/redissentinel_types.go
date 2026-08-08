@@ -224,7 +224,8 @@ type RedisSentinelStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// MasterNode is the current Redis master pod name
+	// MasterNode is the host:port address of the current Redis master as
+	// reported by Sentinel; the host is the master pod's IP.
 	// +optional
 	MasterNode string `json:"masterNode,omitempty"`
 

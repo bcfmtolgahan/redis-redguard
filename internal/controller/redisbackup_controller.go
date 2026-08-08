@@ -41,9 +41,11 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -410,23 +412,6 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 	}
 
 	return backupLocation, int64(len(dataToUpload)), nil
-}
-
-func (r *RedisBackupReconciler) getMasterPod(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel) (*corev1.Pod, error) {
-	if redisSentinel.Status.MasterNode == "" {
-		return nil, fmt.Errorf("master node not found")
-	}
-
-	podName := strings.Split(redisSentinel.Status.MasterNode, ".")[0]
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      podName,
-		Namespace: redisSentinel.Namespace,
-	}, pod); err != nil {
-		return nil, err
-	}
-
-	return pod, nil
 }
 
 // getBackupPod returns a pod to take backup from, preferring replica over master
@@ -1020,8 +1005,14 @@ func (r *RedisBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorderFor("redisbackup-controller")
 	}
+	// The controller writes status (Running, Failed) on the object it watches;
+	// unfiltered, each write re-enqueues the CR immediately and preempts the
+	// RequeueAfter pacing, so a permanently failing backup re-fires BGSAVE in a
+	// hot loop. Generation moves only on spec edits and deletion, which are
+	// exactly the external triggers a backup must react to promptly; scheduled
+	// and retry wakes arrive through RequeueAfter, which no predicate touches.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&redisv1alpha1.RedisBackup{}).
+		For(&redisv1alpha1.RedisBackup{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("redisbackup").
 		Complete(r)
 }

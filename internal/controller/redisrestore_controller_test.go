@@ -67,10 +67,19 @@ func newRestoreFixture(t *testing.T, mutate func(*redisv1alpha1.RedisRestore), e
 	}
 
 	rs := newTestSentinel(restoreCluster, restoreNS)
-	rs.Status.MasterNode = restoreCluster + "-redis-0." + restoreCluster + "-redis-headless." + restoreNS + ".svc.cluster.local"
+	// Status carries the master address as the sentinel controller writes it:
+	// the pod IP and port reported by SENTINEL get-master-addr-by-name.
+	rs.Status.MasterNode = restoreMasterAddr
 
 	masterPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: restoreCluster + "-redis-0", Namespace: restoreNS},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      restoreCluster + "-redis-0",
+			Namespace: restoreNS,
+			Labels: map[string]string{
+				"app.kubernetes.io/instance":  restoreCluster,
+				"app.kubernetes.io/component": "redis",
+			},
+		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			PodIP: restoreMasterIP,

@@ -512,34 +512,6 @@ func (r *RedisUserReconciler) getPasswordFromSecret(ctx context.Context, redisUs
 	return string(password), nil
 }
 
-func (r *RedisUserReconciler) getMasterPodAddress(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel) (string, error) {
-	// Use the master node from status
-	if redisSentinel.Status.MasterNode == "" {
-		return "", fmt.Errorf("master node not found in RedisSentinel status")
-	}
-
-	// Extract pod name from master node (format: podname.headless-svc)
-	podName := strings.Split(redisSentinel.Status.MasterNode, ".")[0]
-
-	// Get the pod to find its IP
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      podName,
-		Namespace: redisSentinel.Namespace,
-	}, pod); err != nil {
-		return "", err
-	}
-
-	if pod.Status.PodIP == "" {
-		return "", fmt.Errorf("pod IP not available")
-	}
-
-	// Use default Redis port
-	port := 6379
-
-	return fmt.Sprintf("%s:%d", pod.Status.PodIP, port), nil
-}
-
 // getAllRedisPodAddresses returns all running Redis pod addresses
 // ACL rules must be applied to all nodes to ensure they persist after failover
 func (r *RedisUserReconciler) getAllRedisPodAddresses(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel) ([]string, error) {

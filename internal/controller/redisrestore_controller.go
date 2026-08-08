@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -710,24 +711,36 @@ func spdyPodExec(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, contain
 	return stdout.String(), stderr.String(), err
 }
 
+// getMasterPod resolves status.masterNode, a host:port address reported by
+// Sentinel, to the Redis pod whose IP is the host part. A pod restart or
+// failover moves the address, so the lookup runs against the live pod list on
+// every call rather than caching a name.
 func (r *RedisRestoreReconciler) getMasterPod(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (*corev1.Pod, error) {
 	if rs.Status.MasterNode == "" {
 		return nil, fmt.Errorf("master node not found in status")
 	}
 
-	podName := strings.Split(rs.Status.MasterNode, ".")[0]
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      podName,
-		Namespace: rs.Namespace,
-	}, pod); err != nil {
-		return nil, err
-	}
-	if pod.Status.PodIP == "" {
-		return nil, fmt.Errorf("master pod %s has no IP yet", podName)
+	host := rs.Status.MasterNode
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
 
-	return pod, nil
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(rs.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/instance":  rs.Name,
+			"app.kubernetes.io/component": "redis",
+		}); err != nil {
+		return nil, err
+	}
+	for i := range podList.Items {
+		if podList.Items[i].Status.PodIP == host {
+			return &podList.Items[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("no redis pod matches master address %s", rs.Status.MasterNode)
 }
 
 func (r *RedisRestoreReconciler) getAdminPassword(ctx context.Context, rs *redisv1alpha1.RedisSentinel) string {

@@ -2711,7 +2711,9 @@ spec:
                 format: date-time
                 type: string
               masterNode:
-                description: MasterNode is the current Redis master pod name
+                description: |-
+                  MasterNode is the host:port address of the current Redis master as
+                  reported by Sentinel; the host is the master pod's IP.
                 type: string
               observedGeneration:
                 description: |-
