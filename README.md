@@ -1,340 +1,227 @@
-# Redguard - Redis Sentinel Operator
+# Redguard
 
-Redguard is a Kubernetes-native operator for managing highly available Redis clusters with Sentinel for automatic failover.
+Redguard is a Kubernetes operator that runs Redis in a master-replica set
+supervised by Redis Sentinel, and moves the write endpoint when Sentinel
+promotes a new master.
 
-## Overview
+You declare a `RedisSentinel`; the operator creates the StatefulSets, the
+Services, the configuration, the PodDisruptionBudgets and the NetworkPolicies,
+watches Sentinel, and keeps the `<name>-redis` Service pointing at whichever pod
+is master right now.
 
-Redguard simplifies Redis deployment and management on Kubernetes by automating:
-- Redis master-replica setup with automatic failover
-- Sentinel deployment for high availability
-- Persistent storage and configuration management
-- User access control with Redis ACL
-- Automated backups to S3-compatible storage
-- Health monitoring and metrics export
+## What it does
 
-## Features
+- Redis master-replica sets with Sentinel-driven failover.
+- A write Service that selects only the master, and a separate Service for
+  read-only traffic.
+- Durable Sentinel state on a PVC, so a restarted Sentinel keeps the master it
+  learned instead of re-seeding from the template.
+- Authentication for both Redis and Sentinel from one Secret, rotated online
+  without dropping replication.
+- Declarative ACL users (`RedisUser`) confined to their declared key, channel
+  and command scope.
+- Scheduled and one-off RDB backups to S3 or an S3-compatible endpoint
+  (`RedisBackup`), and restore from one (`RedisRestore`).
+- Prometheus metrics per cluster, per pod and per backup.
 
-### Core Features
-- **High Availability**: Automatic failover with Redis Sentinel
-- **Kubernetes Native**: Custom Resource Definitions for declarative management
-- **Persistent Storage**: StatefulSet-based deployment with PVC support
-- **Custom Configuration**: Support for Redis and Sentinel configuration parameters
-- **Resource Management**: Configurable CPU and memory limits
-- **Service Types**: ClusterIP, NodePort, and LoadBalancer support
+## What it does not do
 
-### Security
-- **TLS/SSL Encryption**: Secure Redis connections with certificate-based authentication
-- **ACL Support**: Fine-grained access control with Redis 6+ ACLs
-- **RedisUser CRD**: Declarative user and permission management
-- **Mutual TLS**: Optional client certificate verification
-- **Secret Management**: Password storage via Kubernetes Secrets
+- It does not run Redis Cluster (sharding). One `RedisSentinel` is one dataset.
+- It does not create or renew certificates. See the TLS limitation below.
+- It does not manage clients. A client that caches the master address across a
+  failover has to reconnect; use the Service or a Sentinel-aware client.
+- It does not move the write endpoint while the operator itself is down. Only a
+  controller can make a Service follow a Sentinel promotion.
 
-### Backup & Recovery
-- **S3 Backups**: Automated backups to AWS S3 and S3-compatible storage (MinIO, DigitalOcean Spaces)
-- **RedisBackup CRD**: Declarative backup configuration
-- **Scheduled Backups**: Cron-based automatic backups
-- **Retention Policies**: Automatic cleanup of old backups
-- **Compression**: Gzip compression support
-- **IAM Role Support**: IRSA on EKS for secure credential management
+## Requirements
 
-### Observability
-- **Prometheus Metrics**: Built-in metrics for cluster health, replication lag, and backup status
-- **Status Reporting**: Real-time status updates for all resources
-- **Event Recording**: Kubernetes events for important operations
+- Kubernetes 1.33 or newer. The e2e suite runs against 1.33, 1.34 and 1.36.
+- A default StorageClass, or one named in `spec.redisConfig.storage`.
+- `kubectl`, and `helm` 3 for the chart install.
 
-## Installation
+## Install
 
-### Prerequisites
-- Kubernetes 1.20+
-- kubectl configured
-- Helm 3+
+With Helm:
 
-### Using Helm (Recommended)
-
-```bash
-# Clone the repository
-git clone https://github.com/bcfmtolgahan/redis-operator.git
-cd redis-operator
-
-# Install the operator using local Helm chart
-helm install redguard ./helm/redguard \
-  --namespace redguard-system \
-  --create-namespace
-
-# Verify installation
-kubectl get pods -n redguard-system
+```sh
+helm repo add redguard https://bcfmtolgahan.github.io/redis-redguard
+helm repo update
+helm install redguard redguard/redguard \
+  --version 0.3.0 \
+  --namespace redguard-system --create-namespace \
+  --wait
 ```
 
-### Using kubectl
+Pin `--version`. 0.3.0 is the first release that starts; 0.2.1 is published but
+its chart never granted the operator the RBAC it needs.
 
-```bash
-# Clone the repository
-git clone https://github.com/bcfmtolgahan/redis-operator.git
-cd redis-operator
+With plain manifests:
 
-# Apply installation manifest
-kubectl apply -f install-ready.yaml
-
-# Verify installation
-kubectl get pods -n redguard-system
+```sh
+kubectl apply -f https://github.com/bcfmtolgahan/redis-redguard/releases/download/v0.3.0/install.yaml
 ```
 
-## Quick Start
+Check it:
 
-### Create a Redis Cluster
+```sh
+kubectl -n redguard-system get deploy
+kubectl -n redguard-system logs -l control-plane=controller-manager | head
+```
 
-Create a basic Redis cluster with Sentinel:
+The Deployment is `redguard` after the chart install and
+`redguard-controller-manager` after the manifest install; the label above
+selects either.
 
-```yaml
+Chart options, including `operator.watchNamespaces` and the backup destination
+allowlist, are in [docs/install.md](docs/install.md). To build and run from a
+checkout, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Quick start
+
+```sh
+kubectl apply -f - <<'EOF'
 apiVersion: redis.redguard.io/v1alpha1
 kind: RedisSentinel
 metadata:
-  name: my-redis
-  namespace: default
+  name: redis-cluster
 spec:
   redisConfig:
     replicas: 3
-    image: redis:7-alpine
-    resources:
-      requests:
-        memory: "256Mi"
-        cpu: "100m"
-      limits:
-        memory: "512Mi"
-        cpu: "500m"
     storage:
       size: 1Gi
-      storageClassName: standard
   sentinelConfig:
     replicas: 3
     quorum: 2
-    downAfterMilliseconds: 5000
-    failoverTimeout: 10000
-  serviceType: ClusterIP
+EOF
 ```
 
-Apply the configuration:
+Wait for it:
 
-```bash
-kubectl apply -f redis-cluster.yaml
-
-# Check status
-kubectl get redissentinel my-redis
-kubectl get pods -l redis.redguard.io/redis-name=my-redis
+```sh
+kubectl get redissentinel redis-cluster -w
 ```
 
-### Connect to Redis
-
-The operator creates two client Services per cluster:
-
-- `<name>-redis` routes to the current master only. Use it for writes. The
-  operator moves its endpoint when Sentinel promotes a new master; during the
-  failover window the Service has no endpoints and writes fail fast instead of
-  reaching a read-only replica.
-- `<name>-redis-replicas` routes to every Redis pod, master included. Use it
-  to spread read-only traffic; a write sent here can land on a replica and be
-  rejected with `-READONLY`.
-
-```bash
-# Port-forward to the master (write) service
-kubectl port-forward svc/my-redis-redis 6379:6379
-
-# Connect with redis-cli
-redis-cli -h localhost
+```
+NAME            PHASE     MASTER             REPLICAS   SENTINELS   AGE
+redis-cluster   Running   10.244.0.10:6379   3          3           45s
 ```
 
-## Custom Resources
+Write through the master Service and read through the replicas Service:
 
-### RedisSentinel
+```sh
+kubectl run redis-client --rm -i --restart=Never --image redis:7-alpine -- \
+  redis-cli -h redis-cluster-redis SET greeting hello
 
-Manages Redis cluster with Sentinel for high availability. Supports custom configuration, TLS, authentication, and resource limits.
-
-**Example with Authentication:**
-
-```yaml
-apiVersion: redis.redguard.io/v1alpha1
-kind: RedisSentinel
-metadata:
-  name: prod-redis
-spec:
-  redisConfig:
-    replicas: 5
-    auth:
-      secretName: redis-password
-    customConfig:
-      maxmemory: "1gb"
-      maxmemory-policy: "allkeys-lru"
-  sentinelConfig:
-    replicas: 5
-    quorum: 3
+kubectl run redis-client --rm -i --restart=Never --image redis:7-alpine -- \
+  redis-cli -h redis-cluster-redis-replicas GET greeting
 ```
 
-Create password secret:
+The master carries a label; that is how the write Service finds it:
 
-```bash
-kubectl create secret generic redis-password \
-  --from-literal=password=mysecurepassword
+```sh
+kubectl get pods -l app.kubernetes.io/instance=redis-cluster,redis.redguard.io/role=master
 ```
 
-### RedisUser
+## What gets created
 
-Manages Redis ACL users with fine-grained permissions.
+For a `RedisSentinel` named `redis-cluster`:
 
-**Example:**
+| Object | Name | Purpose |
+| --- | --- | --- |
+| StatefulSet | `redis-cluster-redis` | Redis pods, one PVC each |
+| StatefulSet | `redis-cluster-sentinel` | Sentinel pods, one PVC each for durable state |
+| Service | `redis-cluster-redis` | Writes. Selects the master pod only |
+| Service | `redis-cluster-redis-replicas` | Reads. Selects every Redis pod |
+| Service | `redis-cluster-redis-headless` | Stable per-pod DNS for replication |
+| Service | `redis-cluster-sentinel` | Sentinel-aware clients, port 26379 |
+| Service | `redis-cluster-sentinel-headless` | Stable per-pod DNS for the quorum |
+| ConfigMap | `redis-cluster-redis-config` | `redis.conf` and the init script |
+| ConfigMap | `redis-cluster-sentinel-config` | `sentinel.conf` and the init script |
+| PodDisruptionBudget | `redis-cluster-redis-pdb`, `redis-cluster-sentinel-pdb` | `maxUnavailable: 1` per component |
+| NetworkPolicy | `redis-cluster-redis-netpol`, `redis-cluster-sentinel-netpol` | Ingress from the workload namespace and the operator namespace |
 
-```yaml
-apiVersion: redis.redguard.io/v1alpha1
-kind: RedisUser
-metadata:
-  name: app-user
-spec:
-  redisClusterRef: my-redis
-  username: appuser
-  passwordSecretRef: app-password
-  enabled: true
-  aclRules:
-    categories: ["+@read", "+@write", "-@admin"]
-    keys: ["~app:*"]
-    channels: ["&notifications:*"]
-```
+Every object carries `app.kubernetes.io/instance: redis-cluster` and
+`app.kubernetes.io/component: redis` or `sentinel`. There is no
+`redis.redguard.io/redis-name` label; select on `app.kubernetes.io/instance`.
 
-### RedisBackup
+The Sentinel monitor name is `<cluster>-master`, for example
+`redis-cluster-master`.
 
-Automated S3 backups with scheduling and retention policies.
+## Custom resources
 
-**Example:**
+| Kind | Purpose |
+| --- | --- |
+| `RedisSentinel` | One Redis master-replica set with its Sentinels |
+| `RedisUser` | One Redis ACL user on a cluster, applied to every node |
+| `RedisBackup` | Scheduled or one-off RDB backup to S3 |
+| `RedisRestore` | Load an S3 backup back into a cluster |
 
-```yaml
-apiVersion: redis.redguard.io/v1alpha1
-kind: RedisBackup
-metadata:
-  name: daily-backup
-spec:
-  redisClusterRef: my-redis
-  schedule: "0 2 * * *"  # Daily at 2 AM
-  s3:
-    bucket: my-redis-backups
-    region: us-east-1
-    credentialsSecretRef: s3-credentials
-  retentionPolicy: 7
-  compression: true
-```
-
-## Monitoring
-
-The operator exposes Prometheus metrics on port 8080:
-
-```bash
-# Port-forward metrics service
-kubectl port-forward -n redguard-system \
-  svc/redguard-controller-manager-metrics-service 8080:8080
-
-# Query metrics
-curl http://localhost:8080/metrics | grep redis_
-```
-
-**Available Metrics:**
-- `redis_cluster_info` - Cluster status
-- `redis_connected_replicas` - Number of connected replicas
-- `redis_replication_lag_seconds` - Replication lag per pod
-- `redis_sentinel_status` - Sentinel health
-- `redis_failover_total` - Total failover count
-- `redis_backup_status` - Backup success/failure status
-- `redis_backup_duration_seconds` - Backup duration
-- `redis_user_acl_status` - ACL user status
-
-## Architecture
-
-Redguard creates the following Kubernetes resources:
-
-- **StatefulSet (Redis)**: Master and replica pods with persistent storage
-- **StatefulSet (Sentinel)**: Sentinel pods for monitoring and failover
-- **Services**: headless Services for pod discovery, `<name>-redis` for writes
-  (master only, tracked via the `redis.redguard.io/role: master` pod label),
-  `<name>-redis-replicas` for read scaling, `<name>-sentinel` for Sentinel
-  clients
-- **ConfigMaps**: Redis and Sentinel configuration
-- **PersistentVolumeClaims**: Storage for Redis data
-
-**Failover Process:**
-1. Sentinel detects master failure
-2. Quorum of Sentinels agree on failure
-3. New master is elected from healthy replicas
-4. Replicas reconfigured to follow new master
-5. Operator moves the `redis.redguard.io/role: master` label to the promoted
-   pod, repointing `<name>-redis`, and updates the status
-
-The role label only moves while the operator runs. If the operator is down
-during a failover, `<name>-redis` keeps pointing at the demoted pod until the
-operator comes back and reconciles.
-
-## Configuration Examples
-
-See [config/samples/](./config/samples/) for more examples:
-- [Basic Redis cluster](./config/samples/redis_v1alpha1_redissentinel.yaml)
-- [Redis with TLS](./config/samples/redis_v1alpha1_redissentinel_tls.yaml)
-- [Redis User ACL](./config/samples/redis_v1alpha1_redisuser.yaml)
-- [Redis Backup](./config/samples/redis_v1alpha1_redisbackup.yaml)
+Every field is in [docs/reference.md](docs/reference.md).
 
 ## Documentation
 
-- [HANDBOOK.md](./HANDBOOK.md) - Comprehensive operator guide
-- [FEATURES.md](./FEATURES.md) - Detailed feature documentation
-- [QUICKSTART.md](./QUICKSTART.md) - Quick start guide
+- [docs/install.md](docs/install.md) — chart values, operator flags, upgrade
+  and uninstall.
+- [docs/reference.md](docs/reference.md) — the four custom resources, field by
+  field, with their status and conditions.
+- [docs/operations.md](docs/operations.md) — failover, scaling, configuration
+  changes, password rotation, backup, restore, metrics and alerts,
+  troubleshooting.
+- [docs/security.md](docs/security.md) — threat model, what the ACL allowlist
+  confines, the backup destination allowlist, operator RBAC, Pod Security,
+  NetworkPolicy.
+- [CHANGELOG.md](CHANGELOG.md) — releases, including the 0.2.1 breaking changes.
 
-## Best Practices
+## Limitations
 
-For production deployments:
-- Use at least 3 Redis replicas
-- Use at least 3 Sentinel replicas (odd number)
-- Set appropriate quorum (typically N/2 + 1)
-- Enable authentication with strong passwords
-- Use TLS for production environments
-- Configure resource limits
-- Use fast SSD storage
-- Set up automated backups with retention policies
-- Monitor with Prometheus and Grafana
-- Test failover scenarios regularly
+- **A single-replica cluster is not highly available.** `replicas: 1` is legal
+  and useful for development, but Sentinel has nothing to promote. The operator
+  reports it: `HighlyAvailable=False`, reason `NoFailoverTarget`.
+- **The write Service is only as current as the operator.** Sentinel promotes a
+  replica on its own, but the role label that steers `<name>-redis` moves only
+  when the operator reconciles. While the operator is down the Service keeps
+  selecting the demoted pod.
+- **There is a write gap during a failover.** Between the master failing and the
+  label moving, `<name>-redis` has no endpoints and writes fail fast, which is
+  the intent: the alternative is a write silently accepted by a read-only
+  replica.
+- **NetworkPolicies need a CNI that enforces them.** The operator writes the
+  objects regardless. Under a CNI that ignores NetworkPolicy they are inert.
+- **TLS does not currently work.** `spec.tls` is accepted and the pods are
+  configured for it, but the Redis start-up script queries Sentinel without TLS
+  and never resolves the master, so the Redis pods do not become ready. See
+  [docs/operations.md](docs/operations.md#tls).
+- **A restore restarts the master.** If the restart outlasts
+  `sentinelConfig.downAfterMilliseconds`, Sentinel can promote a replica and the
+  restored dataset is discarded. Check `status.phase` on the `RedisRestore`.
 
-## Uninstalling
+## Uninstall
 
-### Helm Installation
-
-```bash
-# Delete all Redis instances
+```sh
 kubectl delete redissentinel --all --all-namespaces
-
-# Uninstall operator
 helm uninstall redguard -n redguard-system
-
-# Delete CRDs (optional)
-kubectl delete crd redissentinels.redis.redguard.io
-kubectl delete crd redisusers.redis.redguard.io
-kubectl delete crd redisbackups.redis.redguard.io
+kubectl delete namespace redguard-system
 ```
 
-### kubectl Installation
+Helm does not delete CRDs. Removing them deletes every remaining custom
+resource in the cluster:
 
-```bash
-kubectl delete -f install-ready.yaml
+```sh
+kubectl delete crd \
+  redissentinels.redis.redguard.io \
+  redisusers.redis.redguard.io \
+  redisbackups.redis.redguard.io \
+  redisrestores.redis.redguard.io
 ```
+
+PersistentVolumeClaims outlive their StatefulSet. Delete them separately once
+you no longer need the data.
 
 ## Contributing
 
-Contributions are welcome. Please submit issues and pull requests to the repository.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities through the
+process in [SECURITY.md](SECURITY.md).
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Apache License 2.0. See [LICENSE](LICENSE).

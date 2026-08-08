@@ -1,4 +1,7 @@
-## Append samples of your project ##
+# Applied together by `kubectl apply -k config/samples`. Only the samples that
+# are safe to create side by side are listed: the TLS and production clusters
+# would each start a second Redis cluster, and the restore sample overwrites a
+# dataset. Apply those individually.
 resources:
 - redis_v1alpha1_redissentinel.yaml
 - redis_v1alpha1_redisuser.yaml
