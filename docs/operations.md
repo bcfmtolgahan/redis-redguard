@@ -254,7 +254,7 @@ daily   redis-cluster   0 2 * * *   Completed   40s           2m
 ```
 
 Omit `schedule` for a one-off. The object lands at
-`<prefix>/<namespace>/<cluster>/backup-<timestamp>.rdb.gz`, and
+`<prefix>/<namespace>/<cluster>/<backupName>/backup-<timestamp>.rdb.gz`, and
 `status.backupLocation` gives the exact `s3://` URL to feed a restore.
 
 Pause a schedule with `spec.suspend: true`. Retention deletes only objects this

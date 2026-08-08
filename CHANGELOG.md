@@ -78,8 +78,9 @@ A 0.2.1 user will hit all of these.
 - **The chart grants the RBAC the operator actually needs.** The ClusterRole is
   generated from the controllers' kubebuilder markers and synced into the chart
   by `hack/sync-chart.sh`; `make verify-chart` gates the drift.
-- **Backup object keys always contain the namespace and cluster.** Objects are
-  written to `<prefix>/<namespace>/<cluster>/backup-<timestamp>.rdb[.gz]`, and
+- **Backup object keys always contain the namespace, cluster and backup name.**
+  Objects are written to
+  `<prefix>/<namespace>/<cluster>/<backupName>/backup-<timestamp>.rdb[.gz]`, and
   retention only ever deletes objects directly under that prefix named
   `backup-*.rdb` or `backup-*.rdb.gz`. Restores of objects written by an earlier
   version need the old key in `backupPath`.
