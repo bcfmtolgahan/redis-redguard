@@ -106,6 +106,40 @@ var _ = Describe("RedisUser Controller", func() {
 			}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
 		})
 
+		// Redis honours a rule wherever it appears in the SETUSER list, so a
+		// grant written under spec.aclRules.keys is a real grant that the
+		// confinement floor never follows. The rejection has to reach the user,
+		// naming the rule and the field it belongs in, or the spec looks
+		// accepted while the account is never written.
+		It("should reject a grant smuggled into spec.aclRules.keys", func() {
+			By("writing a category grant into the key-pattern field")
+			user := &redisv1alpha1.RedisUser{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, user)).To(Succeed())
+			user.Spec.ACLRules.Keys = []string{"+@read", "~*"}
+			Expect(k8sClient.Update(ctx, user)).To(Succeed())
+
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+
+			By("not retrying a spec that only an edit can fix")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+
+			By("naming the offending rule and the field it belongs in")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, user)).To(Succeed())
+			Expect(user.Status.Conditions).To(ContainElement(SatisfyAll(
+				HaveField("Type", "Degraded"),
+				HaveField("Status", metav1.ConditionTrue),
+				HaveField("Reason", "SpecRejected"),
+				HaveField("Message", SatisfyAll(
+					ContainSubstring("+@read"),
+					ContainSubstring("keys"),
+					ContainSubstring("categories"),
+				)),
+			)))
+		})
+
 		It("should report that there are no Redis pods to apply the ACL to", func() {
 			By("Reconciling the created resource")
 			// envtest runs no kubelet, so the StatefulSet produces no pods and
