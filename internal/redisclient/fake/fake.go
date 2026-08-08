@@ -30,10 +30,20 @@ type Factory struct {
 	masterAddr    string
 	users         map[string][]string
 	masterOptions map[string]string
-	errs          map[string]error
-	calls         []string
-	failovers     []string
-	resets        []string
+	// monitorDefault seeds the monitor state a pool reports for the master:
+	// quorum, down-after-milliseconds, failover-timeout, parallel-syncs.
+	// monitorByKey holds each pool's own copy, keyed like the call log,
+	// because SENTINEL SET is per-instance state that never propagates: a
+	// repair sent to one member must not change what the others report.
+	monitorDefault map[string]string
+	monitorByKey   map[string]map[string]string
+	errs           map[string]error
+	calls          []string
+	// ops is a second log carrying the arguments the calls log drops, so a
+	// test can assert what was written and in which order across nodes.
+	ops       []string
+	failovers []string
+	resets    []string
 	// knownSentinels overrides the peer count the pool reports. Zero means
 	// derive it from the pool size, which is a set that agrees with itself.
 	knownSentinels int
@@ -55,10 +65,12 @@ type node struct {
 
 func NewFactory() *Factory {
 	return &Factory{
-		nodes:         map[string]*node{},
-		users:         map[string][]string{},
-		masterOptions: map[string]string{},
-		errs:          map[string]error{},
+		nodes:          map[string]*node{},
+		users:          map[string][]string{},
+		masterOptions:  map[string]string{},
+		monitorDefault: map[string]string{},
+		monitorByKey:   map[string]map[string]string{},
+		errs:           map[string]error{},
 	}
 }
 
@@ -175,6 +187,47 @@ func (f *Factory) MasterOptions() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// SetMonitorConfig declares the monitor parameters every fake sentinel reports
+// for the master: quorum, down-after-milliseconds, failover-timeout,
+// parallel-syncs. Unset keys report as empty. Per-pool state written earlier
+// through SetMasterOptionAll is discarded.
+func (f *Factory) SetMonitorConfig(cfg map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.monitorDefault = map[string]string{}
+	for k, v := range cfg {
+		f.monitorDefault[k] = v
+	}
+	f.monitorByKey = map[string]map[string]string{}
+}
+
+// monitorFor returns the monitor state one pool reports, seeding it from the
+// default on first use. Caller holds f.mu.
+func (f *Factory) monitorFor(key string) map[string]string {
+	state, ok := f.monitorByKey[key]
+	if !ok {
+		state = map[string]string{}
+		for k, v := range f.monitorDefault {
+			state[k] = v
+		}
+		f.monitorByKey[key] = state
+	}
+	return state
+}
+
+// Ops returns the ordered argument-level log: every write with the values it
+// carried, formatted "<addr>:<method>:<args>". Calls() keeps the coarse form.
+func (f *Factory) Ops() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ops...)
+}
+
+// recordOp appends to the argument-level log. Caller holds f.mu.
+func (f *Factory) recordOp(entry string) {
+	f.ops = append(f.ops, entry)
 }
 
 // errorFor returns the injected error for addr and method. Caller holds f.mu.
@@ -359,6 +412,7 @@ func (c *client) ACLSetUser(ctx context.Context, username string, rules ...strin
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "ACLSetUser")
+	c.f.recordOp(c.addr + ":ACLSetUser:" + username + ":" + strings.Join(rules, " "))
 	if err := c.f.errorFor(c.addr, "ACLSetUser"); err != nil {
 		return err
 	}
@@ -442,6 +496,7 @@ func (c *client) ConfigSet(ctx context.Context, parameter, value string) error {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "ConfigSet")
+	c.f.recordOp(c.addr + ":ConfigSet:" + parameter + "=" + value)
 	if err := c.f.errorFor(c.addr, "ConfigSet"); err != nil {
 		return err
 	}
@@ -501,14 +556,22 @@ func (p *pool) GetMasterFromPool(ctx context.Context, masterName string) (*senti
 	if p.f.knownSentinels > 0 {
 		others = p.f.knownSentinels - 1
 	}
+	monitor := p.f.monitorFor(p.key())
+	quorum := monitor["quorum"]
+	if quorum == "" {
+		quorum = "2"
+	}
 	return &sentinel.MasterInfo{
-		Name:              masterName,
-		IP:                host,
-		Port:              port,
-		Flags:             "master",
-		NumSlaves:         strconv.Itoa(slaves),
-		NumOtherSentinels: strconv.Itoa(others),
-		Quorum:            "2",
+		Name:                  masterName,
+		IP:                    host,
+		Port:                  port,
+		Flags:                 "master",
+		NumSlaves:             strconv.Itoa(slaves),
+		NumOtherSentinels:     strconv.Itoa(others),
+		Quorum:                quorum,
+		DownAfterMilliseconds: monitor["down-after-milliseconds"],
+		FailoverTimeout:       monitor["failover-timeout"],
+		ParallelSyncs:         monitor["parallel-syncs"],
 	}, nil
 }
 
@@ -552,9 +615,38 @@ func (p *pool) SetMasterOptionAll(ctx context.Context, masterName, option, value
 	p.f.mu.Lock()
 	defer p.f.mu.Unlock()
 	p.f.record(p.key(), "SetMasterOptionAll")
+	p.f.recordOp(p.key() + ":SetMasterOptionAll:" + option + "=" + value)
 	if err := p.f.errorFor(p.key(), "SetMasterOptionAll"); err != nil {
 		return err
 	}
 	p.f.masterOptions[option] = value
+	switch option {
+	case "quorum", "down-after-milliseconds", "failover-timeout", "parallel-syncs":
+		p.f.monitorFor(p.key())[option] = value
+	}
 	return nil
+}
+
+func (p *pool) AddPasswordAll(ctx context.Context, password string) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.f.record(p.key(), "AddPasswordAll")
+	p.f.recordOp(p.key() + ":AddPasswordAll:" + password)
+	return p.f.errorFor(p.key(), "AddPasswordAll")
+}
+
+func (p *pool) ResetPasswordAll(ctx context.Context, password string) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.f.record(p.key(), "ResetPasswordAll")
+	p.f.recordOp(p.key() + ":ResetPasswordAll:" + password)
+	return p.f.errorFor(p.key(), "ResetPasswordAll")
+}
+
+func (p *pool) SetOutboundPasswordAll(ctx context.Context, masterName, password string) error {
+	p.f.mu.Lock()
+	defer p.f.mu.Unlock()
+	p.f.record(p.key(), "SetOutboundPasswordAll")
+	p.f.recordOp(p.key() + ":SetOutboundPasswordAll:" + masterName + ":" + password)
+	return p.f.errorFor(p.key(), "SetOutboundPasswordAll")
 }

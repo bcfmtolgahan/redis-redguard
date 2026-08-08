@@ -30,6 +30,14 @@ const (
 	// password so nothing derived from the secret value sits on a pod template.
 	// The reconciler owns this one: only it can read the Secret.
 	AuthSecretVersionAnnotation = "redis.redguard.io/auth-secret-version"
+
+	// TLSSecretVersionAnnotation carries the resourceVersions of the TLS
+	// certificate and CA Secrets. Both servers load their certificates once at
+	// startup, so a renewed certificate reaches a running pod only through a
+	// roll; without this stamp a cert-manager renewal changes no pod field and
+	// every pod keeps serving the expired certificate. The reconciler owns
+	// this one for the same reason it owns the auth stamp.
+	TLSSecretVersionAnnotation = "redis.redguard.io/tls-secret-version"
 )
 
 // configHash fingerprints rendered configuration files. A .conf value is

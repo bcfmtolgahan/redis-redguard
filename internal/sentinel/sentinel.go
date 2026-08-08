@@ -25,6 +25,12 @@ type MasterInfo struct {
 	NumSlaves         string
 	NumOtherSentinels string
 	Flags             string
+	// The monitor timings as this sentinel currently applies them. SENTINEL SET
+	// never propagates between sentinels, so these are per-instance state and
+	// the reconciler reads them from every member to detect drift.
+	DownAfterMilliseconds string
+	FailoverTimeout       string
+	ParallelSyncs         string
 }
 
 // ReplicaInfo contains information about a replica
@@ -172,6 +178,60 @@ func (p *SentinelClientPool) SetMasterOptionAll(ctx context.Context, masterName,
 	return errors.Join(errs...)
 }
 
+// AddPasswordAll adds password to the default user of every sentinel, keeping
+// the passwords it already has. Sentinel mode has no CONFIG command, but it
+// does serve ACL, and requirepass is the default user's password, so this is
+// the runtime path for widening the accepted credentials during a rotation.
+func (p *SentinelClientPool) AddPasswordAll(ctx context.Context, password string) error {
+	var errs []error
+	for _, addr := range p.addresses {
+		client := p.newClient(addr)
+		err := client.client.Do(ctx, "ACL", "SETUSER", "default", ">"+password).Err()
+		client.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ResetPasswordAll replaces the default user's password set of every sentinel
+// with exactly password, in one ACL SETUSER so no moment exists in which the
+// user has no password at all. Sentinel persists the result into its config
+// file as requirepass on its next rewrite, so the change survives a restart.
+func (p *SentinelClientPool) ResetPasswordAll(ctx context.Context, password string) error {
+	var errs []error
+	for _, addr := range p.addresses {
+		client := p.newClient(addr)
+		err := client.client.Do(ctx, "ACL", "SETUSER", "default", "resetpass", ">"+password).Err()
+		client.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// SetOutboundPasswordAll changes the credentials every sentinel presents when
+// it dials out: auth-pass towards the monitored master and its replicas, and
+// sentinel-pass towards the other sentinels. Both are per-instance state that
+// never propagates, and sentinel writes both to its config file by itself.
+func (p *SentinelClientPool) SetOutboundPasswordAll(ctx context.Context, masterName, password string) error {
+	var errs []error
+	for _, addr := range p.addresses {
+		client := p.newClient(addr)
+		err := client.client.Do(ctx, "SENTINEL", "SET", masterName, "auth-pass", password).Err()
+		if err == nil {
+			err = client.client.Do(ctx, "SENTINEL", "CONFIG", "SET", "sentinel-pass", password).Err()
+		}
+		client.Close()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sentinel %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // ResetMasterAll makes every sentinel in the pool forget what it learned about
 // the master and rediscover it. Like SENTINEL SET this is per-instance state
 // that never propagates, so it has to reach all of them: one sentinel left
@@ -298,13 +358,16 @@ func parseMasterReply(reply interface{}) (*MasterInfo, error) {
 		return nil, err
 	}
 	return &MasterInfo{
-		Name:              fields["name"],
-		IP:                fields["ip"],
-		Port:              fields["port"],
-		Quorum:            fields["quorum"],
-		NumSlaves:         fields["num-slaves"],
-		NumOtherSentinels: fields["num-other-sentinels"],
-		Flags:             fields["flags"],
+		Name:                  fields["name"],
+		IP:                    fields["ip"],
+		Port:                  fields["port"],
+		Quorum:                fields["quorum"],
+		NumSlaves:             fields["num-slaves"],
+		NumOtherSentinels:     fields["num-other-sentinels"],
+		Flags:                 fields["flags"],
+		DownAfterMilliseconds: fields["down-after-milliseconds"],
+		FailoverTimeout:       fields["failover-timeout"],
+		ParallelSyncs:         fields["parallel-syncs"],
 	}, nil
 }
 

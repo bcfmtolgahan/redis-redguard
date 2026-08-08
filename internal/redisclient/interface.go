@@ -47,6 +47,9 @@ type Sentinel interface {
 	SetMasterOptionAll(ctx context.Context, masterName, option, value string) error
 	FailoverFromPool(ctx context.Context, masterName string) error
 	ResetMasterAll(ctx context.Context, masterName string) error
+	AddPasswordAll(ctx context.Context, password string) error
+	ResetPasswordAll(ctx context.Context, password string) error
+	SetOutboundPasswordAll(ctx context.Context, masterName, password string) error
 }
 
 // Factory constructs protocol clients. A nil tlsConfig selects the plaintext

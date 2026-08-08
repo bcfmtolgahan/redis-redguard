@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -84,7 +85,7 @@ func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -103,6 +104,19 @@ const (
 	// so one unreachable node cannot stall the reconcile worker; unfinished
 	// work is retried on the fast requeue.
 	failoverHandleTimeout = 15 * time.Second
+
+	// rotationTimeout bounds one online credential push across the whole
+	// cluster. The push is idempotent, so an aborted attempt is simply
+	// resumed on the next pass rather than left half-done forever.
+	rotationTimeout = 30 * time.Second
+)
+
+// Keys inside the applied-credentials Secret: the password every node
+// currently accepts, and the auth Secret resourceVersion it was read from,
+// which is the value stamped on the pod templates.
+const (
+	appliedPasswordKey = "password"
+	appliedVersionKey  = "authSecretResourceVersion"
 )
 
 // Reconcile reconciles a RedisSentinel object
@@ -291,7 +305,11 @@ func (r *RedisSentinelReconciler) reconcileServices(ctx context.Context, rs *red
 func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (bool, error) {
 	logger := log.FromContext(ctx)
 
-	authVersion, err := r.authSecretVersion(ctx, rs)
+	authVersion, err := r.reconcileAuthCredentials(ctx, rs)
+	if err != nil {
+		return false, err
+	}
+	tlsVersion, err := r.tlsSecretVersion(ctx, rs)
 	if err != nil {
 		return false, err
 	}
@@ -299,6 +317,7 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 	// Redis StatefulSet
 	redisStatefulSet := builder.BuildRedisStatefulSet(rs)
 	stampAuthSecretVersion(redisStatefulSet, authVersion)
+	stampTLSSecretVersion(redisStatefulSet, tlsVersion)
 	if err := controllerutil.SetControllerReference(rs, redisStatefulSet, r.Scheme); err != nil {
 		return false, err
 	}
@@ -314,14 +333,15 @@ func (r *RedisSentinelReconciler) reconcileStatefulSets(ctx context.Context, rs 
 	// Sentinel StatefulSet
 	sentinelStatefulSet := builder.BuildSentinelStatefulSet(rs)
 	stampAuthSecretVersion(sentinelStatefulSet, authVersion)
+	stampTLSSecretVersion(sentinelStatefulSet, tlsVersion)
 	if err := controllerutil.SetControllerReference(rs, sentinelStatefulSet, r.Scheme); err != nil {
 		return false, err
 	}
 	r.warnOnSentinelScaleDown(ctx, rs, sentinelStatefulSet)
 	r.warnOnRollout(ctx, rs, sentinelStatefulSet,
 		"Sentinel pods restart one at a time to apply the new configuration; "+
-			"learned state on the volume is kept, so the monitor parameters of an "+
-			"already-seeded sentinel do not change")
+			"learned state on the volume is kept, and the monitor parameters are "+
+			"converged to the spec at runtime rather than by this restart")
 	if err := r.createOrUpdate(ctx, sentinelStatefulSet); err != nil {
 		return false, fmt.Errorf("failed to reconcile Sentinel StatefulSet: %w", err)
 	}
@@ -561,28 +581,301 @@ func sentinelAddresses(rs *redisv1alpha1.RedisSentinel) []string {
 	return addrs
 }
 
-// authSecretVersion returns the resourceVersion of the auth Secret, or "" when
-// the CR configures no authentication. A Secret that is referenced but absent
-// also yields "": the pods cannot start without it either, and the version
-// appears and rolls them once the Secret does. Any other read failure aborts
-// the pass rather than stamping a version the Secret does not have: doing so
-// would restart every pod, master included, and restart them back on the next
-// successful read.
-func (r *RedisSentinelReconciler) authSecretVersion(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
+// appliedAuthSecretName is the operator-owned Secret recording the password
+// the cluster currently accepts.
+func appliedAuthSecretName(rs *redisv1alpha1.RedisSentinel) string {
+	return rs.Name + "-auth-state"
+}
+
+// reconcileAuthCredentials returns the value to stamp as the auth Secret
+// version on both pod templates, or "" when the CR configures no
+// authentication or the referenced Secret is absent (the pods cannot start
+// without it either; the version appears and rolls them once the Secret does).
+//
+// A changed password is pushed to every running node online before the new
+// version is returned: rolling first restarts each pod into the new credential
+// while its un-rolled peers still require the old one, which breaks
+// replication and Sentinel authentication for the whole roll and stalls it on
+// the readiness probe. After a successful push the roll only makes the change
+// durable. The password last pushed is kept in an operator-owned Secret,
+// because the user Secret holds only the new value and the operator must still
+// authenticate against nodes that accept the old one.
+func (r *RedisSentinelReconciler) reconcileAuthCredentials(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
 	auth := rs.Spec.RedisConfig.Auth
 	if auth == nil || auth.SecretName == "" {
 		return "", nil
 	}
 
-	secret := &corev1.Secret{}
+	userSecret := &corev1.Secret{}
 	key := types.NamespacedName{Name: auth.SecretName, Namespace: rs.Namespace}
-	if err := r.Get(ctx, key, secret); err != nil {
+	if err := r.Get(ctx, key, userSecret); err != nil {
 		if errors.IsNotFound(err) {
 			return "", nil
 		}
 		return "", fmt.Errorf("read auth secret %s: %w", auth.SecretName, err)
 	}
-	return secret.ResourceVersion, nil
+	desired := string(userSecret.Data["password"])
+
+	applied := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: appliedAuthSecretName(rs), Namespace: rs.Namespace}, applied)
+	if errors.IsNotFound(err) {
+		// First contact: converge the runtime state (idempotent when it
+		// already matches, and it also carries a cluster that predates auth
+		// into requiring it) and record what the cluster accepts from now on.
+		if pushErr := r.pushCredentials(ctx, rs, desired, ""); pushErr != nil {
+			r.reportRotationFailure(ctx, rs, pushErr)
+			return "", fmt.Errorf("online credential push: %w", pushErr)
+		}
+		if err := r.writeAppliedAuth(ctx, rs, desired, userSecret.ResourceVersion); err != nil {
+			return "", err
+		}
+		return userSecret.ResourceVersion, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read applied credentials secret: %w", err)
+	}
+
+	previous := string(applied.Data[appliedPasswordKey])
+	if previous == desired {
+		// Track the Secret's resourceVersion even when only metadata moved:
+		// the stamp must equal the live version or the next comparison
+		// misreads an unchanged password as a pending rotation.
+		if string(applied.Data[appliedVersionKey]) != userSecret.ResourceVersion {
+			if err := r.writeAppliedAuth(ctx, rs, desired, userSecret.ResourceVersion); err != nil {
+				return "", err
+			}
+		}
+		return userSecret.ResourceVersion, nil
+	}
+
+	if pushErr := r.pushCredentials(ctx, rs, desired, previous); pushErr != nil {
+		r.reportRotationFailure(ctx, rs, pushErr)
+		return "", fmt.Errorf("online credential rotation: %w", pushErr)
+	}
+	if err := r.writeAppliedAuth(ctx, rs, desired, userSecret.ResourceVersion); err != nil {
+		return "", err
+	}
+	recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "CredentialsRotated",
+		"Pushed the rotated password to every running Redis node and Sentinel; "+
+			"the pods now restart only to make the change durable")
+	return userSecret.ResourceVersion, nil
+}
+
+// reportRotationFailure surfaces an incomplete push. The cluster still agrees
+// on the previously applied password, so nothing is rolled and the push is
+// retried; silent partial application is the one state that must not exist.
+func (r *RedisSentinelReconciler) reportRotationFailure(ctx context.Context, rs *redisv1alpha1.RedisSentinel, pushErr error) {
+	recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "CredentialRotationFailed", pushErr.Error())
+	r.setDegraded(ctx, rs, "CredentialRotationFailed", pushErr.Error())
+}
+
+// writeAppliedAuth records password and the auth Secret version it was read
+// from, creating the applied-credentials Secret on first use. Owned by the CR
+// so it is garbage collected with it.
+func (r *RedisSentinelReconciler) writeAppliedAuth(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password, version string) error {
+	key := types.NamespacedName{Name: appliedAuthSecretName(rs), Namespace: rs.Namespace}
+	data := map[string][]byte{
+		appliedPasswordKey: []byte(password),
+		appliedVersionKey:  []byte(version),
+	}
+
+	return retry.OnError(retry.DefaultRetry, isRaceError, func() error {
+		existing := &corev1.Secret{}
+		err := r.Get(ctx, key, existing)
+		if errors.IsNotFound(err) {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      key.Name,
+					Namespace: key.Namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "redguard-operator",
+						"app.kubernetes.io/instance":   rs.Name,
+					},
+				},
+				Data: data,
+			}
+			if err := controllerutil.SetControllerReference(rs, secret, r.Scheme); err != nil {
+				return err
+			}
+			return r.Create(ctx, secret)
+		}
+		if err != nil {
+			return err
+		}
+		existing.Data = data
+		return r.Update(ctx, existing)
+	})
+}
+
+// pushCredentials moves every running node from previous to desired online, in
+// three cluster-wide phases: widen (every node accepts both passwords), switch
+// outbound (every dialer presents the new one), narrow (the old one stops
+// being accepted). At every instant each presented credential is accepted by
+// its peer, so replication links stay up and Sentinel never loses the master;
+// there is no ordering window to get wrong. Each phase is gated on the
+// previous one completing on every node, and everything is idempotent, so an
+// aborted push is resumed by simply running it again. Verified against real
+// redis:7-alpine containers: sentinel mode has no CONFIG command, so widening
+// and narrowing there go through the default user's ACL, which sentinel
+// persists into its state file by itself.
+func (r *RedisSentinelReconciler) pushCredentials(ctx context.Context, rs *redisv1alpha1.RedisSentinel, desired, previous string) error {
+	ctx, cancel := context.WithTimeout(ctx, rotationTimeout)
+	defer cancel()
+
+	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, rs)
+	if err != nil {
+		return fmt.Errorf("resolve client TLS config: %w", err)
+	}
+	factory := factoryOrDefault(r.RedisFactory)
+
+	redisAddrs, err := r.runningPodAddresses(ctx, rs, "redis", 6379)
+	if err != nil {
+		return err
+	}
+	sentinelAddrs, err := r.runningPodAddresses(ctx, rs, "sentinel", 26379)
+	if err != nil {
+		return err
+	}
+
+	// Every redis node must be reachable before anything is written anywhere:
+	// a push that cannot finish must not start.
+	clients := make(map[string]redisclient.Client, len(redisAddrs))
+	defer func() {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	}()
+	for _, addr := range redisAddrs {
+		c, err := dialWithEither(ctx, factory, addr, desired, previous, tlsCfg)
+		if err != nil {
+			return fmt.Errorf("redis node %s: %w", addr, err)
+		}
+		clients[addr] = c
+	}
+
+	// forEachSentinel runs op against every sentinel individually, trying the
+	// new credential first (already valid on a resumed push) and falling back
+	// to the previous one.
+	forEachSentinel := func(what string, op func(redisclient.Sentinel) error) error {
+		for _, addr := range sentinelAddrs {
+			err := op(factory.NewSentinelPool([]string{addr}, desired, tlsCfg))
+			if err != nil {
+				if prevErr := op(factory.NewSentinelPool([]string{addr}, previous, tlsCfg)); prevErr != nil {
+					return fmt.Errorf("%s on sentinel %s: with the new password: %v; with the previous one: %w", what, addr, err, prevErr)
+				}
+			}
+		}
+		return nil
+	}
+
+	// Phase 1: widen.
+	for _, addr := range redisAddrs {
+		if err := clients[addr].ACLSetUser(ctx, "default", ">"+desired); err != nil {
+			return fmt.Errorf("widen accepted passwords on redis node %s: %w", addr, err)
+		}
+	}
+	if err := forEachSentinel("widen accepted passwords", func(p redisclient.Sentinel) error {
+		return p.AddPasswordAll(ctx, desired)
+	}); err != nil {
+		return err
+	}
+
+	// Phase 2: switch outbound.
+	for _, addr := range redisAddrs {
+		if err := clients[addr].ConfigSet(ctx, "masterauth", desired); err != nil {
+			return fmt.Errorf("switch masterauth on redis node %s: %w", addr, err)
+		}
+	}
+	masterName := rs.Name + "-master"
+	if err := forEachSentinel("switch outbound credentials", func(p redisclient.Sentinel) error {
+		return p.SetOutboundPasswordAll(ctx, masterName, desired)
+	}); err != nil {
+		return err
+	}
+
+	// Phase 3: narrow.
+	for _, addr := range redisAddrs {
+		if err := clients[addr].ConfigSet(ctx, "requirepass", desired); err != nil {
+			return fmt.Errorf("narrow accepted passwords on redis node %s: %w", addr, err)
+		}
+	}
+	return forEachSentinel("narrow accepted passwords", func(p redisclient.Sentinel) error {
+		return p.ResetPasswordAll(ctx, desired)
+	})
+}
+
+// dialWithEither connects to one redis node with whichever of the two
+// credentials it currently accepts, new one first.
+func dialWithEither(ctx context.Context, factory redisclient.Factory, addr, desired, previous string, tlsCfg *tls.Config) (redisclient.Client, error) {
+	c := factory.NewClient(addr, desired, tlsCfg)
+	newErr := c.Ping(ctx)
+	if newErr == nil {
+		return c, nil
+	}
+	_ = c.Close()
+
+	c = factory.NewClient(addr, previous, tlsCfg)
+	prevErr := c.Ping(ctx)
+	if prevErr == nil {
+		return c, nil
+	}
+	_ = c.Close()
+	return nil, fmt.Errorf("not reachable with the new password (%v) nor the previous one (%v)", newErr, prevErr)
+}
+
+// runningPodAddresses lists the dial addresses of the running pods of one
+// component, sorted so multi-node operations run in a stable order.
+func (r *RedisSentinelReconciler) runningPodAddresses(ctx context.Context, rs *redisv1alpha1.RedisSentinel, component string, port int) ([]string, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/component": component,
+		"app.kubernetes.io/instance":  rs.Name,
+	}); err != nil {
+		return nil, err
+	}
+
+	var addrs []string
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		addrs = append(addrs, fmt.Sprintf("%s:%d", pod.Status.PodIP, port))
+	}
+	slices.Sort(addrs)
+	return addrs, nil
+}
+
+// tlsSecretVersion returns the value to stamp as the TLS secret version on
+// both pod templates, or "" when TLS is disabled or the certificate Secret is
+// absent. Both servers load their certificates once at startup, so a renewal
+// reaches a running pod only through the roll this stamp triggers.
+func (r *RedisSentinelReconciler) tlsSecretVersion(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
+	spec := rs.Spec.TLS
+	if spec == nil || !spec.Enabled || spec.CertificateSecretRef == "" {
+		return "", nil
+	}
+
+	cert := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: spec.CertificateSecretRef, Namespace: rs.Namespace}, cert); err != nil {
+		if errors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read TLS certificate secret %s: %w", spec.CertificateSecretRef, err)
+	}
+	version := cert.ResourceVersion
+
+	if spec.CASecretRef != "" && spec.CASecretRef != spec.CertificateSecretRef {
+		ca := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: spec.CASecretRef, Namespace: rs.Namespace}, ca); err != nil {
+			if errors.IsNotFound(err) {
+				return version, nil
+			}
+			return "", fmt.Errorf("read TLS CA secret %s: %w", spec.CASecretRef, err)
+		}
+		version += "/" + ca.ResourceVersion
+	}
+	return version, nil
 }
 
 // stampAuthSecretVersion records on the pod template which version of the auth
@@ -597,6 +890,18 @@ func stampAuthSecretVersion(sts *appsv1.StatefulSet, version string) {
 		sts.Spec.Template.Annotations = map[string]string{}
 	}
 	sts.Spec.Template.Annotations[builder.AuthSecretVersionAnnotation] = version
+}
+
+// stampTLSSecretVersion records on the pod template which version of the TLS
+// secrets the pods loaded their certificates from, so a renewal rolls them.
+func stampTLSSecretVersion(sts *appsv1.StatefulSet, version string) {
+	if version == "" {
+		return
+	}
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = map[string]string{}
+	}
+	sts.Spec.Template.Annotations[builder.TLSSecretVersionAnnotation] = version
 }
 
 // warnOnRollout announces a pod restart before it happens. Rolling a
@@ -614,27 +919,33 @@ func (r *RedisSentinelReconciler) warnOnRollout(ctx context.Context, rs *redisv1
 		return
 	}
 
-	// A rotation is the one case where the pods disagree with each other while
-	// the roll runs: a restarted node presents the new password to peers that
-	// still require the old one, so replication and Sentinel authentication
-	// stay broken until the last pod has restarted.
+	// The rotated credential was already pushed to every running node before
+	// the stamp changed, so this roll only makes it durable.
 	if authSecretVersionOf(existing) != authSecretVersionOf(desired) {
-		message += "; the auth Secret changed, so replication and Sentinel " +
-			"authentication are interrupted until every pod has restarted"
+		message += "; the auth Secret changed and the new password was already " +
+			"pushed online, this roll makes it durable"
+	}
+	if tlsSecretVersionOf(existing) != tlsSecretVersionOf(desired) {
+		message += "; the TLS secrets changed, so the pods restart to load the renewed certificates"
 	}
 
 	recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "ConfigRollout",
 		fmt.Sprintf("%s: %s", desired.Name, message))
 }
 
-// podConfigIdentity is the pair of annotations that decide whether the
+// podConfigIdentity is the set of annotations that decide whether the
 // StatefulSet controller replaces the pods.
 func podConfigIdentity(sts *appsv1.StatefulSet) string {
-	return sts.Spec.Template.Annotations[builder.ConfigHashAnnotation] + "/" + authSecretVersionOf(sts)
+	return sts.Spec.Template.Annotations[builder.ConfigHashAnnotation] + "/" +
+		authSecretVersionOf(sts) + "/" + tlsSecretVersionOf(sts)
 }
 
 func authSecretVersionOf(sts *appsv1.StatefulSet) string {
 	return sts.Spec.Template.Annotations[builder.AuthSecretVersionAnnotation]
+}
+
+func tlsSecretVersionOf(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[builder.TLSSecretVersionAnnotation]
 }
 
 func (r *RedisSentinelReconciler) reconcileNetworkPolicies(ctx context.Context, rs *redisv1alpha1.RedisSentinel) error {
@@ -841,6 +1152,7 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 
 	if sentinelStatefulSet.Status.ReadyReplicas >= rs.Spec.SentinelConfig.Replicas {
 		r.pruneRemovedSentinels(ctx, rs, adminPassword, tlsCfg)
+		conditions = append(conditions, r.syncSentinelMonitorConfig(ctx, rs, adminPassword, tlsCfg))
 	}
 
 	rs.Status.Conditions = conditions
@@ -913,6 +1225,81 @@ func (r *RedisSentinelReconciler) reconcileMasterLabel(ctx context.Context, rs *
 	return labeled, nil
 }
 
+// syncSentinelMonitorConfig converges the monitor parameters every running
+// sentinel applies towards the spec and reports the outcome as a condition.
+// Sentinel keeps durable state on its PVC, so the ConfigMap template is read
+// once, on first boot: editing quorum or the timers in the spec rolls the pods
+// and changes nothing. The live values are therefore repaired at runtime, and
+// because SENTINEL SET never propagates between sentinels, every member is
+// read and repaired individually.
+func (r *RedisSentinelReconciler) syncSentinelMonitorConfig(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) metav1.Condition {
+	logger := log.FromContext(ctx)
+	masterName := rs.Name + "-master"
+	factory := factoryOrDefault(r.RedisFactory)
+
+	cond := metav1.Condition{
+		Type:               "SentinelConfigInSync",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: rs.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "InSync",
+		Message:            "Every running sentinel applies the monitor parameters in the spec",
+	}
+
+	addrs, err := r.runningPodAddresses(ctx, rs, "sentinel", 26379)
+	if err != nil {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "PodListFailed"
+		cond.Message = err.Error()
+		return cond
+	}
+
+	desired := []struct{ option, value string }{
+		{"down-after-milliseconds", fmt.Sprintf("%d", rs.Spec.SentinelConfig.DownAfterMilliseconds)},
+		{"failover-timeout", fmt.Sprintf("%d", rs.Spec.SentinelConfig.FailoverTimeout)},
+		{"parallel-syncs", fmt.Sprintf("%d", rs.Spec.SentinelConfig.ParallelSyncs)},
+		{"quorum", fmt.Sprintf("%d", rs.Spec.SentinelConfig.Quorum)},
+	}
+
+	var repaired, failures []string
+	for _, addr := range addrs {
+		pool := factory.NewSentinelPool([]string{addr}, password, tlsCfg)
+		info, err := pool.GetMasterFromPool(ctx, masterName)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", addr, err))
+			continue
+		}
+		reported := map[string]string{
+			"down-after-milliseconds": info.DownAfterMilliseconds,
+			"failover-timeout":        info.FailoverTimeout,
+			"parallel-syncs":          info.ParallelSyncs,
+			"quorum":                  info.Quorum,
+		}
+		for _, want := range desired {
+			if reported[want.option] == want.value {
+				continue
+			}
+			if err := pool.SetMasterOptionAll(ctx, masterName, want.option, want.value); err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %s: %v", addr, want.option, err))
+				continue
+			}
+			repaired = append(repaired, fmt.Sprintf("%s: %s %s -> %s", addr, want.option, reported[want.option], want.value))
+		}
+	}
+
+	if len(repaired) > 0 {
+		logger.Info("Repaired drifted sentinel monitor parameters", "repairs", repaired)
+		recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "SentinelConfigRepaired",
+			"Reapplied the spec's monitor parameters: "+strings.Join(repaired, ", "))
+	}
+	if len(failures) > 0 {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "DriftRepairFailed"
+		cond.Message = strings.Join(failures, "; ")
+	}
+	return cond
+}
+
 func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (string, error) {
 	masterName := rs.Name + "-master"
 
@@ -926,10 +1313,24 @@ func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redi
 	return masterAddr, nil
 }
 
-// getAdminPassword retrieves the Redis admin password from the secret
+// getAdminPassword retrieves the password the cluster currently accepts. The
+// applied-credentials Secret is authoritative once it exists: during a pending
+// rotation the user Secret already holds the new password while every node
+// still requires the previous one, and the operator must keep authenticating
+// throughout.
 func (r *RedisSentinelReconciler) getAdminPassword(ctx context.Context, rs *redisv1alpha1.RedisSentinel) string {
 	if rs.Spec.RedisConfig.Auth == nil || rs.Spec.RedisConfig.Auth.SecretName == "" {
 		return ""
+	}
+
+	applied := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      appliedAuthSecretName(rs),
+		Namespace: rs.Namespace,
+	}, applied); err == nil {
+		if password, ok := applied.Data[appliedPasswordKey]; ok {
+			return string(password)
+		}
 	}
 
 	secret := &corev1.Secret{}
@@ -1465,12 +1866,13 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 	logger.V(2).Info("Collected metrics from pod", "pod", podName)
 }
 
-// sentinelsForAuthSecret maps a Secret back to the RedisSentinels that name it
-// as their auth Secret. The Secret is created by the user and can be shared, so
-// no owner reference points from it to a CR and Owns() cannot see it; without
-// this mapping a rotated password sits in the Secret while every pod keeps
-// serving the credential it read at startup.
-func (r *RedisSentinelReconciler) sentinelsForAuthSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+// sentinelsForReferencedSecret maps a Secret back to the RedisSentinels that
+// reference it as their auth Secret or as one of their TLS secrets. These
+// Secrets are created by the user and can be shared, so no owner reference
+// points from them to a CR and Owns() cannot see them; without this mapping a
+// rotated password or a renewed certificate sits in the Secret while every pod
+// keeps serving what it read at startup.
+func (r *RedisSentinelReconciler) sentinelsForReferencedSecret(ctx context.Context, obj client.Object) []reconcile.Request {
 	list := &redisv1alpha1.RedisSentinelList{}
 	if err := r.List(ctx, list, client.InNamespace(obj.GetNamespace())); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to list RedisSentinels for a Secret change",
@@ -1481,8 +1883,7 @@ func (r *RedisSentinelReconciler) sentinelsForAuthSecret(ctx context.Context, ob
 	var requests []reconcile.Request
 	for i := range list.Items {
 		rs := &list.Items[i]
-		auth := rs.Spec.RedisConfig.Auth
-		if auth == nil || auth.SecretName != obj.GetName() {
+		if !referencesSecret(rs, obj.GetName()) {
 			continue
 		}
 		requests = append(requests, reconcile.Request{
@@ -1490,6 +1891,20 @@ func (r *RedisSentinelReconciler) sentinelsForAuthSecret(ctx context.Context, ob
 		})
 	}
 	return requests
+}
+
+// referencesSecret reports whether name is the CR's auth Secret or one of its
+// TLS secrets.
+func referencesSecret(rs *redisv1alpha1.RedisSentinel, name string) bool {
+	if auth := rs.Spec.RedisConfig.Auth; auth != nil && auth.SecretName == name {
+		return true
+	}
+	if tlsSpec := rs.Spec.TLS; tlsSpec != nil && tlsSpec.Enabled {
+		if tlsSpec.CertificateSecretRef == name || tlsSpec.CASecretRef == name {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -1507,7 +1922,7 @@ func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.sentinelsForAuthSecret)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.sentinelsForReferencedSecret)).
 		Named("redissentinel").
 		Complete(r)
 }

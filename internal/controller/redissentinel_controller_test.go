@@ -82,10 +82,13 @@ var _ = Describe("RedisSentinel Controller", func() {
 				Expect(k8sClient.Create(ctx, newTestSentinel(resourceName, "default"))).To(Succeed())
 			}
 
+			// A fake factory: the default one resolves *.svc.cluster.local
+			// per pass, stalling in mDNS for seconds outside a cluster.
 			controllerReconciler = &RedisSentinelReconciler{
-				Client:   k8sClient,
-				Scheme:   k8sClient.Scheme(),
-				Recorder: testRecorder,
+				Client:       k8sClient,
+				Scheme:       k8sClient.Scheme(),
+				Recorder:     testRecorder,
+				RedisFactory: fake.NewFactory(),
 			}
 		})
 

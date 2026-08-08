@@ -86,9 +86,10 @@ var _ = Describe("RedisSentinel PodDisruptionBudgets", func() {
 
 	BeforeEach(func() {
 		reconciler = &RedisSentinelReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: testRecorder,
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: fake.NewFactory(),
 		}
 		Expect(k8sClient.Create(ctx, newTestSentinel(resourceName, "default"))).To(Succeed())
 		reconcileUntilSettled(ctx, reconciler, key)

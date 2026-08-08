@@ -35,6 +35,7 @@ import (
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 	"github.com/redguard/redguard/internal/builder"
+	redisfake "github.com/redguard/redguard/internal/redisclient/fake"
 )
 
 // TestSecretWatchIsRegistered guards the wiring the map function alone cannot
@@ -77,10 +78,13 @@ var _ = Describe("RedisSentinel configuration rollout", func() {
 	}
 
 	BeforeEach(func() {
+		// A fake factory: the default one resolves *.svc.cluster.local on
+		// every pass, which stalls in mDNS for seconds outside a cluster.
 		reconciler = &RedisSentinelReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: testRecorder,
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: redisfake.NewFactory(),
 		}
 
 		ensureSecret(secretName, "default", map[string][]byte{"password": []byte("initial-password")})
@@ -207,17 +211,17 @@ var _ = Describe("RedisSentinel configuration rollout", func() {
 		secret := &corev1.Secret{}
 		Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
 
-		Expect(reconciler.sentinelsForAuthSecret(ctx, secret)).To(ContainElement(
+		Expect(reconciler.sentinelsForReferencedSecret(ctx, secret)).To(ContainElement(
 			reconcile.Request{NamespacedName: key}))
 
 		other := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Name: "unreferenced-secret", Namespace: "default"}}
-		Expect(reconciler.sentinelsForAuthSecret(ctx, other)).To(BeEmpty(),
+		Expect(reconciler.sentinelsForReferencedSecret(ctx, other)).To(BeEmpty(),
 			"an unrelated Secret must not restart a Redis cluster")
 
 		elsewhere := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Name: secretName, Namespace: "kube-system"}}
-		Expect(reconciler.sentinelsForAuthSecret(ctx, elsewhere)).To(BeEmpty(),
+		Expect(reconciler.sentinelsForReferencedSecret(ctx, elsewhere)).To(BeEmpty(),
 			"a same-named Secret in another namespace is a different Secret")
 	})
 })
@@ -232,9 +236,10 @@ var _ = Describe("RedisSentinel configuration rollout without auth", func() {
 
 	BeforeEach(func() {
 		reconciler = &RedisSentinelReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: testRecorder,
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     testRecorder,
+			RedisFactory: redisfake.NewFactory(),
 		}
 		Expect(k8sClient.Create(ctx, newTestSentinel(resourceName, "default"))).To(Succeed())
 		reconcileUntilSettled(ctx, reconciler, key)

@@ -39,6 +39,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
@@ -119,6 +120,13 @@ var _ = BeforeSuite(func() {
 	// testRecorder: FakeRecorder.Event blocks once its buffer is full, which
 	// would wedge the Manager's worker goroutine after 100 background
 	// reconciles. testRecorder stays reserved for spec-owned reconcilers.
+	//
+	// It keeps the default Redis factory on purpose. Its dials all fail out
+	// here, slowly, which keeps the background worker well behind the
+	// spec-owned reconcilers; a fast factory makes it win races against the
+	// specs whose events and diffs assume they converge the object first.
+	// Spec-owned reconcilers inject fakes instead, so the specs themselves
+	// never wait on those slow lookups.
 	err = (&RedisSentinelReconciler{
 		Client:   k8sManager.GetClient(),
 		Scheme:   k8sManager.GetScheme(),
