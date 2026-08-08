@@ -14,6 +14,10 @@ What the operator defends against:
   an allowlist and narrowed by a confinement floor, so a user cannot enumerate
   or wipe the keyspace, or reach administrative commands.
 - **A `RedisUser` hijacking the admin account.** `default` is reserved.
+- **A revoked account outliving its `RedisUser`.** The ACL file survives on
+  the retained data volume, so every account the operator creates is recorded
+  as operator-created and removed from every node once no `RedisUser`
+  declares it. See [The ACL account lifecycle](#the-acl-account-lifecycle).
 - **A `RedisBackup` pointing the operator's AWS identity somewhere else.**
   IAM-role backups must name a bucket and endpoint the cluster administrator
   allowlisted on the operator.
@@ -126,6 +130,61 @@ password on every start, so a rotated password takes effect and an ACL file that
 lost the line cannot silently leave the instance open. Only the SHA-256 of the
 password is stored, and it reaches `sha256sum` through a pipe, never through
 `argv`.
+
+## The ACL account lifecycle
+
+`RedisUser` accounts are saved to every node's ACL file, and that file lives on
+the Redis data volume, which deliberately survives the deletion of a
+`RedisSentinel` because it holds user data. Deleting a cluster and recreating
+it under the same name therefore restores every account the file held —
+including accounts revoked, and passwords rotated, while the cluster was gone.
+
+The declared `RedisUser` set is authoritative for the accounts the operator
+created. Each one is recorded in a per-cluster ConfigMap named
+`<cluster>-acl-owners` (username → owning `RedisUser`), written before the
+account first reaches any node so a crash between the two writes can only
+leave a stale record, never an untracked account. The ConfigMap carries no
+owner reference on purpose: it describes the ACL file on the retained volume
+and must outlive the cluster the same way. On every settled reconcile pass the
+operator enumerates the accounts each running node actually holds
+(`ACL USERS`) and removes any recorded account that no `RedisUser` declares,
+persisting the removal with `ACL SAVE`. Each removal is recorded as an
+`ACLUserPruned` event on the `RedisSentinel`, naming the account, the nodes,
+and the `RedisUser` that once owned it.
+
+What is never pruned:
+
+- **`default`.** It is the account the operator itself authenticates as. It is
+  refused here by the same validation that refuses it as a spec, and Redis
+  refuses to delete it besides.
+- **Accounts an administrator created by hand.** They carry no ownership
+  record. This is why pruning needs no opt-in: deleting a hand-made account by
+  default would be its own kind of data loss, while deleting a revoked
+  operator-created one is exactly the declared state.
+
+The pass fails closed. If the ownership record or the `RedisUser` list cannot
+be read, nothing is pruned — an unreadable list is not an empty one, and the
+account's owner may simply not be visible. A node that cannot be enumerated is
+skipped while the reachable nodes are still cleaned, an `ACLPruneIncomplete`
+warning is recorded, and the ownership record is kept until the removal is
+verified on every node, so the skipped node is cleaned when it returns.
+
+Residual gaps, kept deliberately:
+
+- Accounts orphaned by operator versions before the ownership record existed
+  are never pruned: nothing marks them as operator-created, and guessing would
+  delete hand-made accounts. Clear one by recreating and deleting its
+  `RedisUser`, or with `ACL DELUSER` and `ACL SAVE` on every node.
+- A hand-created account that reuses the name of a recorded operator-created
+  account is removed until that record clears. Records are dropped as soon as
+  the removal is verified everywhere, which keeps the window to the life of
+  the orphan itself.
+- A volume retained from a scale-down keeps its ACL file. Scaling back up can
+  restore an account deleted in between, and if its record was already
+  cleared it is not pruned again; the recreate-and-delete remediation above
+  applies.
+- Deleting a cluster for good leaves `<cluster>-acl-owners` behind, exactly as
+  it leaves the data volumes. Delete both if the cluster is not coming back.
 
 ## Configuration the operator owns
 

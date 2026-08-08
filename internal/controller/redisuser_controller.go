@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -80,6 +81,7 @@ type RedisUserReconciler struct {
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisusers/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update
 
 func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -188,6 +190,17 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
 	}
 
+	// Recorded before the first SETUSER, so a crash between the two writes can
+	// only leave a stale record, never a live account nothing marks as
+	// operator-created. The prune pass trusts this record to tell an
+	// operator's account from an administrator's.
+	if err := ensureACLOwner(ctx, r.Client, redisUser.Namespace, redisSentinel.Name,
+		redisUser.Spec.Username, redisUser.Name); err != nil {
+		logger.Error(err, "Failed to record ACL ownership")
+		r.updateStatus(ctx, redisUser, "Error", nil, fmt.Sprintf("ACL ownership record not writable: %v", err))
+		return ctrl.Result{RequeueAfter: userRetryInterval}, nil
+	}
+
 	// ACL commands are not replicated, so every node needs its own copy for the
 	// user to survive a failover.
 	appliedTo := []string{}
@@ -254,7 +267,12 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 			logger.Error(err, "Failed to get RedisSentinel for ACL cleanup")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		// The cluster is gone, so no server is left holding the account.
+		// The cluster is gone, so no reachable server holds the account -- but
+		// the retained data volume may, and a recreation under the same name
+		// restores it from the aclfile. The ownership record is left in place
+		// as the tombstone the prune pass acts on then; only the finalizer
+		// goes, because waiting for a cluster that may never return would
+		// block namespace deletion forever.
 		return r.removeFinalizer(ctx, redisUser)
 	}
 
@@ -303,6 +321,14 @@ func (r *RedisUserReconciler) handleDeletion(ctx context.Context, redisUser *red
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	// Dropped only after every node took the removal: an entry outliving a
+	// half-done cleanup is what lets the prune pass finish the job later.
+	if err := removeACLOwners(ctx, r.Client, redisUser.Namespace,
+		redisUser.Spec.RedisClusterRef, []string{redisUser.Spec.Username}); err != nil {
+		logger.Error(err, "Failed to drop the ACL ownership record")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	return r.removeFinalizer(ctx, redisUser)
 }
 
@@ -329,6 +355,82 @@ func (r *RedisUserReconciler) deleteACL(ctx context.Context, addr, adminPassword
 		return fmt.Errorf("persisting ACL removal: %w", err)
 	}
 	return nil
+}
+
+// aclOwnersName is the per-cluster ConfigMap recording which ACL accounts the
+// operator created: one key per username, valued with the owning RedisUser's
+// name. It carries no owner reference on purpose. The aclfile it describes
+// lives on the retained data volume and outlives the RedisSentinel, so the
+// record must too, or a recreated cluster could not tell a resurrected
+// operator-created account from one an administrator made by hand.
+func aclOwnersName(clusterName string) string {
+	return clusterName + "-acl-owners"
+}
+
+// ensureACLOwner records username as operator-created. It runs before the
+// first SETUSER, so a crash between the two writes can only leave a stale
+// record, never a live account nothing marks as prunable.
+func ensureACLOwner(ctx context.Context, c client.Client, namespace, clusterName, username, owner string) error {
+	key := types.NamespacedName{Name: aclOwnersName(clusterName), Namespace: namespace}
+	return retry.OnError(retry.DefaultRetry, isRaceError, func() error {
+		cm := &corev1.ConfigMap{}
+		err := c.Get(ctx, key, cm)
+		if apierrors.IsNotFound(err) {
+			cm = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      key.Name,
+					Namespace: key.Namespace,
+					// managed-by is also what admits the record into the
+					// operator's label-scoped informer cache.
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "redguard-operator",
+						"app.kubernetes.io/instance":   clusterName,
+					},
+				},
+				Data: map[string]string{username: owner},
+			}
+			return c.Create(ctx, cm)
+		}
+		if err != nil {
+			return err
+		}
+		if cm.Data[username] == owner {
+			return nil
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[username] = owner
+		return c.Update(ctx, cm)
+	})
+}
+
+// removeACLOwners drops usernames from the cluster's ownership record, for
+// accounts that are verified gone from every node. An absent record or entry
+// is the desired end state, not a failure.
+func removeACLOwners(ctx context.Context, c client.Client, namespace, clusterName string, usernames []string) error {
+	key := types.NamespacedName{Name: aclOwnersName(clusterName), Namespace: namespace}
+	return retry.OnError(retry.DefaultRetry, isRaceError, func() error {
+		cm := &corev1.ConfigMap{}
+		err := c.Get(ctx, key, cm)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		changed := false
+		for _, username := range usernames {
+			if _, ok := cm.Data[username]; ok {
+				delete(cm.Data, username)
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		return c.Update(ctx, cm)
+	})
 }
 
 // usernamePattern mirrors the CRD's Pattern marker so a stale CRD cannot let

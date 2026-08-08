@@ -82,6 +82,7 @@ func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels/finalizers,verbs=update
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores,verbs=get;list;watch
+// +kubebuilder:rbac:groups=redis.redguard.io,resources=redisusers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -1118,6 +1119,10 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 			// the freshly promoted master gets demoted.
 			if !masterMoved && failoverSettled {
 				r.repointStrayReplicas(ctx, rs, masterNode, adminPassword, tlsCfg)
+				// Same settledness gate: pruning compares an enumeration of
+				// every node against the declared RedisUser set, and a pass
+				// where the master is still moving is not a coherent view.
+				r.pruneOrphanedACLUsers(ctx, rs, adminPassword, tlsCfg)
 			}
 
 			labeled, err := r.reconcileMasterLabel(ctx, rs, masterNode)
@@ -1571,6 +1576,185 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 		return false
 	}
 	return true
+}
+
+// pruneOrphanedACLUsers removes, from every enumerable Redis node, the ACL
+// accounts the operator itself created whose RedisUser no longer exists. The
+// aclfile lives on the retained data volume, so deleting a cluster and
+// recreating it under the same name restores every account it ever saved --
+// including one whose RedisUser was revoked while the cluster was gone, which
+// otherwise stays live under its old password with no CR referencing it.
+//
+// Only accounts named in the ownership record are candidates: an account an
+// administrator created by hand carries no record and is never touched, and
+// validateUsername refuses 'default' here exactly as it refuses it in a spec.
+// The pass fails closed. An unreadable record or RedisUser list prunes
+// nothing -- an unreadable list is not an empty one -- and a node that could
+// not be enumerated keeps every record entry, so its copy of the account is
+// removed when the node returns instead of being forgotten while it still
+// holds it.
+func (r *RedisSentinelReconciler) pruneOrphanedACLUsers(ctx context.Context, rs *redisv1alpha1.RedisSentinel, adminPassword string, tlsCfg *tls.Config) {
+	logger := log.FromContext(ctx)
+
+	owners := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: aclOwnersName(rs.Name), Namespace: rs.Namespace}, owners); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "Cannot read the ACL ownership record, skipping the prune pass")
+		}
+		// No record: the operator never created an account on this cluster.
+		return
+	}
+	if len(owners.Data) == 0 {
+		return
+	}
+
+	addrs, err := r.runningPodAddresses(ctx, rs, "redis", 6379)
+	if err != nil || len(addrs) == 0 {
+		return
+	}
+
+	factory := factoryOrDefault(r.RedisFactory)
+	clients := make(map[string]redisclient.Client, len(addrs))
+	defer func() {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	}()
+
+	// Enumerated before the RedisUsers are listed: an account reaches a node
+	// only after its CR was written, so every enumerated account's CR, if it
+	// exists, is visible to the List below and cannot be taken for an orphan.
+	held, unreached := enumerateACLAccounts(ctx, factory, clients, addrs, adminPassword, tlsCfg)
+
+	users := &redisv1alpha1.RedisUserList{}
+	if err := r.List(ctx, users, client.InNamespace(rs.Namespace)); err != nil {
+		logger.Error(err, "Cannot list RedisUsers, skipping the prune pass")
+		return
+	}
+	declared := make(map[string]struct{}, len(users.Items))
+	for i := range users.Items {
+		if users.Items[i].Spec.RedisClusterRef == rs.Name {
+			declared[users.Items[i].Spec.Username] = struct{}{}
+		}
+	}
+
+	orphans := make([]string, 0, len(owners.Data))
+	for username := range owners.Data {
+		// validateUsername refuses 'default' and anything the operator would
+		// never have written, so a hand-edited record cannot aim a DELUSER at
+		// the admin account.
+		if validateUsername(username) != nil {
+			continue
+		}
+		if _, ok := declared[username]; ok {
+			continue
+		}
+		orphans = append(orphans, username)
+	}
+	if len(orphans) == 0 {
+		return
+	}
+	slices.Sort(orphans)
+
+	pruned, failures := deleteACLAccounts(ctx, clients, addrs, held, orphans)
+
+	for _, username := range orphans {
+		nodes := pruned[username]
+		if len(nodes) == 0 {
+			continue
+		}
+		logger.Info("Pruned an orphaned ACL account",
+			"username", username, "owner", owners.Data[username], "nodes", nodes)
+		recordEvent(r.Recorder, rs, corev1.EventTypeNormal, "ACLUserPruned", fmt.Sprintf(
+			"Removed ACL account %q from %s: created through RedisUser %q, which no longer exists",
+			username, strings.Join(nodes, ", "), owners.Data[username]))
+	}
+
+	// Coverage below the spec'd size means a node that exists, or should, was
+	// not cleaned; above it -- a held scale-down -- is extra coverage, and the
+	// doomed ordinal's aclfile is cleaned before its volume is retained.
+	complete := len(unreached) == 0 && len(failures) == 0 &&
+		int32(len(addrs)) >= rs.Spec.RedisConfig.Replicas
+	if !complete {
+		detail := strings.Join(append(append([]string{}, unreached...), failures...), "; ")
+		if detail == "" {
+			detail = fmt.Sprintf("%d of %d Redis pods running", len(addrs), rs.Spec.RedisConfig.Replicas)
+		}
+		recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "ACLPruneIncomplete", fmt.Sprintf(
+			"Orphaned ACL account(s) %s could not be verified removed from every node (%s); "+
+				"the ownership records are kept and the prune is retried",
+			strings.Join(orphans, ", "), detail))
+		return
+	}
+
+	// Every node was enumerated and every removal persisted, so the entries
+	// describe nothing any more. Kept longer, they would mark a future
+	// hand-made account of the same name for deletion.
+	if err := removeACLOwners(ctx, r.Client, rs.Namespace, rs.Name, orphans); err != nil {
+		logger.Error(err, "Failed to drop pruned accounts from the ownership record")
+	}
+}
+
+// enumerateACLAccounts lists the accounts each node holds, dialling through the
+// shared client map so the caller closes them. A node that cannot be reached is
+// reported rather than treated as holding nothing: an unreadable node is not an
+// empty one, and pruning on that assumption would forget an account the node
+// still has.
+func enumerateACLAccounts(ctx context.Context, factory redisclient.Factory, clients map[string]redisclient.Client,
+	addrs []string, adminPassword string, tlsCfg *tls.Config) (map[string]map[string]struct{}, []string) {
+	held := make(map[string]map[string]struct{}, len(addrs))
+	unreached := make([]string, 0, len(addrs))
+
+	for _, addr := range addrs {
+		c := factory.NewClient(addr, adminPassword, tlsCfg)
+		clients[addr] = c
+		names, err := c.ACLUsers(ctx)
+		if err != nil {
+			unreached = append(unreached, fmt.Sprintf("%s: %v", addr, err))
+			continue
+		}
+		set := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			set[name] = struct{}{}
+		}
+		held[addr] = set
+	}
+	return held, unreached
+}
+
+// deleteACLAccounts removes the named accounts from the nodes that hold them and
+// persists each node's aclfile, without which the next restart restores what was
+// just deleted. It reports which nodes each account left, and every failure, so
+// the caller can tell a complete prune from a partial one.
+func deleteACLAccounts(ctx context.Context, clients map[string]redisclient.Client, addrs []string,
+	held map[string]map[string]struct{}, orphans []string) (map[string][]string, []string) {
+	pruned := map[string][]string{}
+	failures := make([]string, 0, len(addrs))
+
+	for _, addr := range addrs {
+		names, enumerated := held[addr]
+		if !enumerated {
+			continue
+		}
+		removed := false
+		for _, username := range orphans {
+			if _, ok := names[username]; !ok {
+				continue
+			}
+			if err := clients[addr].ACLDelUser(ctx, username); err != nil {
+				failures = append(failures, fmt.Sprintf("%s on %s: %v", username, addr, err))
+				continue
+			}
+			pruned[username] = append(pruned[username], addr)
+			removed = true
+		}
+		if removed {
+			if err := clients[addr].ACLSave(ctx); err != nil {
+				failures = append(failures, fmt.Sprintf("persisting removals on %s: %v", addr, err))
+			}
+		}
+	}
+	return pruned, failures
 }
 
 // repointStrayReplicas sends SLAVEOF to every replica whose replication source

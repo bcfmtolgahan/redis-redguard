@@ -2,6 +2,31 @@
 
 All notable changes to Redguard are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Orphaned ACL accounts are pruned.** 0.3.0 listed this as a known
+  limitation: the ACL file lives on the retained Redis data volume, so deleting
+  a `RedisSentinel` and recreating it under the same name brought back every
+  account with its previous password, and a `RedisUser` deleted while its
+  cluster was gone left its account live forever. The operator now records
+  every account it creates in a per-cluster `<name>-acl-owners` ConfigMap,
+  written before the account first reaches any node and deliberately not
+  garbage-collected with the cluster, and on each settled pass removes
+  recorded accounts that no `RedisUser` declares from every running node
+  (`ACL DELUSER` plus `ACL SAVE`), recording an `ACLUserPruned` event per
+  account. A `spec.username` change now also removes the account under the
+  previous name once the cluster settles. `default` and accounts created by
+  hand are never touched, so pruning needs no opt-in. The pass fails closed:
+  an unreadable ownership record or `RedisUser` list prunes nothing, and a
+  node that cannot be enumerated keeps the record and raises an
+  `ACLPruneIncomplete` warning until the removal is verified everywhere.
+  Residual gaps, documented in [docs/security.md](docs/security.md): accounts
+  orphaned under 0.3.0 or earlier carry no ownership record and are left
+  alone (recreate and delete the `RedisUser` to clear one), and a hand-made
+  account that reuses a recorded name is removed until that record clears.
+
 ## [0.3.0] - 2026-08-08
 
 The first release that starts. 0.2.1 and earlier could not: the chart never

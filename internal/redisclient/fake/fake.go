@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,6 +107,17 @@ func (f *Factory) SetReplicaOf(addr, followed string) {
 	n := f.node(addr)
 	n.role = roleReplica
 	n.masterHost, n.masterPort = splitHostPort(followed)
+}
+
+// SeedUser plants an account on one node outside any ACLSetUser call, in both
+// its runtime and saved sets: it models an account restored from the node's
+// aclfile, which is what a retained data volume brings back on a recreate.
+func (f *Factory) SeedUser(addr, username string, rules ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.node(addr)
+	n.users[username] = append([]string(nil), rules...)
+	n.savedUsers[username] = append([]string(nil), rules...)
 }
 
 // Users returns the rules of the most recent ACLSetUser per username, across
@@ -446,12 +458,32 @@ func (c *client) ACLDelUser(ctx context.Context, username string) error {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.record(c.addr, "ACLDelUser")
+	c.f.recordOp(c.addr + ":ACLDelUser:" + username)
 	if err := c.f.errorFor(c.addr, "ACLDelUser"); err != nil {
 		return err
 	}
 	delete(c.f.node(c.addr).users, username)
 	delete(c.f.users, username)
 	return nil
+}
+
+// ACLUsers lists the usernames the node currently knows. 'default' always
+// exists on a real node, so the fake reports it too.
+func (c *client) ACLUsers(ctx context.Context) ([]string, error) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.record(c.addr, "ACLUsers")
+	if err := c.f.errorFor(c.addr, "ACLUsers"); err != nil {
+		return nil, err
+	}
+	names := []string{"default"}
+	for u := range c.f.node(c.addr).users {
+		if u != "default" {
+			names = append(names, u)
+		}
+	}
+	slices.Sort(names)
+	return names, nil
 }
 
 // ACLSave snapshots the node's runtime users into its saved set, mirroring the

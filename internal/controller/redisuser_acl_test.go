@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -323,6 +324,96 @@ var _ = Describe("RedisUser ACL application", func() {
 		foreign := pod.DeepCopy()
 		foreign.Labels["app.kubernetes.io/managed-by"] = "someone-else"
 		Expect(reconciler.redisUsersForPod(ctx, foreign)).To(BeEmpty())
+	})
+
+	It("records ownership before any node holds the account", func() {
+		for _, addr := range addresses {
+			factory.SetError(addr, "ACLSetUser", fmt.Errorf("connection refused"))
+		}
+		user := newACLUser("acl-ledger-first", "ledgerfirst")
+		Expect(k8sClient.Create(ctx, user)).To(Succeed())
+		DeferCleanup(func() {
+			for _, addr := range addresses {
+				factory.SetError(addr, "ACLSetUser", nil)
+			}
+			removeUser(user)
+		})
+
+		key := client.ObjectKeyFromObject(user)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Every SETUSER failed, so no node knows the account; the record must
+		// exist anyway, or a crash between the two writes leaves a live
+		// account nothing marks as operator-created, unprunable forever.
+		Expect(factory.Users()).NotTo(HaveKey("ledgerfirst"))
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: aclOwnersName(cluster), Namespace: ns}, cm)).To(Succeed())
+		Expect(cm.Data).To(HaveKeyWithValue("ledgerfirst", "acl-ledger-first"))
+		Expect(cm.OwnerReferences).To(BeEmpty(),
+			"an owner reference would garbage-collect the record with the cluster, but the aclfile it describes outlives the cluster on the retained volume")
+	})
+
+	It("drops the ownership record when the account is removed from every node", func() {
+		user := newACLUser("acl-ledger-drop", "ledgerdrop")
+		Expect(k8sClient.Create(ctx, user)).To(Succeed())
+
+		key := client.ObjectKeyFromObject(user)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: aclOwnersName(cluster), Namespace: ns}, cm)).To(Succeed())
+		Expect(cm.Data).To(HaveKeyWithValue("ledgerdrop", "acl-ledger-drop"))
+
+		removeUser(user)
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: aclOwnersName(cluster), Namespace: ns}, cm)).To(Succeed())
+		Expect(cm.Data).NotTo(HaveKey("ledgerdrop"),
+			"a record kept after a clean removal would mark a future hand-made account of the same name for deletion")
+	})
+
+	It("keeps the ownership record when the cluster is gone at deletion", func() {
+		const goneCluster = "acl-gone-cluster"
+		ensureTestSentinel(goneCluster, ns)
+		ensureReadyRedisPod(goneCluster+"-redis-0", ns, goneCluster, "10.244.2.1")
+		DeferCleanup(func() { deleteRedisPods(ns, goneCluster) })
+
+		user := &redisv1alpha1.RedisUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "acl-tombstone", Namespace: ns},
+			Spec: redisv1alpha1.RedisUserSpec{
+				RedisClusterRef:   goneCluster,
+				Username:          "tombstoned",
+				PasswordSecretRef: "acl-user-pass",
+			},
+		}
+		Expect(k8sClient.Create(ctx, user)).To(Succeed())
+		key := client.ObjectKeyFromObject(user)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("deleting the cluster while its retained volume still holds the account")
+		rs := &redisv1alpha1.RedisSentinel{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: goneCluster, Namespace: ns}, rs)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, rs)).To(Succeed())
+		// The managed reconciler removes the cluster finalizer in the background.
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx,
+				types.NamespacedName{Name: goneCluster, Namespace: ns}, &redisv1alpha1.RedisSentinel{}))
+		}, 20*time.Second, 200*time.Millisecond).Should(BeTrue())
+
+		Expect(k8sClient.Delete(ctx, user)).To(Succeed())
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &redisv1alpha1.RedisUser{}))).To(BeTrue())
+		}, 20*time.Second, 200*time.Millisecond).Should(Succeed())
+
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: aclOwnersName(goneCluster), Namespace: ns}, cm)).To(Succeed())
+		Expect(cm.Data).To(HaveKeyWithValue("tombstoned", "acl-tombstone"),
+			"the record is the only thing that lets a recreated cluster prune this account")
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, cm) })
 	})
 
 	It("keeps enabled: false across the finalizer write", func() {
