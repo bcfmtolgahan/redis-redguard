@@ -1,0 +1,82 @@
+{{- if and (gt (int .Values.operator.replicas) 1) (not .Values.operator.leaderElect) }}
+{{- fail "operator.replicas > 1 requires operator.leaderElect: true, otherwise every replica reconciles the same clusters" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "redguard.fullname" . }}
+  labels:
+    {{- include "redguard.labels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "redguard.selectorLabels" . | nindent 6 }}
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        {{- include "redguard.selectorLabels" . | nindent 8 }}
+        control-plane: controller-manager
+    spec:
+      serviceAccountName: {{ include "redguard.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
+      containers:
+      - name: manager
+        image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+        command:
+        - /manager
+        args:
+        {{- if .Values.operator.leaderElect }}
+        - --leader-elect
+        {{- end }}
+        {{- with .Values.operator.watchNamespaces }}
+        - --watch-namespace={{ join "," . }}
+        {{- end }}
+        {{- if .Values.operator.devLogging }}
+        - --zap-devel
+        {{- end }}
+        {{- if .Values.metrics.enabled }}
+        - --metrics-bind-address=:{{ .Values.metrics.port }}
+        {{- end }}
+        - --health-probe-bind-address=:{{ .Values.health.port }}
+        {{- with .Values.backup.allowedBuckets }}
+        - --allowed-backup-buckets={{ join "," . }}
+        {{- end }}
+        {{- with .Values.backup.allowedEndpoints }}
+        - --allowed-backup-endpoints={{ join "," . }}
+        {{- end }}
+        securityContext:
+          {{- toYaml .Values.operator.containerSecurityContext | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: {{ .Values.health.port }}
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: {{ .Values.health.port }}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          {{- toYaml .Values.operator.resources | nindent 10 }}
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.operator.terminationGracePeriodSeconds }}

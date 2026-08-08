@@ -1,0 +1,36 @@
+# Loads one S3 object back into the cluster's master; the replicas
+# resynchronise from it afterwards. Take the key from the producing backup:
+#
+#   kubectl get redisbackup redis-daily-backup -o jsonpath='{.status.backupLocation}'
+#
+# The restore restarts the master. If the restart outlasts
+# sentinelConfig.downAfterMilliseconds, Sentinel promotes a replica and the
+# restored data is discarded; check that status.phase reached Completed.
+apiVersion: redis.redguard.io/v1alpha1
+kind: RedisRestore
+metadata:
+  name: redis-restore
+  namespace: default
+spec:
+  # A RedisSentinel in this namespace.
+  redisClusterRef: redis-cluster
+
+  backupSource:
+    # Same shape and same one-of rule as RedisBackup.spec.s3.
+    s3:
+      bucket: my-redis-backups
+      region: us-east-1
+      # endpoint: http://minio.minio.svc.cluster.local:9000
+      credentialsSecretRef: aws-s3-creds
+
+    # Object key inside the bucket, not an s3:// URL.
+    backupPath: production/default/redis-cluster/backup-20260808-020000.rdb.gz
+
+    compressed: true
+
+  # Without force, a cluster that already holds keys is refused before
+  # anything is touched.
+  force: false
+
+  # Skips the pre-restore data check entirely.
+  skipDataCheck: false

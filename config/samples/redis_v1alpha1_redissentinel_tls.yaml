@@ -1,3 +1,11 @@
+# TLS clusters do not currently reach Running: see docs/operations.md#tls.
+#
+# One Secret holds the server certificate, its key and the CA. Naming a
+# separate Secret in caSecretRef mounts ca.crt with a subPath inside the
+# certificate volume, which the container runtime refuses.
+#
+# kubectl create secret generic redis-tls-bundle \
+#   --from-file=tls.crt=tls.crt --from-file=tls.key=tls.key --from-file=ca.crt=ca.crt
 apiVersion: redis.redguard.io/v1alpha1
 kind: RedisSentinel
 metadata:
@@ -7,6 +15,10 @@ spec:
   redisConfig:
     replicas: 3
     image: redis:7-alpine
+    auth:
+      secretName: redis-password
+    storage:
+      size: 1Gi
     resources:
       requests:
         cpu: 100m
@@ -14,13 +26,6 @@ spec:
       limits:
         cpu: 500m
         memory: 512Mi
-    storage:
-      size: 1Gi
-      storageClassName: standard
-    
-    # Authentication with password
-    auth:
-      secretName: redis-password  # kubectl create secret generic redis-password --from-literal=password=mysecurepassword
 
   sentinelConfig:
     replicas: 3
@@ -28,25 +33,12 @@ spec:
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
     parallelSyncs: 1
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        cpu: 200m
-        memory: 128Mi
 
-  # TLS Configuration
   tls:
     enabled: true
-    
-    # TLS certificate secret (kubectl create secret tls redis-tls-cert --cert=tls.crt --key=tls.key)
-    certificateSecretRef: redis-tls-cert
-    
-    # CA certificate secret (kubectl create secret generic redis-ca-cert --from-file=ca.crt)
-    caSecretRef: redis-ca-cert
-    
-    # Enable mutual TLS (client certificate verification)
-    mutualTLS: true
+    certificateSecretRef: redis-tls-bundle
+    caSecretRef: redis-tls-bundle
+    # Requires clients to present a certificate (tls-auth-clients yes).
+    mutualTLS: false
 
   serviceType: ClusterIP

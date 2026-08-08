@@ -1,0 +1,101 @@
+# Default values for redguard operator
+
+# Operator configuration
+operator:
+  # Number of operator replicas. More than one requires leaderElect.
+  replicas: 1
+
+  # Elect a single active manager. Two managers reconciling the same clusters
+  # race on master role labels and StatefulSet updates.
+  leaderElect: true
+
+  # Namespaces the operator watches, passed as --watch-namespace. Empty watches
+  # every namespace, which makes the informer cache hold objects cluster-wide.
+  watchNamespaces: []
+
+  # Seconds before the kubelet SIGKILLs the pod. Must stay above the manager's
+  # 30s reconcile drain plus the leader lease handover that follows it.
+  terminationGracePeriodSeconds: 60
+
+  # Console-format debug logging with stacktraces on warnings. The default is
+  # JSON at info level; turn this on only to debug the operator.
+  devLogging: false
+
+  image:
+    repository: ghcr.io/bcfmtolgahan/redguard
+    tag: v0.3.0
+    pullPolicy: IfNotPresent
+
+  # The informer cache is the main memory consumer, and Secrets cannot be
+  # label-scoped because they are user-created, so the ceiling scales with the
+  # number of Secrets in the watched namespaces; set watchNamespaces before
+  # lowering this. Backups stream the RDB to S3 in fixed-size parts, so backup
+  # memory stays flat regardless of dataset size.
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Pod-level security context. The defaults satisfy the restricted Pod
+  # Security Standard; 65532 is the uid the operator image ships with.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Security context of the manager container. The operator writes nothing to
+  # disk, so its root filesystem stays read-only.
+  containerSecurityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  # Node selector
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+  # Affinity
+  affinity: {}
+
+# Backup destination policy. Backups with spec.s3.useIAMRole run under the
+# operator's own AWS identity (IRSA), so the destination must be allowlisted
+# here; backups using spec.s3.credentialsSecretRef are not restricted.
+backup:
+  # S3 buckets IAM-role backups may target. Empty disables the IAM-role path
+  # entirely: RedisBackups must then supply credentialsSecretRef.
+  allowedBuckets: []
+  # Custom S3 endpoints (for example a VPC endpoint URL) permitted for
+  # IAM-role backups. Empty permits only the default AWS endpoint.
+  allowedEndpoints: []
+
+# ServiceAccount configuration
+serviceAccount:
+  # Create service account
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use
+  name: ""
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources
+  create: true
+
+# Metrics service
+metrics:
+  enabled: true
+  port: 8080
+
+# Health probe
+health:
+  port: 8081

@@ -1,46 +1,43 @@
+# kubectl create secret generic aws-s3-creds \
+#   --from-literal=accessKeyId=AKIA... --from-literal=secretAccessKey=...
 apiVersion: redis.redguard.io/v1alpha1
 kind: RedisBackup
 metadata:
   name: redis-daily-backup
   namespace: default
 spec:
-  # Reference to the RedisSentinel cluster to backup
+  # A RedisSentinel in this namespace. It is part of the object key.
   redisClusterRef: redis-cluster
-  
-  # Schedule using cron expression (daily at 2 AM)
-  # For one-time backup, leave empty
+
+  # Five-field cron, optionally prefixed TZ= or CRON_TZ=. Descriptors such as
+  # @daily are not accepted. Omit for a one-time backup.
   schedule: "0 2 * * *"
-  
-  # S3 Configuration
+
   s3:
-    # S3 bucket name
     bucket: my-redis-backups
-    
-    # AWS region
     region: us-east-1
-    
-    # Optional: S3-compatible endpoint (for MinIO, DigitalOcean Spaces, etc.)
-    # endpoint: https://s3.us-east-1.amazonaws.com
-    
-    # Path prefix in the bucket
-    prefix: redis-cluster/backups
-    
-    # Secret containing AWS credentials (kubectl create secret generic aws-s3-creds --from-literal=accessKeyId=xxx --from-literal=secretAccessKey=yyy)
-    # If using IAM roles (IRSA), set useIAMRole: true instead
+
+    # S3-compatible endpoint, for example MinIO or a VPC endpoint.
+    # endpoint: http://minio.minio.svc.cluster.local:9000
+
+    # Objects land at <prefix>/<namespace>/<cluster>/backup-<timestamp>.rdb[.gz].
+    prefix: production
+
+    # Exactly one of credentialsSecretRef and useIAMRole. The Secret holds
+    # accessKeyId and secretAccessKey.
     credentialsSecretRef: aws-s3-creds
-    
-    # Use IAM role instead of credentials (e.g., with IRSA on EKS)
-    useIAMRole: false
-  
-  # Retention: keep last 7 backups
+
+  # Backups of this cluster to keep. 0 keeps every backup. Pruning only ever
+  # deletes objects this controller wrote under the prefix above.
   retentionPolicy: 7
-  
-  # Enable gzip compression
+
   compression: true
-  
-  # Suspend scheduled backups (useful for maintenance)
   suspend: false
 ---
+# IAM-role backup (IRSA on EKS). The request runs under the operator's own AWS
+# identity, so the bucket must be in its --allowed-backup-buckets and any custom
+# endpoint in --allowed-backup-endpoints, or the backup is refused with
+# DestinationNotAllowed.
 apiVersion: redis.redguard.io/v1alpha1
 kind: RedisBackup
 metadata:
@@ -48,14 +45,11 @@ metadata:
   namespace: default
 spec:
   redisClusterRef: redis-cluster
-  
-  # No schedule = one-time backup
-  
+  # No schedule: runs once.
   s3:
     bucket: my-redis-backups
     region: us-east-1
-    prefix: redis-cluster/manual
-    credentialsSecretRef: aws-s3-creds
-  
+    prefix: manual
+    useIAMRole: true
   retentionPolicy: 30
   compression: true

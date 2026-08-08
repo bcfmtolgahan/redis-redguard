@@ -1,0 +1,250 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: redis-operator-alerts
+  labels:
+    app.kubernetes.io/name: redguard
+    app.kubernetes.io/managed-by: redguard-operator
+spec:
+  groups:
+    # Critical alerts - immediate action required
+    - name: redis-critical
+      rules:
+        - alert: RedisClusterDown
+          expr: redis_cluster_info == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis cluster {{ $labels.namespace }}/{{ $labels.name }} is down"
+            description: "Redis cluster has been down for more than 1 minute. Immediate action required."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisclusterdown"
+
+        - alert: RedisSentinelQuorumLost
+          expr: redis_sentinel_quorum_healthy == 0
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis Sentinel quorum lost for {{ $labels.namespace }}/{{ $labels.name }}"
+            description: "Sentinel quorum is not healthy. Automatic failover may not work."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redissentinelquorumlost"
+
+        - alert: RedisNoReplicas
+          expr: redis_connected_replicas == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis cluster {{ $labels.namespace }}/{{ $labels.name }} has no replicas"
+            description: "No replicas are connected to the master. Data durability is at risk."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisnoreplicas"
+
+        - alert: RedisMasterLinkDown
+          expr: redis_master_link_status == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis replica {{ $labels.pod }} lost connection to master"
+            description: "Master link is down for replica {{ $labels.pod }} in {{ $labels.namespace }}/{{ $labels.name }}."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redismasterlinkdown"
+
+    # Warning alerts - attention needed
+    - name: redis-warning
+      rules:
+        - alert: RedisReplicationLagHigh
+          expr: redis_replication_lag_bytes > 10485760
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High replication lag on {{ $labels.pod }}"
+            description: "Replication lag is {{ $value | humanize1024 }}B for {{ $labels.pod }} in {{ $labels.namespace }}/{{ $labels.name }}."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisreplicationlaghigh"
+
+        - alert: RedisReplicationLagCritical
+          expr: redis_replication_lag_bytes > 104857600
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Critical replication lag on {{ $labels.pod }}"
+            description: "Replication lag is {{ $value | humanize1024 }}B for {{ $labels.pod }}. Replica is significantly behind."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisreplicationlagcritical"
+
+        - alert: RedisMemoryHigh
+          expr: (redis_used_memory_bytes / redis_max_memory_bytes) > 0.8 and redis_max_memory_bytes > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High memory usage on {{ $labels.pod }}"
+            description: "Redis memory usage is {{ $value | humanizePercentage }} on {{ $labels.pod }} in {{ $labels.namespace }}/{{ $labels.name }}."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redismemoryhigh"
+
+        - alert: RedisMemoryCritical
+          expr: (redis_used_memory_bytes / redis_max_memory_bytes) > 0.95 and redis_max_memory_bytes > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Critical memory usage on {{ $labels.pod }}"
+            description: "Redis memory usage is {{ $value | humanizePercentage }} on {{ $labels.pod }}. OOM killer may intervene."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redismemorycritical"
+
+        - alert: RedisHighFragmentation
+          expr: redis_memory_fragmentation_ratio > 1.5
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High memory fragmentation on {{ $labels.pod }}"
+            description: "Memory fragmentation ratio is {{ $value }} on {{ $labels.pod }}. Consider restarting Redis."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redishighfragmentation"
+
+        - alert: RedisRejectedConnections
+          expr: increase(redis_rejected_connections_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis is rejecting connections on {{ $labels.pod }}"
+            description: "Redis {{ $labels.pod }} has rejected {{ $value }} connections in the last 5 minutes."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisrejectedconnections"
+
+        - alert: RedisBlockedClients
+          expr: redis_blocked_clients > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High number of blocked clients on {{ $labels.pod }}"
+            description: "{{ $value }} clients are blocked on {{ $labels.pod }}."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisblockedclients"
+
+    # Backup alerts
+    - name: redis-backup
+      rules:
+        - alert: RedisBackupFailed
+          expr: redis_backup_status == 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis backup failed for {{ $labels.cluster }}"
+            description: "Backup {{ $labels.namespace }}/{{ $labels.name }} for cluster {{ $labels.cluster }} has failed."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisbackupfailed"
+
+        - alert: RedisBackupOverdue
+          expr: time() - redis_rdb_last_save_timestamp_seconds > 86400
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis backup overdue on {{ $labels.pod }}"
+            description: "Last RDB save on {{ $labels.pod }} was {{ $value | humanizeDuration }} ago."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisbackupoverdue"
+
+        - alert: RedisBackupOverdueCritical
+          expr: time() - redis_rdb_last_save_timestamp_seconds > 172800
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis backup critically overdue on {{ $labels.pod }}"
+            description: "Last RDB save on {{ $labels.pod }} was more than 2 days ago."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisbackupoverduecritical"
+
+        - alert: RedisHighChangesSinceLastSave
+          expr: redis_rdb_changes_since_last_save > 1000000
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High unsaved changes on {{ $labels.pod }}"
+            description: "{{ $value }} changes since last save on {{ $labels.pod }}. Data loss risk if Redis crashes."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redishighchangessincelastsave"
+
+    # Performance alerts
+    #
+    # There is no "no commands processed" alert: the operator itself issues
+    # INFO against every node on each pass, so the command rate of a reachable
+    # node is never zero and such an alert could not fire.
+    - name: redis-performance
+      rules:
+        # Rates, not the raw counters: their ratio is the hit rate over the
+        # whole lifetime of the series, which a bad hour can never move. The
+        # second term keeps a nearly idle instance from alerting on a handful
+        # of lookups.
+        - alert: RedisLowHitRatio
+          expr: |
+            rate(redis_keyspace_hits_total[30m])
+              / (rate(redis_keyspace_hits_total[30m]) + rate(redis_keyspace_misses_total[30m])) < 0.5
+            and
+            (rate(redis_keyspace_hits_total[30m]) + rate(redis_keyspace_misses_total[30m])) > 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Low cache hit ratio on {{ $labels.pod }}"
+            description: "Cache hit ratio is {{ $value | humanizePercentage }} on {{ $labels.pod }}."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redislowhitratio"
+
+    # Sentinel alerts
+    - name: redis-sentinel
+      rules:
+        - alert: RedisSentinelDown
+          expr: redis_sentinel_status == 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis Sentinel unhealthy for {{ $labels.namespace }}/{{ $labels.name }}"
+            description: "Sentinel cluster is not healthy. Check sentinel pods."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redissentineldown"
+
+        - alert: RedisFailoverOccurred
+          expr: increase(redis_failover_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: info
+          annotations:
+            summary: "Redis failover occurred in {{ $labels.namespace }}/{{ $labels.name }}"
+            description: "A failover has occurred. Check cluster health and investigate the cause."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisfailoveroccurred"
+
+        - alert: RedisFrequentFailovers
+          expr: increase(redis_failover_total[1h]) > 3
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Frequent failovers in {{ $labels.namespace }}/{{ $labels.name }}"
+            description: "More than 3 failovers in the last hour. Cluster may be unstable."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisfrequentfailovers"
+
+    # Operator alerts
+    - name: redis-operator
+      rules:
+        # controller-runtime counts these for every controller the Manager
+        # runs; the operator does not duplicate them.
+        - alert: RedisOperatorReconciliationErrors
+          expr: increase(controller_runtime_reconcile_errors_total{controller=~"redissentinel|redisbackup|redisrestore|redisuser"}[5m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High reconciliation error rate for {{ $labels.controller }}"
+            description: "Controller {{ $labels.controller }} has {{ $value }} errors in the last 5 minutes."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisoperatorreconciliationerrors"
+
+        - alert: RedisACLSyncFailed
+          expr: redis_user_acl_status == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "ACL sync failed for user {{ $labels.username }}"
+            description: "RedisUser {{ $labels.namespace }}/{{ $labels.name }} failed to apply ACL rules."
+            runbook_url: "https://github.com/redguard/redguard/wiki/alerts#redisaclsyncfailed"

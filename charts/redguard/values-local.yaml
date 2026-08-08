@@ -1,0 +1,13 @@
+# Overrides for 'make helm-install-local': install against the image the
+# default 'make docker-build' produces (IMG=controller:latest). Load it into
+# the cluster first, e.g. 'kind load docker-image controller:latest'.
+# Everything not set here inherits the defaults in values.yaml.
+
+operator:
+  image:
+    repository: controller
+    tag: latest
+    pullPolicy: Never
+
+  # Console debug logs read better than JSON while iterating locally.
+  devLogging: true

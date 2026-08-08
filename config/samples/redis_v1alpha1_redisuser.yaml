@@ -1,42 +1,41 @@
+# kubectl create secret generic app-user-password --from-literal=password='...'
 apiVersion: redis.redguard.io/v1alpha1
 kind: RedisUser
 metadata:
   name: app-user
   namespace: default
 spec:
-  # Reference to the RedisSentinel cluster
+  # A RedisSentinel in this namespace. The user is written to every ready node.
   redisClusterRef: redis-cluster
-  
-  # Username for Redis ACL
+
+  # "default" is reserved: it is the admin account whose password is requirepass.
   username: app-user
-  
-  # Secret containing password (kubectl create secret generic app-user-password --from-literal=password=mypassword)
+
+  # Secret in this namespace holding the password under the key "password".
   passwordSecretRef: app-user-password
-  
-  # ACL Rules - Redis 6+ Access Control Lists
+
+  # Nothing is granted implicitly. A user with no rules reaches no key, channel
+  # or command. Grants are allowlisted and narrowed by a confinement floor;
+  # see docs/security.md.
   aclRules:
-    # Categories: @all, @read, @write, @set, @sortedset, @list, @hash, @string, @bitmap, @hyperloglog, @geo, @stream, @pubsub, @admin, @fast, @slow, @blocking, @dangerous, @connection, @transaction, @scripting
+    # Data categories only. +@all, +@admin and +@dangerous are refused.
     categories:
-      - "+@read"      # Allow all read commands
-      - "+@write"     # Allow all write commands
-      - "-@dangerous" # Deny dangerous commands (FLUSHDB, FLUSHALL, etc.)
-    
-    # Individual commands (prefix with + to allow, - to deny)
+      - "+@read"
+      - "+@write"
+    # Individual commands must carry a key specification, so ~patterns confine
+    # them. +keys and +scan are refused; a negation is always accepted.
     commands:
       - "+get"
       - "+set"
       - "+del"
       - "-flushdb"
-      - "-flushall"
-    
-    # Key patterns this user can access
+    # Key patterns this user may reach.
     keys:
-      - "~app:*"      # Can access keys starting with "app:"
-      - "~cache:*"    # Can access keys starting with "cache:"
-    
-    # Pub/Sub channel patterns
+      - "~app:*"
+      - "~cache:*"
+    # Pub/Sub channel patterns.
     channels:
       - "&notifications:*"
-  
-  # User enabled status
+
+  # false keeps the rules but rejects every AUTH for this user.
   enabled: true

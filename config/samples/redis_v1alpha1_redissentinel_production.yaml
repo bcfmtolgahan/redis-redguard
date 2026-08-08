@@ -1,0 +1,66 @@
+# A cluster sized and placed for production: authentication, a named storage
+# class, one Redis pod per node, and Sentinels spread across zones.
+#
+# kubectl create secret generic redis-password --from-literal=password="$(openssl rand -base64 24)"
+apiVersion: redis.redguard.io/v1alpha1
+kind: RedisSentinel
+metadata:
+  name: redis-prod
+  namespace: default
+spec:
+  redisConfig:
+    replicas: 3
+    image: redis:7-alpine
+    auth:
+      secretName: redis-password
+    storage:
+      size: 50Gi
+      storageClassName: gp3
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "2"
+        memory: 8Gi
+    customConfig:
+      maxmemory: 6gb
+      maxmemory-policy: allkeys-lru
+      slowlog-log-slower-than: "10000"
+    # Replaces the default preferred anti-affinity: a Redis pod that cannot get
+    # a node of its own stays Pending rather than doubling up.
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/instance: redis-prod
+              app.kubernetes.io/component: redis
+          topologyKey: kubernetes.io/hostname
+    priorityClassName: system-cluster-critical
+
+  sentinelConfig:
+    replicas: 3
+    quorum: 2
+    downAfterMilliseconds: 5000
+    failoverTimeout: 10000
+    parallelSyncs: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    # Anti-affinity spreads by node; this spreads by zone, so losing one zone
+    # cannot take the quorum with it.
+    topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/instance: redis-prod
+          app.kubernetes.io/component: sentinel
+
+  serviceType: ClusterIP

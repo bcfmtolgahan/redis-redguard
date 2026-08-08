@@ -1,0 +1,16 @@
+apiVersion: v2
+name: redguard
+description: A Kubernetes operator for Redis with Sentinel for high availability
+type: application
+version: 0.3.0
+appVersion: "0.3.0"
+keywords:
+  - redis
+  - sentinel
+  - operator
+  - high-availability
+maintainers:
+  - name: bcfmtolgahan
+home: https://github.com/bcfmtolgahan/redis-redguard
+sources:
+  - https://github.com/bcfmtolgahan/redis-redguard

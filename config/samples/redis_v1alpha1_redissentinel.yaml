@@ -14,19 +14,22 @@ spec:
       limits:
         cpu: 500m
         memory: 512Mi
+    # storage is immutable once created, including whether it is set at all.
+    # Omitting storageClassName uses the cluster default.
     storage:
       size: 1Gi
-      storageClassName: standard
-    # Optional: Custom Redis configuration
+    # Extra redis.conf directives. Directives the operator owns are rejected.
     # customConfig:
     #   maxmemory: "256mb"
-    #   maxmemory-policy: "allkeys-lru"
-    # Optional: Enable authentication
+    #   maxmemory-policy: allkeys-lru
+    # Without auth the default user is nopass and anything that reaches 6379
+    # has full access. The Secret holds the password under the key "password".
     # auth:
     #   secretName: redis-password
 
   sentinelConfig:
     replicas: 3
+    # Never more than replicas; replicas/2 + 1 is the usual choice.
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
@@ -39,4 +42,5 @@ spec:
         cpu: 200m
         memory: 128Mi
 
+  # Applies to <name>-redis and <name>-redis-replicas. Sentinel stays ClusterIP.
   serviceType: ClusterIP

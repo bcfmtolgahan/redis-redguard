@@ -1,0 +1,256 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: redisbackups.redis.redguard.io
+spec:
+  group: redis.redguard.io
+  names:
+    kind: RedisBackup
+    listKind: RedisBackupList
+    plural: redisbackups
+    singular: redisbackup
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.redisClusterRef
+      name: Cluster
+      type: string
+    - jsonPath: .spec.schedule
+      name: Schedule
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.lastBackupTime
+      name: Last Backup
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: RedisBackup is the Schema for the redisbackups API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of RedisBackup
+            properties:
+              compression:
+                default: true
+                description: Compression enables gzip compression
+                type: boolean
+              redisClusterRef:
+                description: |-
+                  RedisClusterRef is the name of a RedisSentinel in this RedisBackup's own
+                  namespace. It is resolved verbatim and is joined into the S3 key prefix
+                  this backup writes and prunes under, so it must be a DNS-1123 subdomain.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                type: string
+              retentionPolicy:
+                default: 7
+                description: |-
+                  RetentionPolicy is how many of this cluster's backups to keep; older ones
+                  are deleted after a successful run. Zero disables pruning and keeps every
+                  backup.
+                format: int32
+                minimum: 0
+                type: integer
+              s3:
+                description: S3 defines S3 storage configuration
+                properties:
+                  bucket:
+                    description: Bucket is the S3 bucket name
+                    type: string
+                  credentialsSecretRef:
+                    description: |-
+                      CredentialsSecretRef names a Secret in the referring CR's own namespace
+                      holding "accessKeyId" and "secretAccessKey". The name is resolved
+                      verbatim, so it must be a DNS-1123 subdomain.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  endpoint:
+                    description: Endpoint is the S3-compatible endpoint (for MinIO,
+                      etc.)
+                    type: string
+                  prefix:
+                    description: |-
+                      Prefix is the path prefix for backups. RedisBackup writes objects
+                      under <prefix>/<namespace>/<clusterName>/<backupName>/ and retention
+                      only ever deletes objects under that exact prefix, so two RedisBackups
+                      for one cluster never prune each other's objects.
+                    type: string
+                  region:
+                    description: Region is the AWS region
+                    type: string
+                  useIAMRole:
+                    description: |-
+                      UseIAMRole indicates whether to use IAM role instead of credentials.
+                      The request then runs under the operator's own AWS identity; both
+                      RedisBackup and RedisRestore reject destinations whose bucket is not
+                      listed in the operator's --allowed-backup-buckets or whose custom
+                      endpoint is not in --allowed-backup-endpoints.
+                    type: boolean
+                required:
+                - bucket
+                type: object
+                x-kubernetes-validations:
+                - message: 'exactly one of s3.credentialsSecretRef or s3.useIAMRole
+                    must be set: with neither, the AWS SDK signs the request with
+                    whatever ambient identity the operator pod carries and never passes
+                    the destination allowlist; with both, the Secret wins and useIAMRole
+                    says nothing about which identity signed'
+                  rule: has(self.credentialsSecretRef) != (has(self.useIAMRole) &&
+                    self.useIAMRole)
+              schedule:
+                description: |-
+                  Schedule is a five-field cron expression (minute hour day-of-month month
+                  day-of-week), optionally prefixed with TZ=/CRON_TZ=. Descriptors such as
+                  @daily are not accepted. Leave empty for a one-time backup. The pattern
+                  only fixes the shape; ranges are checked by the controller, which reports
+                  a parse failure as Degraded.
+                maxLength: 256
+                pattern: ^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,?-]+(\s+[0-9A-Za-z*/,?-]+){4}$
+                type: string
+              suspend:
+                description: Suspend pauses scheduled backups
+                type: boolean
+            required:
+            - redisClusterRef
+            - s3
+            type: object
+          status:
+            description: status defines the observed state of RedisBackup
+            properties:
+              backupCount:
+                description: BackupCount is the total number of backups retained
+                format: int32
+                type: integer
+              backupLocation:
+                description: BackupLocation is the S3 path of the last backup
+                type: string
+              backupSize:
+                description: BackupSize is the size of the last backup in bytes
+                format: int64
+                type: integer
+              conditions:
+                description: Conditions represent the current state of the RedisBackup
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              keyCount:
+                description: |-
+                  KeyCount is the number of keys across all databases when the last backup
+                  was taken; RedisRestore uses it to verify a restored dataset.
+                format: int64
+                type: integer
+              lastBackupDuration:
+                description: LastBackupDuration is the duration of the last backup
+                type: string
+              lastBackupTime:
+                description: LastBackupTime is the timestamp of the last successful
+                  backup
+                format: date-time
+                type: string
+              nextBackupTime:
+                description: NextBackupTime is the scheduled time for the next backup
+                format: date-time
+                type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation this status was computed from.
+                  A status whose observedGeneration trails metadata.generation describes the
+                  previous spec, not the one in the object.
+                format: int64
+                type: integer
+              phase:
+                description: Phase represents the current phase (Pending, Running,
+                  Completed, Failed)
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

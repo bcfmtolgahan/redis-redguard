@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Kubernetes libraries move together; a lone k8s.io bump breaks the build, so
+  # controller-runtime and its k8s.io dependencies are raised in one pull request.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+    groups:
+      kubernetes:
+        patterns:
+          - k8s.io/*
+          - sigs.k8s.io/*
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
