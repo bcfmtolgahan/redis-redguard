@@ -345,18 +345,40 @@ var deniedACLKeywords = map[string]string{
 	"allcommands": "it grants every command, including administrative ones",
 }
 
-// scopeSafeKeywords are standalone rules that set or reset the user's own key,
-// channel or command scope, or a benign ACL flag. None can widen access beyond
-// the user's declared scope.
-var scopeSafeKeywords = map[string]struct{}{
-	"allkeys":            {},
-	"resetkeys":          {},
-	"allchannels":        {},
-	"resetchannels":      {},
-	"nocommands":         {},
-	"clearselectors":     {},
-	"sanitize-payload":   {},
-	"nosanitize-payload": {},
+// The spec.aclRules fields. Redis flattens all four into one SETUSER rule list
+// and honours a rule wherever it appears, so the grouping is not enforced by
+// the server: a grant written under keys or channels is a real grant, and the
+// confinement floor below follows only the category and command fields. Each
+// field is therefore held to its own rule shape.
+const (
+	aclFieldCategories = "categories"
+	aclFieldCommands   = "commands"
+	aclFieldKeys       = "keys"
+	aclFieldChannels   = "channels"
+)
+
+// aclScopeKeywords are the standalone rules each field accepts beside its
+// pattern or grant syntax. None can widen access beyond the user's own scope.
+// The sets are disjoint, so a keyword names exactly one field.
+var aclScopeKeywords = map[string]map[string]struct{}{
+	aclFieldKeys:     {"allkeys": {}, "resetkeys": {}},
+	aclFieldChannels: {"allchannels": {}, "resetchannels": {}},
+	// clearselectors and the payload flags change how granted commands execute,
+	// so they ride with the command grants.
+	aclFieldCommands: {
+		"nocommands":         {},
+		"clearselectors":     {},
+		"sanitize-payload":   {},
+		"nosanitize-payload": {},
+	},
+}
+
+// aclFieldShapes says what each field accepts, for the rejection message.
+var aclFieldShapes = map[string]string{
+	aclFieldCategories: "a category grant such as +@read or -@dangerous",
+	aclFieldCommands:   "a command grant such as +get, -del or nocommands",
+	aclFieldKeys:       "a key pattern such as ~app:*, %R~cache:*, allkeys or resetkeys",
+	aclFieldChannels:   "a channel pattern such as &events:*, allchannels or resetchannels",
 }
 
 // validateACLRules confines a RedisUser to its declared scope. A denylist is not
@@ -366,77 +388,164 @@ var scopeSafeKeywords = map[string]struct{}{
 // allowlist derived from Redis: a command may be granted only if it carries a
 // key specification, so a ~pattern confines it, or it touches neither keys nor
 // channels. Category grants are limited to the non-administrative categories and
-// then narrowed by the confinement floor at render time.
-func validateACLRules(rules []string) error {
+// then narrowed by the confinement floor at render time. Every rule is checked
+// against the shape of the field it was written in as well, because the server
+// ignores that grouping while the floor depends on it.
+func validateACLRules(field string, rules []string) error {
 	for _, rule := range rules {
-		if err := validateACLRule(rule); err != nil {
+		if err := validateACLRule(field, rule); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateACLRule(rule string) error {
+func validateACLRule(field, rule string) error {
 	if rule == "" {
-		return fmt.Errorf("aclRules: empty rule")
+		return fmt.Errorf("aclRules.%s: empty rule", field)
 	}
 	if strings.ContainsFunc(rule, unicode.IsSpace) {
-		return fmt.Errorf("aclRules: rule %q must be a single token", rule)
+		return fmt.Errorf("aclRules.%s: rule %q must be a single token", field, rule)
 	}
 	if strings.ContainsAny(rule, "()") {
-		return fmt.Errorf("aclRules: rule %q: selector syntax is not allowed", rule)
+		return fmt.Errorf("aclRules.%s: rule %q: selector syntax is not allowed", field, rule)
 	}
 	switch rule[0] {
 	case '>', '<', '#', '!':
-		return fmt.Errorf("aclRules: rule %q: passwords are managed via passwordSecretRef", rule)
+		return fmt.Errorf("aclRules.%s: rule %q: passwords are managed via passwordSecretRef", field, rule)
 	}
 	norm := strings.ToLower(rule)
 	if why, ok := deniedACLKeywords[norm]; ok {
-		return fmt.Errorf("aclRules: rule %q is not allowed: %s", rule, why)
+		return fmt.Errorf("aclRules.%s: rule %q is not allowed: %s", field, rule, why)
 	}
-	if _, ok := scopeSafeKeywords[norm]; ok {
+	if _, ok := aclScopeKeywords[field][norm]; ok {
 		return nil
 	}
-	switch norm[0] {
-	case '~', '%', '&':
-		// Key and channel scope declarations only set the user's own scope.
-		return nil
-	case '-':
-		// A negation can only remove permission.
-		return nil
+	switch field {
+	case aclFieldKeys:
+		return validateKeyPattern(rule, norm)
+	case aclFieldChannels:
+		return validateChannelPattern(rule, norm)
+	case aclFieldCategories:
+		return validateCategoryRule(rule, norm)
+	case aclFieldCommands:
+		return validateCommandRule(rule, norm)
 	}
-	if category, ok := strings.CutPrefix(norm, "+@"); ok {
-		return validateCategoryGrant(rule, category)
-	}
-	if command, ok := strings.CutPrefix(norm, "+"); ok {
-		return validateCommandGrant(rule, command)
-	}
-	return fmt.Errorf("aclRules: rule %q is not a recognized ACL rule; grant key-scoped commands (+get), a category (+@read), key patterns (~app:*) or channel patterns (&events:*)", rule)
+	return fmt.Errorf("aclRules: unknown field %q", field)
 }
 
-// validateCategoryGrant accepts a +@category only for a non-administrative
-// category Redis defines. The confinement floor strips the keyspace-wide and
-// administrative commands the category still bundles, so an accepted category
-// stays inside the user's scope.
-func validateCategoryGrant(rule, category string) error {
-	switch category {
-	case "all", "admin", "dangerous":
-		return fmt.Errorf("aclRules: rule %q grants administrative or unscoped control; grant a data category such as +@read or +@write instead", rule)
+// aclFieldFor reports the field a rule token belongs in, so a misplaced rule is
+// rejected with the move to make instead of a generic parse error. It reports ""
+// for a token that fits no field.
+func aclFieldFor(norm string) string {
+	for field, keywords := range aclScopeKeywords {
+		if _, ok := keywords[norm]; ok {
+			return field
+		}
 	}
-	if _, ok := redisACLCategories[category]; !ok {
-		return fmt.Errorf("aclRules: rule %q names an unknown ACL category; grant a data category such as +@read or +@write instead", rule)
+	switch {
+	case strings.HasPrefix(norm, "~"), strings.HasPrefix(norm, "%"):
+		return aclFieldKeys
+	case strings.HasPrefix(norm, "&"):
+		return aclFieldChannels
+	case strings.HasPrefix(norm, "+@"), strings.HasPrefix(norm, "-@"):
+		return aclFieldCategories
+	case strings.HasPrefix(norm, "+"), strings.HasPrefix(norm, "-"):
+		return aclFieldCommands
+	}
+	return ""
+}
+
+func errACLFieldMismatch(field, rule, norm string) error {
+	if want := aclFieldFor(norm); want != "" && want != field {
+		return fmt.Errorf("aclRules.%s: rule %q belongs in spec.aclRules.%s; %s accepts only %s",
+			field, rule, want, field, aclFieldShapes[field])
+	}
+	return fmt.Errorf("aclRules.%s: rule %q is not %s", field, rule, aclFieldShapes[field])
+}
+
+// validateKeyPattern accepts only a key-scope declaration: ~pattern or its
+// %R~/%W~/%RW~ qualified forms. A grant here would reach SETUSER with nothing
+// confining it, since the floor trails the category and command fields only.
+func validateKeyPattern(rule, norm string) error {
+	var pattern string
+	switch {
+	case strings.HasPrefix(norm, "~"):
+		pattern = norm[1:]
+	case strings.HasPrefix(norm, "%"):
+		flags, rest, found := strings.Cut(norm[1:], "~")
+		if !found {
+			return fmt.Errorf("aclRules.%s: rule %q: a %% qualifier must be followed by ~pattern", aclFieldKeys, rule)
+		}
+		if flags != "r" && flags != "w" && flags != "rw" {
+			return fmt.Errorf("aclRules.%s: rule %q: only %%R~, %%W~ and %%RW~ qualify a key pattern", aclFieldKeys, rule)
+		}
+		pattern = rest
+	default:
+		return errACLFieldMismatch(aclFieldKeys, rule, norm)
+	}
+	if pattern == "" {
+		return fmt.Errorf("aclRules.%s: rule %q: empty key pattern", aclFieldKeys, rule)
 	}
 	return nil
 }
 
-// validateCommandGrant accepts +command only for a command Redis confines to a
+// validateChannelPattern accepts only &pattern, for the same reason.
+func validateChannelPattern(rule, norm string) error {
+	pattern, ok := strings.CutPrefix(norm, "&")
+	if !ok {
+		return errACLFieldMismatch(aclFieldChannels, rule, norm)
+	}
+	if pattern == "" {
+		return fmt.Errorf("aclRules.%s: rule %q: empty channel pattern", aclFieldChannels, rule)
+	}
+	return nil
+}
+
+// validateCategoryRule accepts +@category only for a non-administrative category
+// Redis defines; the confinement floor strips the keyspace-wide and
+// administrative commands the category still bundles, so an accepted category
+// stays inside the user's scope. A -@category can only remove permission.
+func validateCategoryRule(rule, norm string) error {
+	if negated, ok := strings.CutPrefix(norm, "-@"); ok {
+		if negated == "" {
+			return fmt.Errorf("aclRules.%s: rule %q names no category", aclFieldCategories, rule)
+		}
+		return nil
+	}
+	category, ok := strings.CutPrefix(norm, "+@")
+	if !ok {
+		return errACLFieldMismatch(aclFieldCategories, rule, norm)
+	}
+	switch category {
+	case "all", "admin", "dangerous":
+		return fmt.Errorf("aclRules.%s: rule %q grants administrative or unscoped control; grant a data category such as +@read or +@write instead", aclFieldCategories, rule)
+	}
+	if _, ok := redisACLCategories[category]; !ok {
+		return fmt.Errorf("aclRules.%s: rule %q names an unknown ACL category; grant a data category such as +@read or +@write instead", aclFieldCategories, rule)
+	}
+	return nil
+}
+
+// validateCommandRule accepts +command only for a command Redis confines to a
 // key scope or that touches no keys or channels. Everything else runs
-// server-wide or outside the user's scope and is rejected.
-func validateCommandGrant(rule, command string) error {
+// server-wide or outside the user's scope. A -command can only remove
+// permission.
+func validateCommandRule(rule, norm string) error {
+	if revoked, ok := strings.CutPrefix(norm, "-"); ok && !strings.HasPrefix(norm, "-@") {
+		if revoked == "" {
+			return fmt.Errorf("aclRules.%s: rule %q names no command", aclFieldCommands, rule)
+		}
+		return nil
+	}
+	command, ok := strings.CutPrefix(norm, "+")
+	if !ok || strings.HasPrefix(norm, "+@") {
+		return errACLFieldMismatch(aclFieldCommands, rule, norm)
+	}
 	if _, ok := redisAllowedCommands[command]; ok {
 		return nil
 	}
-	return fmt.Errorf("aclRules: rule %q is not permitted: %s has no key specification and runs across the whole keyspace or the server, escaping the user's scope; grant a scoped category such as +@read or a key-scoped command such as +get instead", rule, command)
+	return fmt.Errorf("aclRules.%s: rule %q is not permitted: %s has no key specification and runs across the whole keyspace or the server, escaping the user's scope; grant a scoped category such as +@read or a key-scoped command such as +get instead", aclFieldCommands, rule, command)
 }
 
 // validateRedisUserSpec re-checks at reconcile what the CRD rejects at
@@ -446,12 +555,20 @@ func validateRedisUserSpec(spec *redisv1alpha1.RedisUserSpec) error {
 	if err := validateUsername(spec.Username); err != nil {
 		return err
 	}
-	var rules []string
-	rules = append(rules, spec.ACLRules.Categories...)
-	rules = append(rules, spec.ACLRules.Commands...)
-	rules = append(rules, spec.ACLRules.Keys...)
-	rules = append(rules, spec.ACLRules.Channels...)
-	return validateACLRules(rules)
+	for _, f := range []struct {
+		name  string
+		rules []string
+	}{
+		{aclFieldCategories, spec.ACLRules.Categories},
+		{aclFieldCommands, spec.ACLRules.Commands},
+		{aclFieldKeys, spec.ACLRules.Keys},
+		{aclFieldChannels, spec.ACLRules.Channels},
+	} {
+		if err := validateACLRules(f.name, f.rules); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyACL writes the user to one node and persists it to that node's ACL file.
@@ -487,7 +604,8 @@ func buildACLRules(redisUser *redisv1alpha1.RedisUser, password string) []string
 
 	// A category or command grant can pull in commands that ignore ~patterns.
 	// The floor removes them last, after the grants, so it wins. With nothing
-	// granted there is nothing to confine.
+	// granted there is nothing to confine. Gating on these two fields is only
+	// sound because per-field validation keeps grants out of keys and channels.
 	if len(redisUser.Spec.ACLRules.Categories) > 0 || len(redisUser.Spec.ACLRules.Commands) > 0 {
 		rules = append(rules, redisConfinementFloor...)
 	}
