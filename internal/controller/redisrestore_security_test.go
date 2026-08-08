@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	redisv1alpha1 "github.com/redguard/redguard/api/v1alpha1"
 )
@@ -45,7 +46,7 @@ func TestRestoreRejectsBucketOutsideAllowlist(t *testing.T) {
 	if err != nil {
 		t.Errorf("rejection must not return an error (it would hot-loop with backoff), got: %v", err)
 	}
-	if res.Requeue || res.RequeueAfter != 0 {
+	if res != (ctrl.Result{}) {
 		t.Errorf("rejection is terminal and must not requeue, got %+v", res)
 	}
 	if calls := fx.factory.Calls(); len(calls) != 0 {

@@ -396,7 +396,7 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("failed to get RDB data: %w", err)
 	}
-	defer rdbStream.Close()
+	defer func() { _ = rdbStream.Close() }()
 
 	body := io.Reader(rdbStream)
 	if redisBackup.Spec.Compression {
@@ -412,7 +412,7 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 			gzPw.CloseWithError(err)
 		}()
 		// Unblocks the gzip goroutine if the upload fails mid-stream.
-		defer gzPr.Close()
+		defer func() { _ = gzPr.Close() }()
 		body = gzPr
 	}
 
@@ -724,14 +724,14 @@ func (r *RedisBackupReconciler) openRDBStream(ctx context.Context, pod *corev1.P
 
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(pr, header); err != nil {
-		pr.Close()
+		_ = pr.Close()
 		if err == io.EOF {
 			return nil, fmt.Errorf("RDB file is empty or not found")
 		}
 		return nil, fmt.Errorf("failed to read RDB file: %w", err)
 	}
 	if string(header) != "REDIS" {
-		pr.Close()
+		_ = pr.Close()
 		return nil, fmt.Errorf("invalid RDB file format")
 	}
 	return &rdbStream{Reader: io.MultiReader(bytes.NewReader(header), pr), pr: pr}, nil
