@@ -39,12 +39,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 	"github.com/bcfmtolgahan/redis-redguard/internal/builder"
+	"github.com/bcfmtolgahan/redis-redguard/internal/clusteraccess"
 	"github.com/bcfmtolgahan/redis-redguard/internal/redisclient"
 	"github.com/bcfmtolgahan/redis-redguard/internal/tlsutil"
 	custmetrics "github.com/bcfmtolgahan/redis-redguard/pkg/metrics"
@@ -57,6 +60,14 @@ type RedisSentinelReconciler struct {
 	Recorder record.EventRecorder
 	// RedisFactory builds Redis and Sentinel clients; nil means DefaultFactory.
 	RedisFactory redisclient.Factory
+	// ExternalEvents carries reconcile triggers produced outside the API
+	// server: the sentinelwatch subscription sends one generic event per
+	// +switch-master publication. An event is a trigger only -- it names the
+	// cluster and nothing else, and the reconcile it wakes resolves the
+	// master with Sentinel exactly as a periodic pass does, so a stale or
+	// forged publication cannot move a label or issue a SLAVEOF. Nil skips
+	// the source; the periodic requeue is unchanged either way.
+	ExternalEvents <-chan event.TypedGenericEvent[*redisv1alpha1.RedisSentinel]
 }
 
 // factoryOrDefault lets a zero-value reconciler dial real Redis without wiring.
@@ -590,19 +601,16 @@ func (r *RedisSentinelReconciler) warnOnSentinelScaleDown(ctx context.Context, r
 }
 
 // sentinelAddresses is the stable per-pod DNS of every Sentinel in the set.
+// Shared with the sentinelwatch subscriber through clusteraccess so both dial
+// the same set.
 func sentinelAddresses(rs *redisv1alpha1.RedisSentinel) []string {
-	addrs := make([]string, rs.Spec.SentinelConfig.Replicas)
-	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
-		addrs[i] = fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
-			rs.Name, i, rs.Name, rs.Namespace)
-	}
-	return addrs
+	return clusteraccess.SentinelAddresses(rs)
 }
 
 // appliedAuthSecretName is the operator-owned Secret recording the password
 // the cluster currently accepts.
 func appliedAuthSecretName(rs *redisv1alpha1.RedisSentinel) string {
-	return rs.Name + "-auth-state"
+	return clusteraccess.AppliedAuthSecretName(rs)
 }
 
 // reconcileAuthCredentials returns the value to stamp as the auth Secret
@@ -1457,35 +1465,13 @@ func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redi
 	return masterAddr, nil
 }
 
-// getAdminPassword retrieves the password the cluster currently accepts. The
-// applied-credentials Secret is authoritative once it exists: during a pending
-// rotation the user Secret already holds the new password while every node
-// still requires the previous one, and the operator must keep authenticating
-// throughout.
+// getAdminPassword retrieves the password the cluster currently accepts,
+// through the same clusteraccess resolution the sentinelwatch subscriber
+// uses: the applied-credentials Secret is authoritative once it exists, so a
+// pending rotation never strands either side on the new password no node
+// accepts yet.
 func (r *RedisSentinelReconciler) getAdminPassword(ctx context.Context, rs *redisv1alpha1.RedisSentinel) string {
-	if rs.Spec.RedisConfig.Auth == nil || rs.Spec.RedisConfig.Auth.SecretName == "" {
-		return ""
-	}
-
-	applied := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      appliedAuthSecretName(rs),
-		Namespace: rs.Namespace,
-	}, applied); err == nil {
-		if password, ok := applied.Data[appliedPasswordKey]; ok {
-			return string(password)
-		}
-	}
-
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      rs.Spec.RedisConfig.Auth.SecretName,
-		Namespace: rs.Namespace,
-	}, secret); err != nil {
-		return ""
-	}
-
-	return string(secret.Data["password"])
+	return clusteraccess.AdminPassword(ctx, r.Client, rs)
 }
 
 // handleFailover reconfigures replication after a detected master change and
@@ -2257,7 +2243,7 @@ func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorderFor("redissentinel-controller")
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&redisv1alpha1.RedisSentinel{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
@@ -2265,6 +2251,13 @@ func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.sentinelsForReferencedSecret)).
-		Named("redissentinel").
-		Complete(r)
+		Named("redissentinel")
+	// The switch-master subscription enqueues by object reference only; the
+	// workqueue collapses the duplicates the per-sentinel subscriptions emit
+	// for one promotion.
+	if r.ExternalEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.ExternalEvents,
+			&handler.TypedEnqueueRequestForObject[*redisv1alpha1.RedisSentinel]{}))
+	}
+	return b.Complete(r)
 }

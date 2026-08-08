@@ -6,6 +6,21 @@ All notable changes to Redguard are documented in this file.
 
 ### Added
 
+- **Failover detection is event-driven.** The operator now holds a
+  subscription to the `+switch-master` channel of every sentinel it manages
+  and wakes the reconciler the moment a promotion is announced, instead of
+  the `redis.redguard.io/role=master` label -- the only thing pointing the
+  write Service at a master -- waiting for the next periodic pass (up to 30s;
+  98s end to end measured on a real three-node cluster). The subscription is
+  a trigger, never a source of truth: an event names the cluster and nothing
+  else, and the reconcile it wakes re-resolves the master with Sentinel
+  before touching a label or issuing a `SLAVEOF`, so a late, duplicated or
+  forged publication cannot redirect writes. One connection per sentinel
+  (the node that takes the master down often hosts a sentinel too), TLS and
+  the rotation-aware admin password resolved fresh on every reconnect,
+  capped-backoff redial, and the periodic pass unchanged as the fallback
+  that converges the cluster if the subscription is down.
+
 - **Orphaned ACL accounts are pruned.** 0.3.0 listed this as a known
   limitation: the ACL file lives on the retained Redis data volume, so deleting
   a `RedisSentinel` and recreating it under the same name brought back every

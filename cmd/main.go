@@ -45,6 +45,7 @@ import (
 
 	redisv1alpha1 "github.com/bcfmtolgahan/redis-redguard/api/v1alpha1"
 	"github.com/bcfmtolgahan/redis-redguard/internal/controller"
+	"github.com/bcfmtolgahan/redis-redguard/internal/sentinelwatch"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -282,10 +283,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The switch-master subscription lives with the manager so it starts only
+	// on the elected leader and stops with it; its events wake the
+	// RedisSentinel reconciler the moment a sentinel announces a promotion,
+	// instead of the role label waiting out the periodic requeue.
+	watcher := sentinelwatch.New(mgr.GetClient())
+	if err := mgr.Add(watcher); err != nil {
+		setupLog.Error(err, "unable to add the sentinel event watcher")
+		os.Exit(1)
+	}
+
 	if err := (&controller.RedisSentinelReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("redissentinel-controller"),
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Recorder:       mgr.GetEventRecorderFor("redissentinel-controller"),
+		ExternalEvents: watcher.Events(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisSentinel")
 		os.Exit(1)

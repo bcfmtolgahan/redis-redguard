@@ -388,6 +388,7 @@ var _ = Describe("Redguard", Ordered, func() {
 			"the write did not reach both replicas, so surviving the failover would prove nothing")
 
 		By("deleting the master pod")
+		masterDeletedAt := time.Now()
 		_, err = kubectl("delete", "pod", oldMaster.Pod, "-n", clusterNamespace, "--wait=false")
 		Expect(err).NotTo(HaveOccurred())
 
@@ -401,7 +402,8 @@ var _ = Describe("Redguard", Ordered, func() {
 			g.Expect(masters[0].Pod).NotTo(Equal(oldMaster.Pod),
 				"the deleted pod is master again; no promotion happened")
 			newMaster = masters[0]
-		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		}, 3*time.Minute, 2*time.Second).Should(Succeed())
+		promotionSeenAt := time.Now()
 
 		By("waiting for the CR status to track the new master")
 		Eventually(func(g Gomega) {
@@ -411,7 +413,7 @@ var _ = Describe("Redguard", Ordered, func() {
 				"the CR still points at the pod that was deleted")
 			g.Expect(status.MasterNode).To(Equal(newMaster.IP+":6379"),
 				"the CR does not report the promoted pod as master")
-		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 		By("waiting for the write Service endpoints to move to the new master")
 		Eventually(func(g Gomega) {
@@ -426,7 +428,20 @@ var _ = Describe("Redguard", Ordered, func() {
 			g.Expect(labeled).To(HaveLen(1), "exactly one pod may carry the master role label")
 			g.Expect(labeled[0].Name).To(Equal(newMaster.Pod),
 				"the master role label sits on a pod that is not the master")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		}, 2*time.Minute, time.Second).Should(Succeed())
+
+		// The +switch-master subscription wakes the reconciler the moment a
+		// sentinel announces the promotion, so the label and endpoints follow
+		// within seconds. Polling alone put up to steadyRequeue (30s) between
+		// the promotion and the label move -- 98s end to end measured on a
+		// real cluster -- so a regression to polling trips both budgets long
+		// before the Eventually timeouts would.
+		labelLag := time.Since(promotionSeenAt)
+		Expect(labelLag).To(BeNumerically("<", 20*time.Second),
+			"the write Service trailed the observed promotion by %s; the switch-master subscription is not waking the reconciler", labelLag)
+		endToEnd := time.Since(masterDeletedAt)
+		Expect(endToEnd).To(BeNumerically("<", 60*time.Second),
+			"failover took %s from deleting the master to a correct write Service", endToEnd)
 
 		// Eventually: endpoints are already correct above, but kube-proxy may
 		// lag a moment behind the Endpoints object.

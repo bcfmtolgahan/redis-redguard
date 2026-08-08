@@ -179,7 +179,9 @@ func TestMainRegistersEveryReconciler(t *testing.T) {
 
 // TestMainSuppliesEveryDependency pins the RESTConfig gap: the pod-exec paths
 // in the backup and restore controllers need a *rest.Config, and a reconciler
-// whose Recorder is left nil records no events.
+// whose Recorder is left nil records no events. ExternalEvents left nil ships
+// the switch-master subscription dead: SetupWithManager skips the channel
+// source and failover detection silently degrades to polling only.
 func TestMainSuppliesEveryDependency(t *testing.T) {
 	registered := registeredReconcilers(t)
 	for name, fields := range declaredReconcilers(t) {
@@ -187,11 +189,53 @@ func TestMainSuppliesEveryDependency(t *testing.T) {
 		if !ok {
 			continue
 		}
-		for _, dep := range []string{"RESTConfig", "Recorder"} {
+		for _, dep := range []string{"RESTConfig", "Recorder", "ExternalEvents"} {
 			if fields[dep] && !assigned[dep] {
 				t.Errorf("%s declares %s but cmd/main.go never assigns it", name, dep)
 			}
 		}
+	}
+}
+
+// TestSetupWiresExternalEvents guards the channel-source registration: with
+// the ExternalEvents field declared but never handed to WatchesRawSource, the
+// watcher publishes into a channel nothing drains and a promotion waits for
+// the periodic pass exactly as before.
+func TestSetupWiresExternalEvents(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "redissentinel_controller.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse redissentinel_controller.go: %v", err)
+	}
+
+	var wired bool
+	ast.Inspect(f, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "SetupWithManager" || fn.Recv == nil {
+			return true
+		}
+		var usesRawSource, usesEvents bool
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.SelectorExpr:
+				if v.Sel.Name == "WatchesRawSource" {
+					usesRawSource = true
+				}
+				if v.Sel.Name == "ExternalEvents" {
+					usesEvents = true
+				}
+			case *ast.Ident:
+				if v.Name == "ExternalEvents" {
+					usesEvents = true
+				}
+			}
+			return true
+		})
+		wired = wired || (usesRawSource && usesEvents)
+		return true
+	})
+	if !wired {
+		t.Error("SetupWithManager never passes ExternalEvents to WatchesRawSource; switch-master events would be produced but never enqueue a reconcile")
 	}
 }
 
