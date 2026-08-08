@@ -45,7 +45,7 @@ jobs:
           echo "$total" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: cover.out
