@@ -14,6 +14,11 @@ jobs:
   test-e2e:
     name: Kubernetes ${{ matrix.k8s }}
     runs-on: ubuntu-latest
+    env:
+      # Pinned, and every node image below is published by this release. An
+      # older kind cannot load an image into a node built by a newer one:
+      # 'kind load' fails with "unknown containerd config version".
+      KIND_VERSION: v0.32.0
     strategy:
       # One version failing is a result about that version, not a reason to stop
       # testing the others.
@@ -41,9 +46,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Install kind
         run: |
-          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)"
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
