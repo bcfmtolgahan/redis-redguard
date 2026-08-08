@@ -96,6 +96,18 @@ func (f *Factory) SetMaster(addr string) {
 	}
 }
 
+// SetReplicaOf pins addr as a replica of followed, whatever the configured
+// master is. It models a node that came back following an address Sentinel no
+// longer reports, which is what a pod restarted during a failover does. The
+// next SetMaster recomputes the role and overwrites this.
+func (f *Factory) SetReplicaOf(addr, followed string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.node(addr)
+	n.role = roleReplica
+	n.masterHost, n.masterPort = splitHostPort(followed)
+}
+
 // Users returns the rules of the most recent ACLSetUser per username, across
 // all nodes. Deleted users are absent.
 func (f *Factory) Users() map[string][]string {

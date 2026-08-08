@@ -1089,7 +1089,8 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 			writeReady = false
 		} else {
 			failoverSettled := true
-			if rs.Status.MasterNode != "" && rs.Status.MasterNode != masterNode {
+			masterMoved := rs.Status.MasterNode != "" && rs.Status.MasterNode != masterNode
+			if masterMoved {
 				// Failover detected
 				logger.Info("Failover detected", "old", rs.Status.MasterNode, "new", masterNode)
 				recordEvent(r.Recorder, rs, corev1.EventTypeWarning, "FailoverDetected",
@@ -1107,6 +1108,17 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 				cancel()
 			}
 			rs.Status.MasterNode = masterNode
+
+			// A pod that boots while Sentinel still reports the previous
+			// master follows a dead address, and the failover branch above
+			// cannot repair it: the master change it reacts to is already in
+			// the past by then. Only on a settled pass, and never while the
+			// master is moving -- mid-failover the reported address may be a
+			// promotion Sentinel has not agreed on, and acting on it is how
+			// the freshly promoted master gets demoted.
+			if !masterMoved && failoverSettled {
+				r.repointStrayReplicas(ctx, rs, masterNode, adminPassword, tlsCfg)
+			}
 
 			labeled, err := r.reconcileMasterLabel(ctx, rs, masterNode)
 			if err != nil {
@@ -1559,6 +1571,62 @@ func (r *RedisSentinelReconciler) handleFailover(ctx context.Context, rs *redisv
 		return false
 	}
 	return true
+}
+
+// repointStrayReplicas sends SLAVEOF to every replica whose replication source
+// is not the master Sentinel currently reports. Repointing a replica cannot
+// lose data: it already holds no authoritative copy and resyncs from the master
+// either way. Pods claiming to be master are left alone; deciding those is the
+// failover path's job, and demoting one here on a stale view is how acknowledged
+// writes get lost.
+func (r *RedisSentinelReconciler) repointStrayReplicas(ctx context.Context, rs *redisv1alpha1.RedisSentinel, masterAddr, adminPassword string, tlsCfg *tls.Config) {
+	logger := log.FromContext(ctx)
+
+	masterIP, masterPort := parseHostPort(masterAddr)
+	if masterIP == "" {
+		return
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/component": "redis",
+		"app.kubernetes.io/instance":  rs.Name,
+	}); err != nil {
+		logger.Error(err, "Failed to list Redis pods")
+		return
+	}
+
+	for _, pod := range podList.Items {
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || pod.Status.PodIP == masterIP {
+			continue
+		}
+
+		func(podIP, podName string) {
+			redisClient := factoryOrDefault(r.RedisFactory).NewClient(fmt.Sprintf("%s:6379", podIP), adminPassword, tlsCfg)
+			defer redisClient.Close()
+
+			info, err := redisClient.GetReplicationInfo(ctx)
+			if err != nil {
+				// A pod that cannot be dialled is reported through the
+				// readiness conditions; there is nothing to repair here.
+				return
+			}
+			if info["role"] != "slave" {
+				return
+			}
+			if info["master_host"] == masterIP && info["master_port"] == masterPort {
+				return
+			}
+
+			logger.Info("Repointing replica at the current master",
+				"pod", podName,
+				"followed", fmt.Sprintf("%s:%s", info["master_host"], info["master_port"]),
+				"master", masterAddr)
+			if err := redisClient.SlaveOf(ctx, masterIP, masterPort); err != nil {
+				logger.Error(err, "Failed to repoint replica", "pod", podName)
+			}
+		}(pod.Status.PodIP, pod.Name)
+	}
 }
 
 // ensureReplicasFollowMaster verifies and corrects replication configuration for all replicas
