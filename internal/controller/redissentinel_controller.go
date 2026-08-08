@@ -81,6 +81,7 @@ func recordEvent(rec record.EventRecorder, obj runtime.Object, eventType, reason
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=redis.redguard.io,resources=redissentinels/finalizers,verbs=update
+// +kubebuilder:rbac:groups=redis.redguard.io,resources=redisrestores,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -1262,7 +1263,8 @@ func (r *RedisSentinelReconciler) reconcileMasterLabel(ctx context.Context, rs *
 // once, on first boot: editing quorum or the timers in the spec rolls the pods
 // and changes nothing. The live values are therefore repaired at runtime, and
 // because SENTINEL SET never propagates between sentinels, every member is
-// read and repaired individually.
+// read and repaired individually. down-after-milliseconds is ceded to an
+// active RedisRestore holding the quiesce: see restoreHoldingQuiesce.
 func (r *RedisSentinelReconciler) syncSentinelMonitorConfig(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) metav1.Condition {
 	logger := log.FromContext(ctx)
 	masterName := rs.Name + "-master"
@@ -1284,11 +1286,25 @@ func (r *RedisSentinelReconciler) syncSentinelMonitorConfig(ctx context.Context,
 		return cond
 	}
 
+	quiescedBy, err := r.restoreHoldingQuiesce(ctx, rs)
+	if err != nil {
+		// Not knowing whether a restore holds the quiesce means a repair here
+		// could re-arm failure detection mid-restart and cost the restored
+		// dataset; skip the pass instead.
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "RestoreLookupFailed"
+		cond.Message = err.Error()
+		return cond
+	}
+
 	desired := []struct{ option, value string }{
-		{"down-after-milliseconds", fmt.Sprintf("%d", rs.Spec.SentinelConfig.DownAfterMilliseconds)},
 		{"failover-timeout", fmt.Sprintf("%d", rs.Spec.SentinelConfig.FailoverTimeout)},
 		{"parallel-syncs", fmt.Sprintf("%d", rs.Spec.SentinelConfig.ParallelSyncs)},
 		{"quorum", fmt.Sprintf("%d", rs.Spec.SentinelConfig.Quorum)},
+	}
+	if quiescedBy == "" {
+		desired = append(desired, struct{ option, value string }{
+			"down-after-milliseconds", fmt.Sprintf("%d", rs.Spec.SentinelConfig.DownAfterMilliseconds)})
 	}
 
 	var repaired, failures []string
@@ -1326,8 +1342,40 @@ func (r *RedisSentinelReconciler) syncSentinelMonitorConfig(ctx context.Context,
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = "DriftRepairFailed"
 		cond.Message = strings.Join(failures, "; ")
+	} else if quiescedBy != "" {
+		cond.Reason = "RestoreQuiesced"
+		cond.Message = "down-after-milliseconds is held raised by RedisRestore " + quiescedBy + " during its master restart"
 	}
 	return cond
+}
+
+// restoreHoldingQuiesce names the RedisRestore that has quiesced this
+// cluster's sentinels, or "" when none does. The restore raises
+// down-after-milliseconds before its controlled master restart; converging the
+// value back to the spec inside that window re-arms failure detection while
+// the master is deliberately down, and the resulting failover resyncs the
+// restored dataset away. The marker is the restore's own persisted breadcrumb,
+// written before the first SENTINEL SET, so an operator restart cannot
+// desynchronise the two controllers. A terminal restore does not hold the
+// quiesce even when the breadcrumb survived (its unquiesce failed): from there
+// this reconciler is the fallback that converges the spec value back, and a
+// deleted restore releases the hold the same way.
+func (r *RedisSentinelReconciler) restoreHoldingQuiesce(ctx context.Context, rs *redisv1alpha1.RedisSentinel) (string, error) {
+	restores := &redisv1alpha1.RedisRestoreList{}
+	if err := r.List(ctx, restores, client.InNamespace(rs.Namespace)); err != nil {
+		return "", err
+	}
+	for i := range restores.Items {
+		restore := &restores.Items[i]
+		if restore.Spec.RedisClusterRef != rs.Name ||
+			restore.Status.QuiescedDownAfterMilliseconds == 0 ||
+			restore.Status.Phase == redisv1alpha1.RestorePhaseCompleted ||
+			restore.Status.Phase == redisv1alpha1.RestorePhaseFailed {
+			continue
+		}
+		return restore.Name, nil
+	}
+	return "", nil
 }
 
 func (r *RedisSentinelReconciler) getCurrentMaster(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config) (string, error) {

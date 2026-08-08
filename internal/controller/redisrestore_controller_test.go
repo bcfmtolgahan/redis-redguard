@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -44,6 +45,8 @@ const (
 	restoreName       = "test-restore"
 	restoreMasterIP   = "10.244.0.10"
 	restoreMasterAddr = restoreMasterIP + ":6379"
+	// restoreSentinelIPBase + ordinal is the IP of each seeded sentinel pod.
+	restoreSentinelIPBase = "10.244.0.2"
 )
 
 type restoreFixture struct {
@@ -89,6 +92,24 @@ func newRestoreFixture(t *testing.T, mutate func(*redisv1alpha1.RedisRestore), e
 		},
 	}
 
+	sentinelPods := make([]client.Object, 3)
+	for i := range sentinelPods {
+		sentinelPods[i] = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-sentinel-%d", restoreCluster, i),
+				Namespace: restoreNS,
+				Labels: map[string]string{
+					"app.kubernetes.io/instance":  restoreCluster,
+					"app.kubernetes.io/component": "sentinel",
+				},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				PodIP: fmt.Sprintf("%s%d", restoreSentinelIPBase, i),
+			},
+		}
+	}
+
 	restore := &redisv1alpha1.RedisRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: restoreName, Namespace: restoreNS, Generation: 1},
 		Spec: redisv1alpha1.RedisRestoreSpec{
@@ -107,7 +128,8 @@ func newRestoreFixture(t *testing.T, mutate func(*redisv1alpha1.RedisRestore), e
 		mutate(restore)
 	}
 
-	objects := append([]client.Object{rs, masterPod, restore}, extra...)
+	objects := append([]client.Object{rs, masterPod, restore}, sentinelPods...)
+	objects = append(objects, extra...)
 	c := crfake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
@@ -259,6 +281,32 @@ func TestRestore_SpecChangeRerunsCompletedRestore(t *testing.T) {
 	}
 }
 
+func TestRestore_SpecChangeClearsStaleQuiesceBreadcrumb(t *testing.T) {
+	// The previous run failed without lifting the quiesce, so its breadcrumb
+	// survived. Carrying it into the new run would mark the sentinels as
+	// quiesced by a shutdown this run never issued: the payload-lost re-stage
+	// check reads it as "already shut down", and the sentinel reconciler keeps
+	// honouring a quiesce nobody holds.
+	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
+		r.Generation = 2
+		r.Status.Phase = redisv1alpha1.RestorePhaseFailed
+		r.Status.ObservedGeneration = 1
+		r.Status.QuiescedDownAfterMilliseconds = 5000
+	})
+
+	if _, err := fx.reconcile(t); err != nil {
+		t.Fatalf("reconcile after spec change: %v", err)
+	}
+
+	restore := fx.get(t)
+	if restore.Status.Phase != redisv1alpha1.RestorePhasePending {
+		t.Fatalf("phase = %q, want Pending", restore.Status.Phase)
+	}
+	if restore.Status.QuiescedDownAfterMilliseconds != 0 {
+		t.Errorf("stale quiesce breadcrumb %d carried into the new run", restore.Status.QuiescedDownAfterMilliseconds)
+	}
+}
+
 func TestRestore_RestoringQuiescesSentinelsBeforeShutdown(t *testing.T) {
 	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
 		r.Status.Phase = redisv1alpha1.RestorePhaseRestoring
@@ -298,6 +346,68 @@ func TestRestore_RestoringQuiescesSentinelsBeforeShutdown(t *testing.T) {
 	}
 	if quiesceIdx == -1 || quiesceIdx > shutdownIdx {
 		t.Fatalf("shutdown before sentinel quiesce would let a stale replica be promoted; calls: %v", calls)
+	}
+}
+
+func TestRestore_RestoringQuiescesEverySentinelPod(t *testing.T) {
+	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
+		r.Status.Phase = redisv1alpha1.RestorePhaseRestoring
+		r.Status.ObservedGeneration = 1
+		r.Status.StartTime = &metav1.Time{Time: time.Now()}
+	})
+	fx.r.PodExec = payloadCheckExec(t, "present")
+
+	if _, err := fx.reconcile(t); err != nil {
+		t.Fatalf("restoring reconcile: %v", err)
+	}
+
+	// The quiesce must land on the same sentinels the sentinel reconciler
+	// converges: the running pods. A write to any other address set leaves a
+	// live sentinel on the low threshold.
+	ops := fx.factory.Ops()
+	for i := 0; i < 3; i++ {
+		addr := fmt.Sprintf("%s%d:26379", restoreSentinelIPBase, i)
+		found := false
+		for _, op := range ops {
+			if strings.Contains(op, addr) && strings.Contains(op, "down-after-milliseconds=600000") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("sentinel pod %s never saw the quiesce; ops: %v", addr, ops)
+		}
+	}
+}
+
+func TestRestore_RestoringRefusesPartialSentinelQuiesce(t *testing.T) {
+	// One sentinel pod is gone. Quiescing only the survivors leaves a sentinel
+	// on the low down-after-milliseconds; if it comes back mid-restart it
+	// still reads the controlled shutdown as a master failure. The restore
+	// must hold off the shutdown until every sentinel can be quiesced.
+	fx := newRestoreFixture(t, func(r *redisv1alpha1.RedisRestore) {
+		r.Status.Phase = redisv1alpha1.RestorePhaseRestoring
+		r.Status.ObservedGeneration = 1
+		r.Status.StartTime = &metav1.Time{Time: time.Now()}
+	})
+	fx.r.PodExec = payloadCheckExec(t, "present")
+
+	gone := &corev1.Pod{}
+	gone.Name, gone.Namespace = restoreCluster+"-sentinel-2", restoreNS
+	if err := fx.c.Delete(context.Background(), gone); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fx.reconcile(t); err == nil {
+		t.Fatal("expected an error while a sentinel cannot be quiesced, got nil")
+	}
+	for _, call := range fx.factory.Calls() {
+		if strings.Contains(call, "ShutdownNoSave") {
+			t.Errorf("master shut down with a sentinel left unquiesced: %v", fx.factory.Calls())
+		}
+		if strings.Contains(call, "SetMasterOptionAll") {
+			t.Errorf("partial quiesce written: %v", fx.factory.Calls())
+		}
 	}
 }
 

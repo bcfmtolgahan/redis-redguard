@@ -234,6 +234,30 @@ func TestSetMasterOptionAllRecordsOptionAcrossPool(t *testing.T) {
 	}
 }
 
+func TestSetMasterOptionAllUpdatesEveryMemberView(t *testing.T) {
+	f := fake.NewFactory()
+	ctx := context.Background()
+	f.SetMaster("10.0.0.1:6379")
+	f.SetMonitorConfig(map[string]string{"down-after-milliseconds": "5000"})
+
+	p := f.NewSentinelPool([]string{"s0:26379", "s1:26379"}, "", nil)
+	if err := p.SetMasterOptionAll(ctx, "m", "down-after-milliseconds", "600000"); err != nil {
+		t.Fatal(err)
+	}
+
+	// SENTINEL SET is per-instance state and the pool applies it to every
+	// member, so a later read through a single-member pool must see the write.
+	for _, addr := range []string{"s0:26379", "s1:26379"} {
+		info, err := f.NewSentinelPool([]string{addr}, "", nil).GetMasterFromPool(ctx, "m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.DownAfterMilliseconds != "600000" {
+			t.Errorf("%s reports down-after-milliseconds=%q, want the pool-wide write 600000", addr, info.DownAfterMilliseconds)
+		}
+	}
+}
+
 func TestSetErrorReachesSentinelPoolMethods(t *testing.T) {
 	f := fake.NewFactory()
 	ctx := context.Background()

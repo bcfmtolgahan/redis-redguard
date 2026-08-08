@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -126,6 +127,10 @@ func (r *RedisRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		redisRestore.Status.StartTime = &metav1.Time{Time: time.Now()}
 		redisRestore.Status.CompletionTime = nil
 		redisRestore.Status.Duration = ""
+		// A breadcrumb surviving a failed unquiesce belongs to the previous
+		// run: carried over, it reads as "this run already shut the master
+		// down" and holds the sentinel reconciler off a quiesce nobody owns.
+		redisRestore.Status.QuiescedDownAfterMilliseconds = 0
 		if err := r.updateStatus(ctx, redisRestore, redisv1alpha1.RestorePhasePending, "Spec changed; starting a new restore run", 0); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -299,7 +304,11 @@ func (r *RedisRestoreReconciler) handleRestoringPhase(ctx context.Context, resto
 
 	// The value to restore is persisted before SENTINEL SET: if the process
 	// dies in between, the breadcrumb still gets the setting restored later;
-	// the reverse order could leave the sentinels quiesced forever.
+	// the reverse order could leave the sentinels quiesced forever. The
+	// breadcrumb doubles as the quiesce marker the sentinel reconciler
+	// honours: while it is set and this restore is not terminal, monitor
+	// drift repair leaves down-after-milliseconds alone instead of lowering
+	// it mid-restart and letting a failover wipe the restored dataset.
 	if restore.Status.QuiescedDownAfterMilliseconds == 0 {
 		value := rs.Spec.SentinelConfig.DownAfterMilliseconds
 		if value == 0 {
@@ -310,7 +319,7 @@ func (r *RedisRestoreReconciler) handleRestoringPhase(ctx context.Context, resto
 			return ctrl.Result{}, err
 		}
 	}
-	if err := r.setSentinelDownAfter(ctx, rs, adminPassword, tlsCfg, quiesceDownAfterMilliseconds); err != nil {
+	if err := r.setSentinelDownAfter(ctx, rs, adminPassword, tlsCfg, quiesceDownAfterMilliseconds, true); err != nil {
 		return ctrl.Result{}, fmt.Errorf("quiesce sentinels: %w", err)
 	}
 
@@ -427,7 +436,7 @@ func (r *RedisRestoreReconciler) failRestore(ctx context.Context, restore *redis
 		}
 		if err != nil {
 			logger.Error(err, "Failed to restore sentinel down-after-milliseconds")
-			message += "; sentinel down-after-milliseconds is still raised and must be restored manually"
+			message += "; sentinel down-after-milliseconds is still raised and the sentinel reconciler will converge it back to the spec"
 		}
 	}
 
@@ -508,12 +517,46 @@ func (r *RedisRestoreReconciler) lookupBackupKeyCount(ctx context.Context, resto
 	return nil
 }
 
-// setSentinelDownAfter applies down-after-milliseconds on every sentinel.
-func (r *RedisRestoreReconciler) setSentinelDownAfter(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config, value string) error {
-	addrs := make([]string, rs.Spec.SentinelConfig.Replicas)
-	for i := int32(0); i < rs.Spec.SentinelConfig.Replicas; i++ {
-		addrs[i] = fmt.Sprintf("%s-sentinel-%d.%s-sentinel-headless.%s.svc.cluster.local:26379",
-			rs.Name, i, rs.Name, rs.Namespace)
+// runningSentinelAddresses lists the dial addresses of the cluster's running
+// sentinel pods: the same surface the sentinel reconciler converges, so the
+// quiesce and the drift repair talk about the same instances.
+func (r *RedisRestoreReconciler) runningSentinelAddresses(ctx context.Context, rs *redisv1alpha1.RedisSentinel) ([]string, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabels{
+		"app.kubernetes.io/component": "sentinel",
+		"app.kubernetes.io/instance":  rs.Name,
+	}); err != nil {
+		return nil, err
+	}
+	addrs := make([]string, 0, len(podList.Items))
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		addrs = append(addrs, pod.Status.PodIP+":26379")
+	}
+	slices.Sort(addrs)
+	return addrs, nil
+}
+
+// setSentinelDownAfter applies down-after-milliseconds on every running
+// sentinel. requireAll refuses to act unless every sentinel in the spec is
+// visible and running: one missed by the quiesce keeps the low threshold and
+// can still declare the controlled restart a master failure. The lenient form
+// serves the unquiesce, where the sentinel reconciler repairs any member
+// missed here once the restore is terminal.
+func (r *RedisRestoreReconciler) setSentinelDownAfter(ctx context.Context, rs *redisv1alpha1.RedisSentinel, password string, tlsCfg *tls.Config, value string, requireAll bool) error {
+	addrs, err := r.runningSentinelAddresses(ctx, rs)
+	if err != nil {
+		return err
+	}
+	if requireAll && int32(len(addrs)) < rs.Spec.SentinelConfig.Replicas {
+		return fmt.Errorf("only %d of %d sentinels are running; refusing a partial quiesce",
+			len(addrs), rs.Spec.SentinelConfig.Replicas)
+	}
+	if len(addrs) == 0 {
+		return nil
 	}
 	pool := factoryOrDefault(r.RedisFactory).NewSentinelPool(addrs, password, tlsCfg)
 	return pool.SetMasterOptionAll(ctx, rs.Name+"-master", "down-after-milliseconds", value)
@@ -529,7 +572,7 @@ func (r *RedisRestoreReconciler) restoreSentinelDownAfter(ctx context.Context, r
 	if value == 0 {
 		return nil
 	}
-	if err := r.setSentinelDownAfter(ctx, rs, password, tlsCfg, strconv.Itoa(int(value))); err != nil {
+	if err := r.setSentinelDownAfter(ctx, rs, password, tlsCfg, strconv.Itoa(int(value)), false); err != nil {
 		return err
 	}
 	restore.Status.QuiescedDownAfterMilliseconds = 0

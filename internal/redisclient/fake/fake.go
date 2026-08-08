@@ -37,13 +37,14 @@ type Factory struct {
 	masterAddr    string
 	users         map[string][]string
 	masterOptions map[string]string
-	// monitorDefault seeds the monitor state a pool reports for the master:
-	// quorum, down-after-milliseconds, failover-timeout, parallel-syncs.
-	// monitorByKey holds each pool's own copy, keyed like the call log,
-	// because SENTINEL SET is per-instance state that never propagates: a
-	// repair sent to one member must not change what the others report.
+	// monitorDefault seeds the monitor state a sentinel reports for the
+	// master: quorum, down-after-milliseconds, failover-timeout,
+	// parallel-syncs. monitorByAddr holds each member's own copy, keyed by
+	// dial address, because SENTINEL SET is per-instance state that never
+	// propagates on its own: a pool-wide write updates each member it
+	// reaches, and only those, no matter which pool later reads them.
 	monitorDefault map[string]string
-	monitorByKey   map[string]map[string]string
+	monitorByAddr  map[string]map[string]string
 	errs           map[string]error
 	calls          []string
 	// ops is a second log carrying the arguments the calls log drops, so a
@@ -76,7 +77,7 @@ func NewFactory() *Factory {
 		users:          map[string][]string{},
 		masterOptions:  map[string]string{},
 		monitorDefault: map[string]string{},
-		monitorByKey:   map[string]map[string]string{},
+		monitorByAddr:  map[string]map[string]string{},
 		errs:           map[string]error{},
 	}
 }
@@ -198,7 +199,7 @@ func (f *Factory) MasterOptions() map[string]string {
 
 // SetMonitorConfig declares the monitor parameters every fake sentinel reports
 // for the master: quorum, down-after-milliseconds, failover-timeout,
-// parallel-syncs. Unset keys report as empty. Per-pool state written earlier
+// parallel-syncs. Unset keys report as empty. Per-member state written earlier
 // through SetMasterOptionAll is discarded.
 func (f *Factory) SetMonitorConfig(cfg map[string]string) {
 	f.mu.Lock()
@@ -207,19 +208,19 @@ func (f *Factory) SetMonitorConfig(cfg map[string]string) {
 	for k, v := range cfg {
 		f.monitorDefault[k] = v
 	}
-	f.monitorByKey = map[string]map[string]string{}
+	f.monitorByAddr = map[string]map[string]string{}
 }
 
-// monitorFor returns the monitor state one pool reports, seeding it from the
-// default on first use. Caller holds f.mu.
-func (f *Factory) monitorFor(key string) map[string]string {
-	state, ok := f.monitorByKey[key]
+// monitorFor returns the monitor state one sentinel member reports, seeding it
+// from the default on first use. Caller holds f.mu.
+func (f *Factory) monitorFor(addr string) map[string]string {
+	state, ok := f.monitorByAddr[addr]
 	if !ok {
 		state = map[string]string{}
 		for k, v := range f.monitorDefault {
 			state[k] = v
 		}
-		f.monitorByKey[key] = state
+		f.monitorByAddr[addr] = state
 	}
 	return state
 }
@@ -563,7 +564,13 @@ func (p *pool) GetMasterFromPool(ctx context.Context, masterName string) (*senti
 	if p.f.knownSentinels > 0 {
 		others = p.f.knownSentinels - 1
 	}
-	monitor := p.f.monitorFor(p.key())
+	// The real pool serves the read from the first member that answers, and
+	// monitor state is that member's own view.
+	memberAddr := p.key()
+	if len(p.addrs) > 0 {
+		memberAddr = p.addrs[0]
+	}
+	monitor := p.f.monitorFor(memberAddr)
 	quorum := monitor["quorum"]
 	if quorum == "" {
 		quorum = "2"
@@ -629,7 +636,11 @@ func (p *pool) SetMasterOptionAll(ctx context.Context, masterName, option, value
 	p.f.masterOptions[option] = value
 	switch option {
 	case "quorum", "down-after-milliseconds", "failover-timeout", "parallel-syncs":
-		p.f.monitorFor(p.key())[option] = value
+		// The real command runs against every member individually, so each
+		// member's own view updates and later single-member reads see it.
+		for _, addr := range p.addrs {
+			p.f.monitorFor(addr)[option] = value
+		}
 	}
 	return nil
 }
