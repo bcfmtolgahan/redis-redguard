@@ -85,16 +85,20 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+        # The informer cache dominates memory and the Secret informer is not
+        # label-scoped, so the ceiling scales with the Secrets in the watched
+        # namespaces. Keep in sync with operator.resources in
+        # charts/redguard/values.yaml.
         resources:
           limits:
             cpu: 500m
-            memory: 128Mi
+            memory: 512Mi
           requests:
-            cpu: 10m
-            memory: 64Mi
+            cpu: 100m
+            memory: 128Mi
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager
-      terminationGracePeriodSeconds: 10
+      # A reconcile can block on failover convergence, and the leader lease is
+      # handed back during shutdown; 10s would SIGKILL through both.
+      terminationGracePeriodSeconds: 60

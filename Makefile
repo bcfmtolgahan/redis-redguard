@@ -190,7 +190,7 @@ sync-chart: manifests ## Regenerate chart CRDs and RBAC from config/.
 	./hack/sync-chart.sh
 
 .PHONY: verify-chart
-verify-chart: manifests ## Fail if the chart is out of sync with config/.
+verify-chart: manifests ## Fail if the chart is out of sync with config/ or drops a required runtime flag.
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT; \
 	./hack/sync-chart.sh "$$tmp" >/dev/null; \
 	rc=0; \
@@ -203,6 +203,7 @@ verify-chart: manifests ## Fail if the chart is out of sync with config/.
 	fi
 	helm lint $(CHART_DIR)
 	helm template redguard $(CHART_DIR) >/dev/null
+	./hack/verify-chart-render.sh $(CHART_DIR)
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

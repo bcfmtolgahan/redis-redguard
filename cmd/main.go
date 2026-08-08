@@ -26,10 +26,17 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -64,6 +71,79 @@ func splitCommaList(s string) []string {
 	return out
 }
 
+// managedByOperator selects the objects the operator itself creates; every one
+// of them is built with this label.
+var managedByOperator = labels.SelectorFromSet(labels.Set{
+	"app.kubernetes.io/managed-by": "redguard-operator",
+})
+
+// cacheOptions scopes the manager's informers. An unscoped manager keeps a
+// cluster-wide copy of every Pod, ConfigMap, Service and StatefulSet, which is
+// what makes the operator run out of memory on a large cluster.
+//
+// watchNamespaces empty means every namespace. Types the operator only ever
+// reads back from itself are additionally filtered by label. Secrets are not:
+// the auth password, the TLS certificates and the S3 credentials belong to the
+// user and carry no operator label, so filtering them would hide them from
+// every read and from the watch that drives credential rotation.
+func cacheOptions(watchNamespaces []string) cache.Options {
+	opts := cache.Options{
+		// Server-side field ownership is a large share of a cached object and
+		// nothing here reads it.
+		DefaultTransform: cache.TransformStripManagedFields(),
+		ByObject: map[client.Object]cache.ByObject{
+			&corev1.Pod{}:                   {Label: managedByOperator},
+			&corev1.ConfigMap{}:             {Label: managedByOperator},
+			&corev1.Service{}:               {Label: managedByOperator},
+			&appsv1.StatefulSet{}:           {Label: managedByOperator},
+			&networkingv1.NetworkPolicy{}:   {Label: managedByOperator},
+			&policyv1.PodDisruptionBudget{}: {Label: managedByOperator},
+		},
+	}
+
+	if len(watchNamespaces) > 0 {
+		opts.DefaultNamespaces = make(map[string]cache.Config, len(watchNamespaces))
+		for _, ns := range watchNamespaces {
+			opts.DefaultNamespaces[ns] = cache.Config{}
+		}
+	}
+	return opts
+}
+
+// managerConfig carries the parsed flags the manager itself needs.
+type managerConfig struct {
+	metrics         metricsserver.Options
+	webhookServer   webhook.Server
+	probeAddr       string
+	leaderElect     bool
+	watchNamespaces []string
+}
+
+func managerOptions(cfg managerConfig) ctrl.Options {
+	return ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                cfg.metrics,
+		WebhookServer:          cfg.webhookServer,
+		HealthProbeBindAddress: cfg.probeAddr,
+		LeaderElection:         cfg.leaderElect,
+		LeaderElectionID:       "f4acadcf.redguard.io",
+		// Nothing runs after mgr.Start returns, so stepping down is safe here
+		// and the successor takes over in seconds instead of waiting out the
+		// full lease.
+		LeaderElectionReleaseOnCancel: true,
+		Cache:                         cacheOptions(cfg.watchNamespaces),
+	}
+}
+
+// zapOptions binds the logging flags to fs. The zero value is production
+// logging: JSON, info level, stacktraces only from error upwards. --zap-devel
+// is the opt-in to console output at debug level.
+func zapOptions(fs *flag.FlagSet) *zap.Options {
+	opts := &zap.Options{}
+	opts.BindFlags(fs)
+	return opts
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -75,6 +155,7 @@ func main() {
 	var enableHTTP2 bool
 	var allowedBackupBuckets string
 	var allowedBackupEndpoints string
+	var watchNamespace string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -100,13 +181,14 @@ func main() {
 	flag.StringVar(&allowedBackupEndpoints, "allowed-backup-endpoints", "",
 		"Comma-separated custom S3 endpoints permitted for IAM-role backups, for example a VPC "+
 			"endpoint URL. Empty permits only the default AWS endpoint.")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
+	flag.StringVar(&watchNamespace, "watch-namespace", "",
+		"Comma-separated namespaces the operator watches and acts on. Empty watches every "+
+			"namespace, which means an informer over the whole cluster; set this on a large "+
+			"cluster or when the operator should not see other tenants.")
+	opts := zapOptions(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(opts)))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -175,25 +257,20 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "f4acadcf.redguard.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
-	})
+	watchNamespaces := splitCommaList(watchNamespace)
+	if len(watchNamespaces) == 0 {
+		setupLog.Info("watching every namespace")
+	} else {
+		setupLog.Info("watching selected namespaces", "namespaces", watchNamespaces)
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions(managerConfig{
+		metrics:         metricsServerOptions,
+		webhookServer:   webhookServer,
+		probeAddr:       probeAddr,
+		leaderElect:     enableLeaderElection,
+		watchNamespaces: watchNamespaces,
+	}))
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)

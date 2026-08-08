@@ -2,18 +2,37 @@
 
 # Operator configuration
 operator:
-  # Number of operator replicas
+  # Number of operator replicas. More than one requires leaderElect.
   replicas: 1
+
+  # Elect a single active manager. Two managers reconciling the same clusters
+  # race on master role labels and StatefulSet updates.
+  leaderElect: true
+
+  # Namespaces the operator watches, passed as --watch-namespace. Empty watches
+  # every namespace, which makes the informer cache hold objects cluster-wide.
+  watchNamespaces: []
+
+  # Seconds before the kubelet SIGKILLs the pod. Must stay above the manager's
+  # 30s reconcile drain plus the leader lease handover that follows it.
+  terminationGracePeriodSeconds: 60
+
+  # Console-format debug logging with stacktraces on warnings. The default is
+  # JSON at info level; turn this on only to debug the operator.
+  devLogging: false
 
   image:
     repository: ghcr.io/bcfmtolgahan/redguard
     tag: v0.2.1
     pullPolicy: IfNotPresent
 
+  # The informer cache dominates memory, and Secrets cannot be label-scoped
+  # because they are user-created, so the ceiling scales with the number of
+  # Secrets in the watched namespaces. Set watchNamespaces before lowering this.
   resources:
     limits:
       cpu: 500m
-      memory: 256Mi
+      memory: 512Mi
     requests:
       cpu: 100m
       memory: 128Mi

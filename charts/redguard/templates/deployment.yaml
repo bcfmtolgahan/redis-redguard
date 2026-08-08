@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.operator.replicas) 1) (not .Values.operator.leaderElect) }}
+{{- fail "operator.replicas > 1 requires operator.leaderElect: true, otherwise every replica reconciles the same clusters" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,7 +32,15 @@ spec:
         command:
         - /manager
         args:
+        {{- if .Values.operator.leaderElect }}
         - --leader-elect
+        {{- end }}
+        {{- with .Values.operator.watchNamespaces }}
+        - --watch-namespace={{ join "," . }}
+        {{- end }}
+        {{- if .Values.operator.devLogging }}
+        - --zap-devel
+        {{- end }}
         {{- if .Values.metrics.enabled }}
         - --metrics-bind-address=:{{ .Values.metrics.port }}
         {{- end }}
@@ -68,4 +79,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: {{ .Values.operator.terminationGracePeriodSeconds }}
