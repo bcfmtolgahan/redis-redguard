@@ -26,9 +26,11 @@ operator:
     tag: v0.3.0
     pullPolicy: IfNotPresent
 
-  # The informer cache dominates memory, and Secrets cannot be label-scoped
-  # because they are user-created, so the ceiling scales with the number of
-  # Secrets in the watched namespaces. Set watchNamespaces before lowering this.
+  # The informer cache is the main memory consumer, and Secrets cannot be
+  # label-scoped because they are user-created, so the ceiling scales with the
+  # number of Secrets in the watched namespaces; set watchNamespaces before
+  # lowering this. Backups stream the RDB to S3 in fixed-size parts, so backup
+  # memory stays flat regardless of dataset size.
   resources:
     limits:
       cpu: 500m

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -42,28 +43,102 @@ import (
 
 // fakeS3Store is an in-memory S3 implementing the subset the backup
 // controller uses. Listing filters by prefix and paginates like S3;
-// per-key delete errors are injectable.
+// per-key delete errors and put or part failures are injectable.
 type fakeS3Store struct {
 	objects      map[string]time.Time
+	data         map[string][]byte
 	pageSize     int
 	deleteErrs   map[string]error
+	putErr       error
+	partErrs     map[int32]error
 	putKeys      []string
 	deleted      []string
 	listPrefixes []string
+	mpParts      map[string]map[int32][]byte
+	mpKeys       map[string]string
+	mpCreated    int
+	mpCompleted  int
+	mpAborted    int
 }
 
 func newFakeS3Store() *fakeS3Store {
 	return &fakeS3Store{
 		objects:    map[string]time.Time{},
+		data:       map[string][]byte{},
 		deleteErrs: map[string]error{},
+		partErrs:   map[int32]error{},
+		mpParts:    map[string]map[int32][]byte{},
+		mpKeys:     map[string]string{},
 	}
 }
 
 func (f *fakeS3Store) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if f.putErr != nil {
+		return nil, f.putErr
+	}
+	body, err := io.ReadAll(in.Body)
+	if err != nil {
+		return nil, err
+	}
 	key := aws.ToString(in.Key)
 	f.putKeys = append(f.putKeys, key)
 	f.objects[key] = time.Now()
+	f.data[key] = body
 	return &s3.PutObjectOutput{}, nil
+}
+
+func (f *fakeS3Store) CreateMultipartUpload(_ context.Context, in *s3.CreateMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
+	f.mpCreated++
+	id := "mp-" + strconv.Itoa(f.mpCreated)
+	f.mpParts[id] = map[int32][]byte{}
+	f.mpKeys[id] = aws.ToString(in.Key)
+	return &s3.CreateMultipartUploadOutput{UploadId: aws.String(id)}, nil
+}
+
+func (f *fakeS3Store) UploadPart(_ context.Context, in *s3.UploadPartInput, _ ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+	num := aws.ToInt32(in.PartNumber)
+	if err, ok := f.partErrs[num]; ok {
+		return nil, err
+	}
+	parts, ok := f.mpParts[aws.ToString(in.UploadId)]
+	if !ok {
+		return nil, errors.New("no such upload")
+	}
+	body, err := io.ReadAll(in.Body)
+	if err != nil {
+		return nil, err
+	}
+	parts[num] = body
+	return &s3.UploadPartOutput{ETag: aws.String("etag-" + strconv.Itoa(int(num)))}, nil
+}
+
+func (f *fakeS3Store) CompleteMultipartUpload(_ context.Context, in *s3.CompleteMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+	id := aws.ToString(in.UploadId)
+	parts, ok := f.mpParts[id]
+	if !ok {
+		return nil, errors.New("no such upload")
+	}
+	var body []byte
+	for _, p := range in.MultipartUpload.Parts {
+		chunk, ok := parts[aws.ToInt32(p.PartNumber)]
+		if !ok {
+			return nil, errors.New("completed part was never uploaded")
+		}
+		body = append(body, chunk...)
+	}
+	key := aws.ToString(in.Key)
+	f.putKeys = append(f.putKeys, key)
+	f.objects[key] = time.Now()
+	f.data[key] = body
+	delete(f.mpParts, id)
+	f.mpCompleted++
+	return &s3.CompleteMultipartUploadOutput{}, nil
+}
+
+func (f *fakeS3Store) AbortMultipartUpload(_ context.Context, in *s3.AbortMultipartUploadInput, _ ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+	delete(f.mpParts, aws.ToString(in.UploadId))
+	f.mpAborted++
+	return &s3.AbortMultipartUploadOutput{}, nil
 }
 
 func (f *fakeS3Store) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
@@ -382,7 +457,7 @@ func TestUploadKeyIsNamespaceAndClusterScoped(t *testing.T) {
 	fakeS3 := newFakeS3Store()
 	r := backupReconcilerWithS3(fakeS3)
 
-	location, err := r.uploadToS3(context.Background(), backup, []byte("REDIS0011-not-really"))
+	location, _, err := r.uploadToS3(context.Background(), backup, strings.NewReader("REDIS0011-not-really"))
 	if err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}

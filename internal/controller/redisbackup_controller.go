@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"sort"
 	"strings"
@@ -84,9 +85,16 @@ type RedisBackupReconciler struct {
 	// AllowedEndpoints lists custom S3 endpoints permitted together with
 	// useIAMRole. Empty permits only the SDK's default AWS endpoint.
 	AllowedEndpoints []string
+	// PodStream streams a command's stdout out of a Redis pod; nil means the
+	// SPDY executor. It is a seam so tests can feed an RDB stream.
+	PodStream podStreamFn
 	// newS3Client replaces S3 client construction in tests.
 	newS3Client func(ctx context.Context, backup *redisv1alpha1.RedisBackup) (s3API, error)
 }
+
+// podStreamFn writes a command's stdout to the given writer as it arrives, so
+// the caller never holds the full output in memory.
+type podStreamFn func(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, container string, command []string, stdout io.Writer) (stderr string, err error)
 
 // s3API is the subset of the AWS S3 client the backup controller uses.
 // *s3.Client satisfies it; tests substitute an in-memory implementation.
@@ -94,6 +102,10 @@ type s3API interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	CreateMultipartUpload(ctx context.Context, in *s3.CreateMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(ctx context.Context, in *s3.UploadPartInput, optFns ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(ctx context.Context, in *s3.AbortMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
 }
 
 // s3ClientFor returns the S3 client for a backup, honouring the test override.
@@ -176,7 +188,7 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	r.updateStatus(ctx, redisBackup, phaseRunning, "", 0, "", nil)
 
 	startTime := time.Now()
-	backupLocation, backupSize, err := r.performBackup(ctx, redisBackup)
+	backupLocation, backupSize, keyCount, err := r.performBackup(ctx, redisBackup)
 	duration := time.Since(startTime)
 
 	if err != nil {
@@ -198,7 +210,11 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "RetentionFailed", err.Error())
 	}
 
-	// Update status
+	// KeyCount is persisted only here, together with the BackupLocation it
+	// describes: written earlier, a failed upload would pair the new count
+	// with the previous object and every restore of it would then fail its
+	// verification. A nil count clears a stale one for the same reason.
+	redisBackup.Status.KeyCount = keyCount
 	r.updateStatus(ctx, redisBackup, phaseCompleted, backupLocation, backupSize, duration.String(), nil)
 
 	// Update metrics
@@ -323,7 +339,11 @@ func (r *RedisBackupReconciler) shouldBackup(redisBackup *redisv1alpha1.RedisBac
 	return now.After(nextBackup), schedule.Next(now)
 }
 
-func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (string, int64, error) {
+// performBackup runs one backup and returns the stored location, uploaded
+// size and the key count taken right after BGSAVE (nil when counting failed).
+// The count is returned, not written to status: it describes an object that
+// exists only if the upload succeeds, so the caller persists both together.
+func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (string, int64, *int64, error) {
 	logger := log.FromContext(ctx)
 
 	// Get RedisSentinel cluster
@@ -332,13 +352,13 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 		Name:      redisBackup.Spec.RedisClusterRef,
 		Namespace: redisBackup.Namespace,
 	}, redisSentinel); err != nil {
-		return "", 0, fmt.Errorf("failed to get RedisSentinel: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to get RedisSentinel: %w", err)
 	}
 
 	// Get backup pod - prefer replica over master to reduce load on master
 	backupPod, isReplica, err := r.getBackupPod(ctx, redisSentinel)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to get backup pod: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to get backup pod: %w", err)
 	}
 
 	if isReplica {
@@ -349,55 +369,59 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 
 	// Trigger BGSAVE
 	if err := r.triggerBGSave(ctx, redisSentinel, backupPod); err != nil {
-		return "", 0, fmt.Errorf("failed to trigger BGSAVE: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to trigger BGSAVE: %w", err)
 	}
 
 	// Wait for BGSAVE to complete
 	if err := r.waitForBGSave(ctx, redisSentinel, backupPod); err != nil {
-		return "", 0, fmt.Errorf("BGSAVE failed: %w", err)
+		return "", 0, nil, fmt.Errorf("BGSAVE failed: %w", err)
 	}
 
 	// Recorded so a restore of this object can verify the loaded dataset.
 	// Counted after BGSAVE completes, so a cluster taking writes may drift
-	// from the snapshot by the keys written since the fork.
+	// from the snapshot by the keys written since the fork; the restore
+	// treats a mismatch as advisory for exactly that reason.
+	var keyCount *int64
 	if total, err := r.backupKeyCount(ctx, redisSentinel, backupPod); err != nil {
 		logger.Error(err, "Failed to count keys; restores of this backup fall back to a non-empty check")
 	} else {
-		redisBackup.Status.KeyCount = &total
+		keyCount = &total
 	}
 
-	// Get RDB file content using pod exec
-	rdbData, err := r.getRDBData(ctx, backupPod)
+	// The RDB is streamed out of the pod, optionally through gzip, straight
+	// into the S3 upload: peak memory stays at one upload part regardless of
+	// dataset size, where buffering held roughly twice the dataset and OOM
+	// killed the operator on any dataset near the pod's memory limit.
+	rdbStream, err := r.openRDBStream(ctx, backupPod)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to get RDB data: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to get RDB data: %w", err)
 	}
+	defer rdbStream.Close()
 
-	// Compress if enabled
-	var dataToUpload []byte
+	body := io.Reader(rdbStream)
 	if redisBackup.Spec.Compression {
-		var buf bytes.Buffer
-		gzipWriter := gzip.NewWriter(&buf)
-		if _, err := gzipWriter.Write(rdbData); err != nil {
-			return "", 0, fmt.Errorf("compression failed: %w", err)
-		}
-		// Close writes the gzip footer. Uploading buf without it stores an
-		// archive that no reader, including the restore path, can decompress.
-		if err := gzipWriter.Close(); err != nil {
-			return "", 0, fmt.Errorf("compression failed: %w", err)
-		}
-		dataToUpload = buf.Bytes()
-		logger.Info("Compressed backup", "original", len(rdbData), "compressed", len(dataToUpload))
-	} else {
-		dataToUpload = rdbData
+		gzPr, gzPw := io.Pipe()
+		go func() {
+			gz := gzip.NewWriter(gzPw)
+			_, err := io.Copy(gz, rdbStream)
+			// Close writes the gzip footer. Propagating a copy error instead
+			// keeps a truncated archive from being stored as a valid one.
+			if cerr := gz.Close(); err == nil {
+				err = cerr
+			}
+			gzPw.CloseWithError(err)
+		}()
+		// Unblocks the gzip goroutine if the upload fails mid-stream.
+		defer gzPr.Close()
+		body = gzPr
 	}
 
-	// Upload to S3
-	backupLocation, err := r.uploadToS3(ctx, redisBackup, dataToUpload)
+	backupLocation, backupSize, err := r.uploadToS3(ctx, redisBackup, body)
 	if err != nil {
-		return "", 0, fmt.Errorf("S3 upload failed: %w", err)
+		return "", 0, nil, fmt.Errorf("S3 upload failed: %w", err)
 	}
 
-	return backupLocation, int64(len(dataToUpload)), nil
+	return backupLocation, backupSize, keyCount, nil
 }
 
 // getBackupPod returns a pod to take backup from, preferring replica over master
@@ -632,19 +656,26 @@ func (r *RedisBackupReconciler) waitForBGSave(ctx context.Context, redisSentinel
 	}
 }
 
-func (r *RedisBackupReconciler) getRDBData(ctx context.Context, pod *corev1.Pod) ([]byte, error) {
-	logger := log.FromContext(ctx)
+// rdbStream is the validated RDB byte stream; Close releases the exec pipe.
+type rdbStream struct {
+	io.Reader
+	pr *io.PipeReader
+}
 
-	if r.RESTConfig == nil {
-		return nil, fmt.Errorf("RESTConfig is not set")
+func (s *rdbStream) Close() error { return s.pr.Close() }
+
+// spdyPodStream is the production podStreamFn: it execs the command over SPDY
+// and copies stdout into the writer as it arrives.
+func spdyPodStream(ctx context.Context, cfg *rest.Config, pod *corev1.Pod, container string, command []string, stdout io.Writer) (string, error) {
+	if cfg == nil {
+		return "", fmt.Errorf("RESTConfig is not set")
 	}
 
-	clientset, err := kubernetes.NewForConfig(r.RESTConfig)
+	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create clientset: %w", err)
+		return "", fmt.Errorf("failed to create clientset: %w", err)
 	}
 
-	// Execute cat /data/dump.rdb in the pod
 	req := clientset.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
@@ -652,55 +683,163 @@ func (r *RedisBackupReconciler) getRDBData(ctx context.Context, pod *corev1.Pod)
 		Namespace(pod.Namespace).
 		SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
-			Container: "redis",
-			Command:   []string{"cat", "/data/dump.rdb"},
+			Container: container,
+			Command:   command,
 			Stdout:    true,
 			Stderr:    true,
 		}, scheme.ParameterCodec)
 
-	exec, err := remotecommand.NewSPDYExecutor(r.RESTConfig, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create executor: %w", err)
+		return "", fmt.Errorf("failed to create executor: %w", err)
 	}
 
-	var stdout, stderr bytes.Buffer
+	var stderr bytes.Buffer
 	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
+		Stdout: stdout,
 		Stderr: &stderr,
 	})
+	return stderr.String(), err
+}
 
-	if err != nil {
-		// Check if stderr has useful info
-		if stderr.Len() > 0 {
-			logger.Error(err, "Pod exec failed", "stderr", stderr.String())
+// openRDBStream starts streaming /data/dump.rdb out of the pod and validates
+// the RDB magic before returning the stream, so a missing or corrupt dump is
+// refused without the file ever being held in memory.
+func (r *RedisBackupReconciler) openRDBStream(ctx context.Context, pod *corev1.Pod) (io.ReadCloser, error) {
+	streamFn := r.PodStream
+	if streamFn == nil {
+		streamFn = spdyPodStream
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		stderr, err := streamFn(ctx, r.RESTConfig, pod, "redis", []string{"cat", "/data/dump.rdb"}, pw)
+		if err != nil && strings.TrimSpace(stderr) != "" {
+			err = fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr))
+		}
+		// A nil error closes the pipe with EOF; anything else surfaces on the
+		// reader side, failing the upload mid-stream instead of truncating it.
+		pw.CloseWithError(err)
+	}()
+
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(pr, header); err != nil {
+		pr.Close()
+		if err == io.EOF {
+			return nil, fmt.Errorf("RDB file is empty or not found")
 		}
 		return nil, fmt.Errorf("failed to read RDB file: %w", err)
 	}
-
-	if stdout.Len() == 0 {
-		return nil, fmt.Errorf("RDB file is empty or not found")
-	}
-
-	// Verify it's a valid RDB file (starts with "REDIS")
-	data := stdout.Bytes()
-	if len(data) < 5 || string(data[:5]) != "REDIS" {
+	if string(header) != "REDIS" {
+		pr.Close()
 		return nil, fmt.Errorf("invalid RDB file format")
 	}
-
-	logger.Info("Retrieved RDB data", "size", len(data), "pod", pod.Name)
-	return data, nil
+	return &rdbStream{Reader: io.MultiReader(bytes.NewReader(header), pr), pr: pr}, nil
 }
 
-func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, data []byte) (string, error) {
+// backupUploadPartSize is the buffer one in-flight upload part occupies: the
+// peak memory of a backup no longer scales with the dataset. 16MiB stays well
+// inside the operator's memory limit and puts S3's 10000-part ceiling at
+// ~156GiB per backup. A var only so tests can exercise the multipart path
+// with small payloads.
+var backupUploadPartSize = 16 << 20
+
+// uploadStream uploads body to bucket/key one part at a time. An object that
+// fits one buffer goes through a single PutObject; larger ones use a
+// multipart upload that is aborted on failure, because unaborted parts are
+// invisible in listings and accrue storage charges forever.
+func uploadStream(ctx context.Context, s3Client s3API, bucket, key string, body io.Reader) (int64, error) {
+	buf := make([]byte, backupUploadPartSize)
+	n, err := io.ReadFull(body, buf)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		_, perr := s3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader(buf[:n]),
+		})
+		if perr != nil {
+			return 0, perr
+		}
+		return int64(n), nil
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	create, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return 0, err
+	}
+	abort := func() {
+		_, _ = s3Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(bucket),
+			Key:      aws.String(key),
+			UploadId: create.UploadId,
+		})
+	}
+
+	var completed []s3types.CompletedPart
+	var total int64
+	partNumber := int32(0)
+	for {
+		partNumber++
+		part, perr := s3Client.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:        aws.String(bucket),
+			Key:           aws.String(key),
+			UploadId:      create.UploadId,
+			PartNumber:    aws.Int32(partNumber),
+			Body:          bytes.NewReader(buf[:n]),
+			ContentLength: aws.Int64(int64(n)),
+		})
+		if perr != nil {
+			abort()
+			return 0, perr
+		}
+		completed = append(completed, s3types.CompletedPart{
+			ETag:       part.ETag,
+			PartNumber: aws.Int32(partNumber),
+		})
+		total += int64(n)
+
+		n, err = io.ReadFull(body, buf)
+		if n == 0 {
+			if err == io.EOF {
+				break
+			}
+			abort()
+			return 0, err
+		}
+		if err != nil && err != io.ErrUnexpectedEOF {
+			abort()
+			return 0, err
+		}
+	}
+
+	if _, err := s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(bucket),
+		Key:             aws.String(key),
+		UploadId:        create.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completed},
+	}); err != nil {
+		abort()
+		return 0, err
+	}
+	return total, nil
+}
+
+func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, body io.Reader) (string, int64, error) {
 	// Create S3 client
 	s3Client, err := r.s3ClientFor(ctx, redisBackup)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	prefix, err := backupObjectPrefix(redisBackup)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	timestamp := time.Now().Format("20060102-150405")
@@ -709,19 +848,13 @@ func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *red
 		key += ".gz"
 	}
 
-	// Upload to S3
-	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(redisBackup.Spec.S3.Bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(data),
-	})
-
+	size, err := uploadStream(ctx, s3Client, redisBackup.Spec.S3.Bucket, key, body)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	location := fmt.Sprintf("s3://%s/%s", redisBackup.Spec.S3.Bucket, key)
-	return location, nil
+	return location, size, nil
 }
 
 func (r *RedisBackupReconciler) createS3Client(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup) (*s3.Client, error) {
