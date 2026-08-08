@@ -53,6 +53,17 @@ const redisUserFinalizer = "redis.redguard.io/redisuser-finalizer"
 // replacing it with rate-limited backoff.
 const userRetryInterval = 30 * time.Second
 
+const (
+	// defaultRedisUser is the implicit account the operator itself
+	// authenticates as. A RedisUser may not claim it: rewriting it would
+	// change the cluster password and lock the operator out.
+	defaultRedisUser = "default"
+
+	// userPhaseReady is the phase and the Ready condition type. They share a
+	// spelling because the condition is what the phase reports.
+	userPhaseReady = "Ready"
+)
+
 // RedisUserReconciler reconciles a RedisUser object
 type RedisUserReconciler struct {
 	client.Client
@@ -205,7 +216,7 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Update status
-	r.updateStatus(ctx, redisUser, "Ready", appliedTo, "")
+	r.updateStatus(ctx, redisUser, userPhaseReady, appliedTo, "")
 
 	logger.Info("Successfully reconciled RedisUser", "username", redisUser.Spec.Username)
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
@@ -328,7 +339,7 @@ var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 // Redis usernames are case-sensitive, so only the exact name 'default' is the
 // admin account.
 func validateUsername(username string) error {
-	if username == "default" {
+	if username == defaultRedisUser {
 		return fmt.Errorf("username %q is reserved: it is the Redis admin account whose password is requirepass, and redefining it would reset the cluster password and lock out the operator", username)
 	}
 	if !usernamePattern.MatchString(username) {
@@ -745,7 +756,7 @@ func (r *RedisUserReconciler) setDegraded(ctx context.Context, redisUser *redisv
 	redisUser.Status.ObservedGeneration = redisUser.Generation
 	r.reportACLStatus(redisUser, false)
 	for _, cond := range []metav1.Condition{
-		{Type: "Ready", Status: metav1.ConditionFalse},
+		{Type: userPhaseReady, Status: metav1.ConditionFalse},
 		{Type: "Degraded", Status: metav1.ConditionTrue},
 	} {
 		cond.ObservedGeneration = redisUser.Generation
@@ -766,16 +777,16 @@ func (r *RedisUserReconciler) updateStatus(ctx context.Context, redisUser *redis
 	}
 	// Written here rather than at each call site so no failure path can leave
 	// the gauge at 1 and make a broken user look applied.
-	r.reportACLStatus(redisUser, phase == "Ready")
+	r.reportACLStatus(redisUser, phase == userPhaseReady)
 
 	ready := metav1.Condition{
-		Type:               "Ready",
+		Type:               userPhaseReady,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: redisUser.Generation,
 		Reason:             "Error",
 		Message:            errorMsg,
 	}
-	if phase == "Ready" {
+	if phase == userPhaseReady {
 		ready.Status = metav1.ConditionTrue
 		ready.Reason = "ACLApplied"
 		ready.Message = "ACL successfully applied to Redis cluster"
@@ -786,13 +797,13 @@ func (r *RedisUserReconciler) updateStatus(ctx context.Context, redisUser *redis
 	// must leave the status byte-identical, or the controller's own watch turns
 	// each reconcile into the next one.
 	changed := meta.SetStatusCondition(&redisUser.Status.Conditions, ready)
-	if changed && phase == "Ready" {
+	if changed && phase == userPhaseReady {
 		now := metav1.Now()
 		redisUser.Status.LastPasswordChange = &now
 	}
 
 	// Only a fully applied user proves the partial application is over.
-	if phase == "Ready" {
+	if phase == userPhaseReady {
 		meta.SetStatusCondition(&redisUser.Status.Conditions, metav1.Condition{
 			Type:               "Degraded",
 			Status:             metav1.ConditionFalse,
