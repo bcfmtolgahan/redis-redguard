@@ -479,7 +479,7 @@ func (p *flippingPool) GetMasterAddrFromPool(ctx context.Context, masterName str
 	p.f.flipTo = ""
 	p.f.mu.Unlock()
 	if to != "" {
-		p.f.Factory.SetMaster(to)
+		p.f.SetMaster(to)
 	}
 	return addr, err
 }

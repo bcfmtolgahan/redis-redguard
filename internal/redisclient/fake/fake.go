@@ -21,6 +21,13 @@ var (
 	_ redisclient.Sentinel = (*pool)(nil)
 )
 
+// Roles exactly as Redis spells them in INFO replication, which is what the
+// controllers compare against.
+const (
+	roleMaster  = "master"
+	roleReplica = "slave"
+)
+
 // Factory hands out fake clients backed by shared in-memory state. Safe for
 // concurrent use; every client method appends "<addr>:<method>" to one call
 // log so tests can assert which pods were touched, in what order.
@@ -265,11 +272,11 @@ func (f *Factory) node(addr string) *node {
 // syncRole derives a node's role from the configured master. Caller holds f.mu.
 func (f *Factory) syncRole(addr string, n *node) {
 	if f.masterAddr == "" || addr == f.masterAddr {
-		n.role = "master"
+		n.role = roleMaster
 		n.masterHost, n.masterPort = "", ""
 		return
 	}
-	n.role = "slave"
+	n.role = roleReplica
 	n.masterHost, n.masterPort = splitHostPort(f.masterAddr)
 }
 
@@ -305,7 +312,7 @@ func (c *client) IsMaster(ctx context.Context) (bool, error) {
 	if err := c.f.errorFor(c.addr, "IsMaster"); err != nil {
 		return false, err
 	}
-	return c.f.node(c.addr).role == "master", nil
+	return c.f.node(c.addr).role == roleMaster, nil
 }
 
 func (c *client) GetReplicationInfo(ctx context.Context) (map[string]string, error) {
@@ -317,7 +324,7 @@ func (c *client) GetReplicationInfo(ctx context.Context) (map[string]string, err
 		"role":               n.role,
 		"master_repl_offset": "0",
 	}
-	if n.role == "slave" {
+	if n.role == roleReplica {
 		info["master_host"] = n.masterHost
 		info["master_port"] = n.masterPort
 		info["master_link_status"] = "up"
@@ -399,11 +406,11 @@ func (c *client) SlaveOf(ctx context.Context, masterHost, masterPort string) err
 	c.f.record(c.addr, "SlaveOf")
 	n := c.f.node(c.addr)
 	if strings.EqualFold(masterHost, "no") && strings.EqualFold(masterPort, "one") {
-		n.role = "master"
+		n.role = roleMaster
 		n.masterHost, n.masterPort = "", ""
 		return nil
 	}
-	n.role = "slave"
+	n.role = roleReplica
 	n.masterHost, n.masterPort = masterHost, masterPort
 	return nil
 }
@@ -548,7 +555,7 @@ func (p *pool) GetMasterFromPool(ctx context.Context, masterName string) (*senti
 	host, port := splitHostPort(p.f.masterAddr)
 	slaves := 0
 	for _, n := range p.f.nodes {
-		if n.role == "slave" {
+		if n.role == roleReplica {
 			slaves++
 		}
 	}
@@ -565,7 +572,7 @@ func (p *pool) GetMasterFromPool(ctx context.Context, masterName string) (*senti
 		Name:                  masterName,
 		IP:                    host,
 		Port:                  port,
-		Flags:                 "master",
+		Flags:                 roleMaster,
 		NumSlaves:             strconv.Itoa(slaves),
 		NumOtherSentinels:     strconv.Itoa(others),
 		Quorum:                quorum,

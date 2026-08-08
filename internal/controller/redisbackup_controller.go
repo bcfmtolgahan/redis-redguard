@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -128,7 +127,7 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Handle deletion
-	if !redisBackup.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !redisBackup.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, redisBackup)
 	}
 
@@ -175,7 +174,7 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Perform backup
 	logger.Info("Starting backup", "cluster", redisBackup.Spec.RedisClusterRef)
-	r.updateStatus(ctx, redisBackup, "Running", "", 0, "", nil)
+	r.updateStatus(ctx, redisBackup, phaseRunning, "", 0, "", nil)
 
 	startTime := time.Now()
 	backupLocation, backupSize, err := r.performBackup(ctx, redisBackup)
@@ -188,7 +187,7 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// credentials would then retry every few milliseconds, forking the Redis
 		// process with BGSAVE each time.
 		logger.Error(err, "Backup failed")
-		r.updateStatus(ctx, redisBackup, "Failed", "", 0, "", err)
+		r.updateStatus(ctx, redisBackup, phaseFailed, "", 0, "", err)
 		recordEvent(r.Recorder, redisBackup, corev1.EventTypeWarning, "BackupFailed", err.Error())
 		return ctrl.Result{RequeueAfter: backupRetryInterval}, nil
 	}
@@ -201,7 +200,7 @@ func (r *RedisBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Update status
-	r.updateStatus(ctx, redisBackup, "Completed", backupLocation, backupSize, duration.String(), nil)
+	r.updateStatus(ctx, redisBackup, phaseCompleted, backupLocation, backupSize, duration.String(), nil)
 
 	// Update metrics
 	custmetrics.RedisBackupDuration.WithLabelValues(redisBackup.Namespace, redisBackup.Name).Observe(duration.Seconds())
@@ -244,9 +243,9 @@ func (r *RedisBackupReconciler) validateBackupDestination(redisBackup *redisv1al
 // markDestinationRejected surfaces a destination-policy refusal in status and
 // events under its own reason, distinguishable from a run that failed.
 func (r *RedisBackupReconciler) markDestinationRejected(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, cause error) {
-	redisBackup.Status.Phase = "Failed"
+	redisBackup.Status.Phase = phaseFailed
 	redisBackup.Status.ObservedGeneration = redisBackup.Generation
-	r.reportBackupStatus(redisBackup, "Failed")
+	r.reportBackupStatus(redisBackup, phaseFailed)
 	meta.SetStatusCondition(&redisBackup.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionFalse,
@@ -263,10 +262,10 @@ func (r *RedisBackupReconciler) markDestinationRejected(ctx context.Context, red
 // setDegraded reports a terminal, spec-caused failure: only a spec edit can
 // clear it, and that edit triggers its own reconcile.
 func (r *RedisBackupReconciler) setDegraded(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, reason, message string) {
-	redisBackup.Status.Phase = "Degraded"
+	redisBackup.Status.Phase = phaseDegraded
 	redisBackup.Status.ObservedGeneration = redisBackup.Generation
 	redisBackup.Status.NextBackupTime = nil
-	r.reportBackupStatus(redisBackup, "Degraded")
+	r.reportBackupStatus(redisBackup, phaseDegraded)
 	for _, cond := range []metav1.Condition{
 		{Type: "Ready", Status: metav1.ConditionFalse},
 		{Type: "Degraded", Status: metav1.ConditionTrue},
@@ -385,7 +384,7 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 	}
 
 	// Get RDB file content using pod exec
-	rdbData, err := r.getRDBData(ctx, redisSentinel, backupPod)
+	rdbData, err := r.getRDBData(ctx, backupPod)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to get RDB data: %w", err)
 	}
@@ -398,7 +397,11 @@ func (r *RedisBackupReconciler) performBackup(ctx context.Context, redisBackup *
 		if _, err := gzipWriter.Write(rdbData); err != nil {
 			return "", 0, fmt.Errorf("compression failed: %w", err)
 		}
-		gzipWriter.Close()
+		// Close writes the gzip footer. Uploading buf without it stores an
+		// archive that no reader, including the restore path, can decompress.
+		if err := gzipWriter.Close(); err != nil {
+			return "", 0, fmt.Errorf("compression failed: %w", err)
+		}
 		dataToUpload = buf.Bytes()
 		logger.Info("Compressed backup", "original", len(rdbData), "compressed", len(dataToUpload))
 	} else {
@@ -646,7 +649,7 @@ func (r *RedisBackupReconciler) waitForBGSave(ctx context.Context, redisSentinel
 	}
 }
 
-func (r *RedisBackupReconciler) getRDBData(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) ([]byte, error) {
+func (r *RedisBackupReconciler) getRDBData(ctx context.Context, pod *corev1.Pod) ([]byte, error) {
 	logger := log.FromContext(ctx)
 
 	if r.RESTConfig == nil {
@@ -703,42 +706,6 @@ func (r *RedisBackupReconciler) getRDBData(ctx context.Context, redisSentinel *r
 
 	logger.Info("Retrieved RDB data", "size", len(data), "pod", pod.Name)
 	return data, nil
-}
-
-// getBackupRDBPath returns the path to the RDB file based on persistence info
-func (r *RedisBackupReconciler) getBackupRDBPath(ctx context.Context, redisSentinel *redisv1alpha1.RedisSentinel, pod *corev1.Pod) (string, error) {
-	adminPassword := r.getAdminPassword(ctx, redisSentinel)
-	tlsCfg, err := tlsutil.BuildClientTLSConfig(ctx, r.Client, redisSentinel)
-	if err != nil {
-		return "", fmt.Errorf("resolve client TLS config: %w", err)
-	}
-	addr := fmt.Sprintf("%s:6379", pod.Status.PodIP)
-
-	redisClient := factoryOrDefault(r.RedisFactory).NewClient(addr, adminPassword, tlsCfg)
-	defer redisClient.Close()
-
-	// Get dir and dbfilename from config
-	dirConfig, err := redisClient.ConfigGet(ctx, "dir")
-	if err != nil {
-		return "/data/dump.rdb", nil // default path
-	}
-
-	dbfileConfig, err := redisClient.ConfigGet(ctx, "dbfilename")
-	if err != nil {
-		return "/data/dump.rdb", nil // default path
-	}
-
-	dir := dirConfig["dir"]
-	dbfile := dbfileConfig["dbfilename"]
-
-	if dir == "" {
-		dir = "/data"
-	}
-	if dbfile == "" {
-		dbfile = "dump.rdb"
-	}
-
-	return filepath.Join(dir, dbfile), nil
 }
 
 func (r *RedisBackupReconciler) uploadToS3(ctx context.Context, redisBackup *redisv1alpha1.RedisBackup, data []byte) (string, error) {
@@ -855,12 +822,12 @@ func backupObjectPrefix(redisBackup *redisv1alpha1.RedisBackup) (string, error) 
 // this cluster: a direct child of prefix named backup-<timestamp>.rdb or
 // .rdb.gz. Anything else under the prefix is left alone.
 func isBackupObject(prefix, key string) bool {
-	rest, ok := strings.CutPrefix(key, prefix)
-	if !ok || rest == "" || strings.Contains(rest, "/") {
+	name, ok := strings.CutPrefix(key, prefix)
+	if !ok || name == "" || strings.Contains(name, "/") {
 		return false
 	}
-	return strings.HasPrefix(rest, "backup-") &&
-		(strings.HasSuffix(rest, ".rdb") || strings.HasSuffix(rest, ".rdb.gz"))
+	return strings.HasPrefix(name, "backup-") &&
+		(strings.HasSuffix(name, ".rdb") || strings.HasSuffix(name, ".rdb.gz"))
 }
 
 // cleanupOldBackups prunes this cluster's backups down to the retention count.
@@ -925,11 +892,11 @@ func (r *RedisBackupReconciler) cleanupOldBackups(ctx context.Context, redisBack
 func (r *RedisBackupReconciler) reportBackupStatus(redisBackup *redisv1alpha1.RedisBackup, phase string) {
 	var value float64
 	switch phase {
-	case "Completed":
+	case phaseCompleted:
 		value = 1
-	case "Failed":
+	case phaseFailed:
 		value = 0
-	case "Running":
+	case phaseRunning:
 		value = -1
 	default:
 		// Suspended and any future phase say nothing about the last run, so
@@ -947,7 +914,8 @@ func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *r
 	r.reportBackupStatus(redisBackup, phase)
 
 	now := metav1.Now()
-	if phase == "Completed" {
+	switch phase {
+	case phaseCompleted:
 		redisBackup.Status.LastBackupTime = &now
 		redisBackup.Status.BackupLocation = location
 		redisBackup.Status.BackupSize = size
@@ -975,7 +943,7 @@ func (r *RedisBackupReconciler) updateStatus(ctx context.Context, redisBackup *r
 			Reason:             "BackupCompleted",
 			Message:            "The schedule was accepted and the last run succeeded",
 		})
-	} else if phase == "Failed" {
+	case phaseFailed:
 		errMsg := ""
 		if err != nil {
 			errMsg = err.Error()

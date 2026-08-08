@@ -240,7 +240,7 @@ func (r *RedisSentinelReconciler) validateSpec(rs *redisv1alpha1.RedisSentinel) 
 // setDegraded reports a terminal, spec-caused failure. The next pass that
 // reaches updateStatus flips the condition back to False.
 func (r *RedisSentinelReconciler) setDegraded(ctx context.Context, rs *redisv1alpha1.RedisSentinel, reason, message string) {
-	rs.Status.Phase = "Degraded"
+	rs.Status.Phase = phaseDegraded
 	rs.Status.ObservedGeneration = rs.Generation
 	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 		Type:               "Degraded",
@@ -839,7 +839,7 @@ func (r *RedisSentinelReconciler) runningPodAddresses(ctx context.Context, rs *r
 		return nil, err
 	}
 
-	var addrs []string
+	addrs := make([]string, 0, len(podList.Items))
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !pod.DeletionTimestamp.IsZero() {
@@ -1018,13 +1018,13 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 
 	// Determine phase
 	if redisStatefulSet.Status.ReadyReplicas == 0 {
-		rs.Status.Phase = "Creating"
+		rs.Status.Phase = phaseCreating
 	} else if redisStatefulSet.Status.ReadyReplicas < rs.Spec.RedisConfig.Replicas {
-		rs.Status.Phase = "Scaling"
+		rs.Status.Phase = phaseScaling
 	} else if sentinelStatefulSet.Status.ReadyReplicas < rs.Spec.SentinelConfig.Replicas {
-		rs.Status.Phase = "ConfiguringSentinel"
+		rs.Status.Phase = phaseConfiguringSentinel
 	} else {
-		rs.Status.Phase = "Running"
+		rs.Status.Phase = phaseRunning
 	}
 
 	// Resolved once here; every Redis and Sentinel connection made below and in
@@ -1117,7 +1117,7 @@ func (r *RedisSentinelReconciler) updateStatus(ctx context.Context, rs *redisv1a
 		Type:               "Available",
 		ObservedGeneration: rs.Generation,
 	}
-	if rs.Status.Phase == "Running" {
+	if rs.Status.Phase == phaseRunning {
 		availableCondition.Status = metav1.ConditionTrue
 		availableCondition.Reason = "ReconcileSuccess"
 		availableCondition.Message = "RedisSentinel is available"
@@ -1500,14 +1500,14 @@ func (r *RedisSentinelReconciler) ensureReplicasFollowMaster(ctx context.Context
 			}
 
 			// Check if this is a replica pointing to the correct master
-			role := info["role"]
-			if role == "master" {
+			switch info["role"] {
+			case "master":
 				// This pod thinks it's a master but shouldn't be - reconfigure it
 				logger.Info("Found unexpected master, reconfiguring as replica", "pod", podName)
 				if err := redisClient.SlaveOf(ctx, masterIP, masterPort); err != nil {
 					logger.Error(err, "Failed to reconfigure pod as replica", "pod", podName)
 				}
-			} else if role == "slave" {
+			case "slave":
 				// Check if it's following the correct master
 				currentMasterHost := info["master_host"]
 				currentMasterPort := info["master_port"]
@@ -1649,7 +1649,7 @@ func (r *RedisSentinelReconciler) updateMetrics(ctx context.Context, rs *redisv1
 
 	// Update cluster info metric
 	clusterUp := 0.0
-	if rs.Status.Phase == "Running" {
+	if rs.Status.Phase == phaseRunning {
 		clusterUp = 1.0
 	}
 	custmetrics.RedisClusterInfo.WithLabelValues(namespace, name).Set(clusterUp)
@@ -1726,15 +1726,13 @@ func (r *RedisSentinelReconciler) updateSentinelMetrics(ctx context.Context, rs 
 
 	// Parse sentinel counts
 	if masterInfo.NumOtherSentinels != "" {
-		var count float64
-		fmt.Sscanf(masterInfo.NumOtherSentinels, "%f", &count)
-		custmetrics.SentinelKnownSentinels.WithLabelValues(rs.Namespace, rs.Name).Set(count)
+		custmetrics.SentinelKnownSentinels.WithLabelValues(rs.Namespace, rs.Name).
+			Set(infoFloat(masterInfo.NumOtherSentinels))
 	}
 
 	if masterInfo.NumSlaves != "" {
-		var count float64
-		fmt.Sscanf(masterInfo.NumSlaves, "%f", &count)
-		custmetrics.SentinelKnownReplicas.WithLabelValues(rs.Namespace, rs.Name).Set(count)
+		custmetrics.SentinelKnownReplicas.WithLabelValues(rs.Namespace, rs.Name).
+			Set(infoFloat(masterInfo.NumSlaves))
 	}
 }
 
@@ -1750,53 +1748,27 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 	defer redisClient.Close()
 
 	// --- Memory Metrics ---
-	memInfo, err := redisClient.GetMemoryInfo(ctx)
-	if err == nil {
-		if usedMem, ok := memInfo["used_memory"]; ok {
-			var val float64
-			fmt.Sscanf(usedMem, "%f", &val)
-			custmetrics.RedisUsedMemory.WithLabelValues(namespace, name, podName).Set(val)
-		}
-		if maxMem, ok := memInfo["maxmemory"]; ok {
-			var val float64
-			fmt.Sscanf(maxMem, "%f", &val)
-			custmetrics.RedisMaxMemory.WithLabelValues(namespace, name, podName).Set(val)
-		}
-		if fragRatio, ok := memInfo["mem_fragmentation_ratio"]; ok {
-			var val float64
-			fmt.Sscanf(fragRatio, "%f", &val)
-			custmetrics.RedisMemoryFragmentationRatio.WithLabelValues(namespace, name, podName).Set(val)
-		}
+	if memInfo, err := redisClient.GetMemoryInfo(ctx); err == nil {
+		setInfoGauge(custmetrics.RedisUsedMemory, memInfo, "used_memory", namespace, name, podName)
+		setInfoGauge(custmetrics.RedisMaxMemory, memInfo, "maxmemory", namespace, name, podName)
+		setInfoGauge(custmetrics.RedisMemoryFragmentationRatio, memInfo, "mem_fragmentation_ratio",
+			namespace, name, podName)
 	}
 
 	// --- Client Metrics ---
-	clientInfo, err := redisClient.GetClientInfo(ctx)
-	if err == nil {
-		if connClients, ok := clientInfo["connected_clients"]; ok {
-			var val float64
-			fmt.Sscanf(connClients, "%f", &val)
-			custmetrics.RedisConnectedClients.WithLabelValues(namespace, name, podName).Set(val)
-		}
-		if blockedClients, ok := clientInfo["blocked_clients"]; ok {
-			var val float64
-			fmt.Sscanf(blockedClients, "%f", &val)
-			custmetrics.RedisBlockedClients.WithLabelValues(namespace, name, podName).Set(val)
-		}
+	if clientInfo, err := redisClient.GetClientInfo(ctx); err == nil {
+		setInfoGauge(custmetrics.RedisConnectedClients, clientInfo, "connected_clients",
+			namespace, name, podName)
+		setInfoGauge(custmetrics.RedisBlockedClients, clientInfo, "blocked_clients",
+			namespace, name, podName)
 	}
 
 	// --- Persistence Metrics ---
-	persistInfo, err := redisClient.GetPersistenceInfo(ctx)
-	if err == nil {
-		if lastSave, ok := persistInfo["rdb_last_save_time"]; ok {
-			var val float64
-			fmt.Sscanf(lastSave, "%f", &val)
-			custmetrics.RedisRDBLastSaveTime.WithLabelValues(namespace, name, podName).Set(val)
-		}
-		if changes, ok := persistInfo["rdb_changes_since_last_save"]; ok {
-			var val float64
-			fmt.Sscanf(changes, "%f", &val)
-			custmetrics.RedisRDBChangesSinceLastSave.WithLabelValues(namespace, name, podName).Set(val)
-		}
+	if persistInfo, err := redisClient.GetPersistenceInfo(ctx); err == nil {
+		setInfoGauge(custmetrics.RedisRDBLastSaveTime, persistInfo, "rdb_last_save_time",
+			namespace, name, podName)
+		setInfoGauge(custmetrics.RedisRDBChangesSinceLastSave, persistInfo, "rdb_changes_since_last_save",
+			namespace, name, podName)
 		if aofEnabled, ok := persistInfo["aof_enabled"]; ok {
 			val := 0.0
 			if aofEnabled == "1" {
@@ -1804,108 +1776,87 @@ func (r *RedisSentinelReconciler) collectPodMetrics(ctx context.Context, rs *red
 			}
 			custmetrics.RedisAOFEnabled.WithLabelValues(namespace, name, podName).Set(val)
 		}
-		if aofSize, ok := persistInfo["aof_current_size"]; ok {
-			var val float64
-			fmt.Sscanf(aofSize, "%f", &val)
-			custmetrics.RedisAOFCurrentSize.WithLabelValues(namespace, name, podName).Set(val)
-		}
+		setInfoGauge(custmetrics.RedisAOFCurrentSize, persistInfo, "aof_current_size",
+			namespace, name, podName)
 	}
 
-	// --- Replication Metrics ---
-	replInfo, err := redisClient.GetReplicationInfo(ctx)
-	if err == nil {
-		role := replInfo["role"]
-
-		// Replication offset
-		if role == "master" {
-			if offset, ok := replInfo["master_repl_offset"]; ok {
-				var val float64
-				fmt.Sscanf(offset, "%f", &val)
-				custmetrics.RedisReplicationOffset.WithLabelValues(namespace, name, podName, "master").Set(val)
-			}
-			// Read off the master rather than derived from ready pod count:
-			// a pod can be ready and still not be replicating.
-			if replicas, ok := replInfo["connected_slaves"]; ok {
-				var val float64
-				fmt.Sscanf(replicas, "%f", &val)
-				custmetrics.RedisConnectedReplicas.WithLabelValues(namespace, name).Set(val)
-			}
-		} else {
-			// Slave/replica
-			if offset, ok := replInfo["slave_repl_offset"]; ok {
-				var val float64
-				fmt.Sscanf(offset, "%f", &val)
-				custmetrics.RedisReplicationOffset.WithLabelValues(namespace, name, podName, "replica").Set(val)
-			}
-
-			// Master link status
-			linkStatus := 0.0
-			if replInfo["master_link_status"] == "up" {
-				linkStatus = 1.0
-			}
-			custmetrics.RedisMasterLinkStatus.WithLabelValues(namespace, name, podName).Set(linkStatus)
-
-			// Replication lag (bytes and seconds)
-			lagBytes, err := redisClient.GetReplicationLagByOffset(ctx)
-			if err == nil {
-				custmetrics.RedisReplicationLagBytes.WithLabelValues(namespace, name, podName).Set(float64(lagBytes))
-			}
-
-			lag, err := redisClient.GetReplicationLag(ctx)
-			if err == nil {
-				custmetrics.RedisReplicationLag.WithLabelValues(namespace, name, podName).Set(float64(lag))
-			} else {
-				custmetrics.RedisReplicationLag.WithLabelValues(namespace, name, podName).Set(-1)
-			}
-		}
-	}
+	r.collectReplicationMetrics(ctx, redisClient, namespace, name, podName)
 
 	// --- Stats Metrics ---
 	// INFO reports these as absolute values that restart at zero with the
 	// node, so each one is advanced by its increase since the last pass.
-	statsInfo, err := redisClient.GetStatsInfo(ctx)
-	if err == nil {
-		if totalCmds, ok := statsInfo["total_commands_processed"]; ok {
-			var val float64
-			fmt.Sscanf(totalCmds, "%f", &val)
-			custmetrics.AddCounterDelta(custmetrics.RedisTotalCommandsProcessed, val, namespace, name, podName)
-		}
-		if hits, ok := statsInfo["keyspace_hits"]; ok {
-			var val float64
-			fmt.Sscanf(hits, "%f", &val)
-			custmetrics.AddCounterDelta(custmetrics.RedisKeyspaceHits, val, namespace, name, podName)
-		}
-		if misses, ok := statsInfo["keyspace_misses"]; ok {
-			var val float64
-			fmt.Sscanf(misses, "%f", &val)
-			custmetrics.AddCounterDelta(custmetrics.RedisKeyspaceMisses, val, namespace, name, podName)
-		}
-		if rejectedConns, ok := statsInfo["rejected_connections"]; ok {
-			var val float64
-			fmt.Sscanf(rejectedConns, "%f", &val)
-			custmetrics.AddCounterDelta(custmetrics.RedisRejectedConnections, val, namespace, name, podName)
-		}
+	if statsInfo, err := redisClient.GetStatsInfo(ctx); err == nil {
+		addInfoCounterDelta(custmetrics.RedisTotalCommandsProcessed, statsInfo, "total_commands_processed",
+			namespace, name, podName)
+		addInfoCounterDelta(custmetrics.RedisKeyspaceHits, statsInfo, "keyspace_hits",
+			namespace, name, podName)
+		addInfoCounterDelta(custmetrics.RedisKeyspaceMisses, statsInfo, "keyspace_misses",
+			namespace, name, podName)
+		addInfoCounterDelta(custmetrics.RedisRejectedConnections, statsInfo, "rejected_connections",
+			namespace, name, podName)
 	}
 
 	// --- Keyspace Metrics ---
-	keyspaceInfo, err := redisClient.GetKeyspaceInfo(ctx)
-	if err == nil {
+	if keyspaceInfo, err := redisClient.GetKeyspaceInfo(ctx); err == nil {
 		for db, info := range keyspaceInfo {
-			if strings.HasPrefix(db, "db") {
-				// Parse "keys=123,expires=45,avg_ttl=6789"
-				parts := strings.Split(info, ",")
-				for _, part := range parts {
-					if strings.HasPrefix(part, "keys=") {
-						var keys float64
-						fmt.Sscanf(part, "keys=%f", &keys)
-						custmetrics.RedisDBKeys.WithLabelValues(namespace, name, podName, db).Set(keys)
-					}
+			if !strings.HasPrefix(db, "db") {
+				continue
+			}
+			// Parse "keys=123,expires=45,avg_ttl=6789"
+			for _, part := range strings.Split(info, ",") {
+				if !strings.HasPrefix(part, "keys=") {
+					continue
 				}
+				var keys float64
+				_, _ = fmt.Sscanf(part, "keys=%f", &keys)
+				custmetrics.RedisDBKeys.WithLabelValues(namespace, name, podName, db).Set(keys)
 			}
 		}
 	}
 
 	logger.V(2).Info("Collected metrics from pod", "pod", podName)
+}
+
+// collectReplicationMetrics publishes what one pod reports about replication.
+// A master and a replica answer different questions, so the two halves share
+// only the offset gauge and are labelled apart on it.
+func (r *RedisSentinelReconciler) collectReplicationMetrics(ctx context.Context, redisClient redisclient.Client,
+	namespace, name, podName string) {
+	replInfo, err := redisClient.GetReplicationInfo(ctx)
+	if err != nil {
+		return
+	}
+
+	if replInfo["role"] == "master" {
+		setInfoGauge(custmetrics.RedisReplicationOffset, replInfo, "master_repl_offset",
+			namespace, name, podName, "master")
+		// Read off the master rather than derived from ready pod count:
+		// a pod can be ready and still not be replicating.
+		setInfoGauge(custmetrics.RedisConnectedReplicas, replInfo, "connected_slaves", namespace, name)
+		return
+	}
+
+	setInfoGauge(custmetrics.RedisReplicationOffset, replInfo, "slave_repl_offset",
+		namespace, name, podName, "replica")
+
+	linkStatus := 0.0
+	if replInfo["master_link_status"] == "up" {
+		linkStatus = 1.0
+	}
+	custmetrics.RedisMasterLinkStatus.WithLabelValues(namespace, name, podName).Set(linkStatus)
+
+	if lagBytes, err := redisClient.GetReplicationLagByOffset(ctx); err == nil {
+		custmetrics.RedisReplicationLagBytes.WithLabelValues(namespace, name, podName).Set(float64(lagBytes))
+	}
+
+	// -1 marks a replica whose lag could not be read, which is not the same
+	// answer as a replica that is caught up.
+	lag, err := redisClient.GetReplicationLag(ctx)
+	if err != nil {
+		custmetrics.RedisReplicationLag.WithLabelValues(namespace, name, podName).Set(-1)
+		return
+	}
+	custmetrics.RedisReplicationLag.WithLabelValues(namespace, name, podName).Set(float64(lag))
 }
 
 // sentinelsForReferencedSecret maps a Secret back to the RedisSentinels that
@@ -1922,7 +1873,7 @@ func (r *RedisSentinelReconciler) sentinelsForReferencedSecret(ctx context.Conte
 		return nil
 	}
 
-	var requests []reconcile.Request
+	requests := make([]reconcile.Request, 0, len(list.Items))
 	for i := range list.Items {
 		rs := &list.Items[i]
 		if !referencesSecret(rs, obj.GetName()) {

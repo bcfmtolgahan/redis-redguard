@@ -79,7 +79,7 @@ func (r *RedisUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Handle deletion
-	if !redisUser.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !redisUser.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, redisUser)
 	}
 
@@ -575,7 +575,7 @@ func (r *RedisUserReconciler) redisUsersForPod(ctx context.Context, obj client.O
 		return nil
 	}
 
-	var requests []reconcile.Request
+	requests := make([]reconcile.Request, 0, len(users.Items))
 	for _, user := range users.Items {
 		if user.Spec.RedisClusterRef != cluster {
 			continue
@@ -605,7 +605,7 @@ func (r *RedisUserReconciler) reportACLStatus(redisUser *redisv1alpha1.RedisUser
 // setDegraded reports a partially applied user: the next pass that reaches
 // Ready flips the condition back to False.
 func (r *RedisUserReconciler) setDegraded(ctx context.Context, redisUser *redisv1alpha1.RedisUser, reason, message string) {
-	redisUser.Status.Phase = "Degraded"
+	redisUser.Status.Phase = phaseDegraded
 	redisUser.Status.ObservedGeneration = redisUser.Generation
 	r.reportACLStatus(redisUser, false)
 	for _, cond := range []metav1.Condition{

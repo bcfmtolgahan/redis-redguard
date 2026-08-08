@@ -152,19 +152,19 @@ func TestNetworkPolicies_EgressReachesPeerComponents(t *testing.T) {
 
 	// Redis must reach other Redis pods (replication) and the Sentinels.
 	redis := BuildRedisNetworkPolicy(rs)
-	if !hasEgressPort(redis, corev1.ProtocolTCP, 6379) {
+	if !hasEgressPort(redis, 6379) {
 		t.Error("redis netpol has no egress to TCP/6379; replication would be blocked")
 	}
-	if !hasEgressPort(redis, corev1.ProtocolTCP, 26379) {
+	if !hasEgressPort(redis, 26379) {
 		t.Error("redis netpol has no egress to TCP/26379; init.sh could not query Sentinel")
 	}
 
 	// Sentinel must reach the Redis instances it monitors and its peers.
 	sentinel := BuildSentinelNetworkPolicy(rs)
-	if !hasEgressPort(sentinel, corev1.ProtocolTCP, 6379) {
+	if !hasEgressPort(sentinel, 6379) {
 		t.Error("sentinel netpol has no egress to TCP/6379; monitoring would be blocked")
 	}
-	if !hasEgressPort(sentinel, corev1.ProtocolTCP, 26379) {
+	if !hasEgressPort(sentinel, 26379) {
 		t.Error("sentinel netpol has no egress to TCP/26379; sentinel quorum would be blocked")
 	}
 }
@@ -333,9 +333,9 @@ func allowsPort(ports []networkingv1.NetworkPolicyPort, proto corev1.Protocol, p
 	return false
 }
 
-func hasEgressPort(np *networkingv1.NetworkPolicy, proto corev1.Protocol, port int32) bool {
+func hasEgressPort(np *networkingv1.NetworkPolicy, port int32) bool {
 	for _, rule := range np.Spec.Egress {
-		if allowsPort(rule.Ports, proto, port) {
+		if allowsPort(rule.Ports, corev1.ProtocolTCP, port) {
 			return true
 		}
 	}

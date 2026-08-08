@@ -255,7 +255,7 @@ func (p *SentinelClientPool) ResetMasterAll(ctx context.Context, masterName stri
 // operation and sending it to every member would only start it again on a
 // cluster that is already mid-promotion.
 func (p *SentinelClientPool) FailoverFromPool(ctx context.Context, masterName string) error {
-	var errs []error
+	errs := make([]error, 0, len(p.addresses))
 	for _, addr := range p.addresses {
 		client := p.newClient(addr)
 		err := client.Failover(ctx, masterName)

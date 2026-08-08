@@ -354,7 +354,7 @@ func requireDockerImage(t *testing.T, image string) {
 	}
 }
 
-func dockerRun(t *testing.T, timeout time.Duration, args ...string) string {
+func dockerRun(t *testing.T, timeout time.Duration, args ...string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -362,7 +362,6 @@ func dockerRun(t *testing.T, timeout time.Duration, args ...string) string {
 	if err != nil {
 		t.Fatalf("docker %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
-	return string(out)
 }
 
 func startRedis(t *testing.T, network, name string, serverArgs ...string) {

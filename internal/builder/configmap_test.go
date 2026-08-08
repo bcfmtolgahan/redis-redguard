@@ -44,8 +44,9 @@ func testSentinel() *redisv1alpha1.RedisSentinel {
 
 // configLines splits a rendered config file into non-empty, non-comment lines.
 func configLines(conf string) []string {
-	var out []string
-	for _, l := range strings.Split(conf, "\n") {
+	lines := strings.Split(conf, "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
 		l = strings.TrimSpace(l)
 		if l == "" || strings.HasPrefix(l, "#") {
 			continue

@@ -28,6 +28,13 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// The two binaries whose invocations this file classifies and pins. They are
+// matched on the basename, so an absolute path resolves to one of these.
+const (
+	binKubectl = "kubectl"
+	binHelm    = "helm"
+)
+
 // Cluster is the kind cluster one e2e run created together with the private
 // kubeconfig that is the only path this run takes to reach it. Every value in
 // here is per-run: two suites executing at once hold different ones and cannot
@@ -50,7 +57,7 @@ func (c Cluster) kubectlBin() string {
 	if c.Kubectl != "" {
 		return c.Kubectl
 	}
-	return "kubectl"
+	return binKubectl
 }
 
 // NewKindCluster copies a kind cluster's credentials into a directory of this
@@ -214,7 +221,7 @@ func (c Cluster) Command(name string, args ...string) *exec.Cmd {
 	}
 
 	pinned := []string{"--kubeconfig=" + c.Kubeconfig}
-	if binaryName(name) == "helm" {
+	if binaryName(name) == binHelm {
 		pinned = append(pinned, "--kube-context="+c.Context())
 	} else {
 		pinned = append(pinned, "--context="+c.Context())
@@ -244,9 +251,9 @@ var offlineHelmVerbs = map[string]bool{
 // server and therefore has to be pinned to this run's cluster.
 func IsClusterCommand(name string, args []string) bool {
 	switch binaryName(name) {
-	case "kubectl":
+	case binKubectl:
 		return true
-	case "helm":
+	case binHelm:
 		// --validate sends the rendered manifests to the API server, which
 		// turns an otherwise offline render into a cluster command.
 		for _, arg := range args {
@@ -265,14 +272,14 @@ func IsClusterCommand(name string, args []string) bool {
 // this run creates, and the identity check it would otherwise trigger runs on
 // every poll of a cluster that is still converging.
 var readOnlyVerbs = map[string]map[string]bool{
-	"kubectl": {
+	binKubectl: {
 		"get": true, "describe": true, "logs": true, "wait": true,
 		"exec": true, "config": true, "version": true, "explain": true,
 		"api-resources": true, "api-versions": true, "cluster-info": true,
 		"top": true, "events": true, "auth": true, "diff": true,
 		"port-forward": true, "proxy": true, "cp": true,
 	},
-	"helm": {
+	binHelm: {
 		"list": true, "status": true, "get": true, "history": true,
 		"template": true, "lint": true, "show": true, "version": true,
 		"env": true, "search": true, "repo": true,

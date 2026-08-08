@@ -87,7 +87,7 @@ func TestParseReplicasReply(t *testing.T) {
 	}}
 
 	for name, reply := range map[string]any{
-		"RESP2": []any{[]any(fields)},
+		"RESP2": []any{fields},
 		"RESP3": []any{asMap},
 	} {
 		t.Run(name, func(t *testing.T) {
