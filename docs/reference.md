@@ -294,11 +294,14 @@ cases.
 Objects are written to:
 
 ```
-<prefix>/<namespace>/<cluster>/backup-<YYYYMMDD-HHMMSS>.rdb[.gz]
+<prefix>/<namespace>/<cluster>/<backupName>/backup-<YYYYMMDD-HHMMSS>.rdb[.gz]
 ```
 
-The namespace and cluster segments are always present, so two clusters can never
-share a prefix. Retention only ever deletes objects directly under that exact
+The namespace, cluster and `RedisBackup` name segments are always present, so no
+two `RedisBackup` objects share a prefix. That last segment is what lets a daily
+and a weekly backup of the same cluster coexist: retention prunes within one
+prefix, so without it the shorter policy would delete the other's objects.
+Retention only ever deletes objects directly under that exact
 prefix whose name matches `backup-*.rdb` or `backup-*.rdb.gz`. Anything else in
 the bucket is left alone.
 
