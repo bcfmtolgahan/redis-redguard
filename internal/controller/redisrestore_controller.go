@@ -30,6 +30,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -755,7 +756,6 @@ func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redi
 		restore.Status.RestoredDataSize = dataSize
 	}
 
-	now := metav1.Now()
 	conditionStatus := metav1.ConditionFalse
 	reason := string(phase)
 	if phase == redisv1alpha1.RestorePhaseCompleted {
@@ -763,15 +763,15 @@ func (r *RedisRestoreReconciler) updateStatus(ctx context.Context, restore *redi
 		reason = "RestoreCompleted"
 	}
 
-	restore.Status.Conditions = []metav1.Condition{
-		{
-			Type:               "Ready",
-			Status:             conditionStatus,
-			LastTransitionTime: now,
-			Reason:             reason,
-			Message:            message,
-		},
-	}
+	// A phase is re-asserted on every requeue while a download or a
+	// resynchronisation runs; only a real phase change is a new transition.
+	meta.SetStatusCondition(&restore.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             conditionStatus,
+		ObservedGeneration: restore.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
 
 	if err := r.Status().Update(ctx, restore); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to update RedisRestore status")

@@ -105,8 +105,11 @@ spec:
                 type: boolean
               passwordSecretRef:
                 description: |-
-                  PasswordSecretRef references a Secret containing the password
-                  Secret must have a "password" key
+                  PasswordSecretRef names a Secret in this RedisUser's own namespace holding
+                  this user's password under the key "password". The name is resolved
+                  verbatim, so it must be a DNS-1123 subdomain.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
               redisClusterRef:
                 description: RedisClusterRef references the RedisSentinel instance
@@ -203,6 +206,13 @@ spec:
                   update
                 format: date-time
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation this status was computed from.
+                  A status whose observedGeneration trails metadata.generation describes the
+                  previous spec, not the one in the object.
+                format: int64
+                type: integer
               phase:
                 description: Phase represents the current phase of the RedisUser
                 type: string

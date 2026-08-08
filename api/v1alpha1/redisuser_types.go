@@ -73,9 +73,12 @@ type RedisUserSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self != 'default'",message="username 'default' is reserved for the Redis admin account"
 	Username string `json:"username"`
 
-	// PasswordSecretRef references a Secret containing the password
-	// Secret must have a "password" key
+	// PasswordSecretRef names a Secret in this RedisUser's own namespace holding
+	// this user's password under the key "password". The name is resolved
+	// verbatim, so it must be a DNS-1123 subdomain.
 	// +required
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	PasswordSecretRef string `json:"passwordSecretRef"`
 
 	// ACLRules define the permissions for this user. Nothing is granted
@@ -96,6 +99,12 @@ type RedisUserStatus struct {
 	// Phase represents the current phase of the RedisUser
 	// +optional
 	Phase string `json:"phase,omitempty"`
+
+	// ObservedGeneration is the spec generation this status was computed from.
+	// A status whose observedGeneration trails metadata.generation describes the
+	// previous spec, not the one in the object.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// AppliedTo tracks which Redis instances have this user configured
 	// +optional

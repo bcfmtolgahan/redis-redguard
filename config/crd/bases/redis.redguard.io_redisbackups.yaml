@@ -76,8 +76,12 @@ spec:
                     type: string
                   credentialsSecretRef:
                     description: |-
-                      CredentialsSecretRef references a Secret containing AWS credentials
-                      Secret must have "accessKeyId" and "secretAccessKey" keys
+                      CredentialsSecretRef names a Secret in the referring CR's own namespace
+                      holding "accessKeyId" and "secretAccessKey". The name is resolved
+                      verbatim, so it must be a DNS-1123 subdomain.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   endpoint:
                     description: Endpoint is the S3-compatible endpoint (for MinIO,
@@ -103,10 +107,23 @@ spec:
                 required:
                 - bucket
                 type: object
+                x-kubernetes-validations:
+                - message: 'exactly one of s3.credentialsSecretRef or s3.useIAMRole
+                    must be set: with neither, the AWS SDK signs the request with
+                    whatever ambient identity the operator pod carries and never passes
+                    the destination allowlist; with both, the Secret wins and useIAMRole
+                    says nothing about which identity signed'
+                  rule: has(self.credentialsSecretRef) != (has(self.useIAMRole) &&
+                    self.useIAMRole)
               schedule:
                 description: |-
-                  Schedule defines cron expression for automated backups
-                  Leave empty for one-time backup
+                  Schedule is a five-field cron expression (minute hour day-of-month month
+                  day-of-week), optionally prefixed with TZ=/CRON_TZ=. Descriptors such as
+                  @daily are not accepted. Leave empty for a one-time backup. The pattern
+                  only fixes the shape; ranges are checked by the controller, which reports
+                  a parse failure as Degraded.
+                maxLength: 256
+                pattern: ^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,-]+(\s+[0-9A-Za-z*/,-]+){4}$
                 type: string
               suspend:
                 description: Suspend pauses scheduled backups
@@ -208,6 +225,13 @@ spec:
                 description: NextBackupTime is the scheduled time for the next backup
                 format: date-time
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation this status was computed from.
+                  A status whose observedGeneration trails metadata.generation describes the
+                  previous spec, not the one in the object.
+                format: int64
+                type: integer
               phase:
                 description: Phase represents the current phase (Pending, Running,
                   Completed, Failed)

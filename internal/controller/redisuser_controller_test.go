@@ -113,13 +113,20 @@ var _ = Describe("RedisUser Controller", func() {
 			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
-			Expect(err).To(MatchError(ContainSubstring("no running Redis pods")))
-			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+
+			By("keeping the retry interval instead of falling back to rate-limited backoff")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(userRetryInterval))
 
 			By("recording the failure in the status")
 			user := &redisv1alpha1.RedisUser{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, user)).To(Succeed())
 			Expect(user.Status.Phase).To(Equal("Error"))
+			Expect(user.Status.Conditions).To(ContainElement(SatisfyAll(
+				HaveField("Type", "Ready"),
+				HaveField("Status", metav1.ConditionFalse),
+				HaveField("Message", ContainSubstring("No running Redis pods")),
+			)))
 		})
 	})
 })

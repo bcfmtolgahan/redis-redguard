@@ -986,8 +986,11 @@ spec:
                     properties:
                       secretName:
                         description: |-
-                          SecretName is the name of the secret containing Redis password
-                          Key must be "password"
+                          SecretName names a Secret in this RedisSentinel's own namespace holding
+                          the Redis admin password under the key "password". The name is resolved
+                          verbatim, so it must be a DNS-1123 subdomain.
+                        maxLength: 253
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                         type: string
                     type: object
                   customConfig:
@@ -1016,7 +1019,10 @@ spec:
                     type: string
                   replicas:
                     default: 3
-                    description: Replicas is the number of Redis replicas
+                    description: |-
+                      Replicas is the number of Redis instances, master included. One is legal
+                      and useful for development, but leaves Sentinel with nothing to promote;
+                      the operator then reports HighlyAvailable=False on the cluster.
                     format: int32
                     minimum: 1
                     type: integer
@@ -2259,14 +2265,20 @@ spec:
                     type: object
                   downAfterMilliseconds:
                     default: 5000
-                    description: DownAfterMilliseconds is the time in ms before marking
-                      instance as down
+                    description: |-
+                      DownAfterMilliseconds is the time in ms before marking instance as down.
+                      Written verbatim into sentinel.conf, where zero means every instance is
+                      considered down immediately and permanently.
                     format: int32
+                    minimum: 1
                     type: integer
                   failoverTimeout:
                     default: 10000
-                    description: FailoverTimeout is the failover timeout in milliseconds
+                    description: |-
+                      FailoverTimeout is the failover timeout in milliseconds. Zero aborts every
+                      failover the moment it starts, leaving the cluster without a master.
                     format: int32
+                    minimum: 1
                     type: integer
                   nodeSelector:
                     additionalProperties:
@@ -2276,9 +2288,11 @@ spec:
                     type: object
                   parallelSyncs:
                     default: 1
-                    description: ParallelSyncs is the number of replicas that can
-                      be reconfigured in parallel
+                    description: |-
+                      ParallelSyncs is the number of replicas that can be reconfigured in
+                      parallel. Zero resynchronises no replica after a promotion.
                     format: int32
+                    minimum: 1
                     type: integer
                   priorityClassName:
                     description: |-
@@ -2594,14 +2608,21 @@ spec:
                 properties:
                   caSecretRef:
                     description: |-
-                      CASecretRef references a Secret containing CA certificate
-                      Secret must have "ca.crt" key
-                      When unset, servers are verified against the system trust store
+                      CASecretRef names a Secret in this RedisSentinel's own namespace holding
+                      the CA certificate under "ca.crt". When unset, servers are verified
+                      against the system trust store. The name is resolved verbatim, so it must
+                      be a DNS-1123 subdomain.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   certificateSecretRef:
                     description: |-
-                      CertificateSecretRef references a Secret containing TLS certificates
-                      Secret must have "tls.crt" and "tls.key" keys
+                      CertificateSecretRef names a Secret in this RedisSentinel's own namespace
+                      holding the server certificate under "tls.crt" and its private key under
+                      "tls.key". The name is resolved verbatim, so it must be a DNS-1123
+                      subdomain.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   enabled:
                     description: Enabled indicates if TLS is enabled
@@ -2692,6 +2713,13 @@ spec:
               masterNode:
                 description: MasterNode is the current Redis master pod name
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation this status was computed from.
+                  A status whose observedGeneration trails metadata.generation describes the
+                  previous spec, not the one in the object.
+                format: int64
+                type: integer
               phase:
                 description: Phase represents the current phase of the RedisSentinel
                 type: string

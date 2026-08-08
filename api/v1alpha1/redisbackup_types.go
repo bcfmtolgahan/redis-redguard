@@ -21,6 +21,7 @@ import (
 )
 
 // S3Config defines S3 storage backend configuration
+// +kubebuilder:validation:XValidation:rule="has(self.credentialsSecretRef) != (has(self.useIAMRole) && self.useIAMRole)",message="exactly one of s3.credentialsSecretRef or s3.useIAMRole must be set: with neither, the AWS SDK signs the request with whatever ambient identity the operator pod carries and never passes the destination allowlist; with both, the Secret wins and useIAMRole says nothing about which identity signed"
 type S3Config struct {
 	// Bucket is the S3 bucket name
 	// +required
@@ -40,9 +41,13 @@ type S3Config struct {
 	// +optional
 	Prefix string `json:"prefix,omitempty"`
 
-	// CredentialsSecretRef references a Secret containing AWS credentials
-	// Secret must have "accessKeyId" and "secretAccessKey" keys
+	// CredentialsSecretRef names a Secret in the referring CR's own namespace
+	// holding "accessKeyId" and "secretAccessKey". The name is resolved
+	// verbatim, so it must be a DNS-1123 subdomain.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	CredentialsSecretRef string `json:"credentialsSecretRef,omitempty"`
 
 	// UseIAMRole indicates whether to use IAM role instead of credentials.
@@ -60,9 +65,14 @@ type RedisBackupSpec struct {
 	// +required
 	RedisClusterRef string `json:"redisClusterRef"`
 
-	// Schedule defines cron expression for automated backups
-	// Leave empty for one-time backup
+	// Schedule is a five-field cron expression (minute hour day-of-month month
+	// day-of-week), optionally prefixed with TZ=/CRON_TZ=. Descriptors such as
+	// @daily are not accepted. Leave empty for a one-time backup. The pattern
+	// only fixes the shape; ranges are checked by the controller, which reports
+	// a parse failure as Degraded.
 	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,-]+(\s+[0-9A-Za-z*/,-]+){4}$`
 	Schedule string `json:"schedule,omitempty"`
 
 	// S3 defines S3 storage configuration
@@ -89,6 +99,12 @@ type RedisBackupStatus struct {
 	// Phase represents the current phase (Pending, Running, Completed, Failed)
 	// +optional
 	Phase string `json:"phase,omitempty"`
+
+	// ObservedGeneration is the spec generation this status was computed from.
+	// A status whose observedGeneration trails metadata.generation describes the
+	// previous spec, not the one in the object.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// LastBackupTime is the timestamp of the last successful backup
 	// +optional

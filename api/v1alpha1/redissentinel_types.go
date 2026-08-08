@@ -61,7 +61,9 @@ type RedisConfig struct {
 	// Placement controls where the Redis pods are scheduled
 	Placement `json:",inline"`
 
-	// Replicas is the number of Redis replicas
+	// Replicas is the number of Redis instances, master included. One is legal
+	// and useful for development, but leaves Sentinel with nothing to promote;
+	// the operator then reports HighlyAvailable=False on the cluster.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
 	Replicas int32 `json:"replicas,omitempty"`
@@ -106,15 +108,22 @@ type SentinelConfig struct {
 	// +kubebuilder:default=2
 	Quorum int32 `json:"quorum,omitempty"`
 
-	// DownAfterMilliseconds is the time in ms before marking instance as down
+	// DownAfterMilliseconds is the time in ms before marking instance as down.
+	// Written verbatim into sentinel.conf, where zero means every instance is
+	// considered down immediately and permanently.
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=5000
 	DownAfterMilliseconds int32 `json:"downAfterMilliseconds,omitempty"`
 
-	// FailoverTimeout is the failover timeout in milliseconds
+	// FailoverTimeout is the failover timeout in milliseconds. Zero aborts every
+	// failover the moment it starts, leaving the cluster without a master.
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=10000
 	FailoverTimeout int32 `json:"failoverTimeout,omitempty"`
 
-	// ParallelSyncs is the number of replicas that can be reconfigured in parallel
+	// ParallelSyncs is the number of replicas that can be reconfigured in
+	// parallel. Zero resynchronises no replica after a promotion.
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	ParallelSyncs int32 `json:"parallelSyncs,omitempty"`
 
@@ -144,9 +153,12 @@ type StorageSpec struct {
 
 // AuthConfig defines authentication configuration
 type AuthConfig struct {
-	// SecretName is the name of the secret containing Redis password
-	// Key must be "password"
+	// SecretName names a Secret in this RedisSentinel's own namespace holding
+	// the Redis admin password under the key "password". The name is resolved
+	// verbatim, so it must be a DNS-1123 subdomain.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	SecretName string `json:"secretName,omitempty"`
 }
 
@@ -157,15 +169,22 @@ type TLSConfig struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// CertificateSecretRef references a Secret containing TLS certificates
-	// Secret must have "tls.crt" and "tls.key" keys
+	// CertificateSecretRef names a Secret in this RedisSentinel's own namespace
+	// holding the server certificate under "tls.crt" and its private key under
+	// "tls.key". The name is resolved verbatim, so it must be a DNS-1123
+	// subdomain.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	CertificateSecretRef string `json:"certificateSecretRef,omitempty"`
 
-	// CASecretRef references a Secret containing CA certificate
-	// Secret must have "ca.crt" key
-	// When unset, servers are verified against the system trust store
+	// CASecretRef names a Secret in this RedisSentinel's own namespace holding
+	// the CA certificate under "ca.crt". When unset, servers are verified
+	// against the system trust store. The name is resolved verbatim, so it must
+	// be a DNS-1123 subdomain.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	CASecretRef string `json:"caSecretRef,omitempty"`
 
 	// MutualTLS enables mutual TLS authentication
@@ -198,6 +217,12 @@ type RedisSentinelStatus struct {
 	// Phase represents the current phase of the RedisSentinel
 	// +optional
 	Phase string `json:"phase,omitempty"`
+
+	// ObservedGeneration is the spec generation this status was computed from.
+	// A status whose observedGeneration trails metadata.generation describes the
+	// previous spec, not the one in the object.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// MasterNode is the current Redis master pod name
 	// +optional

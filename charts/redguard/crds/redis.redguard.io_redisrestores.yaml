@@ -72,8 +72,12 @@ spec:
                         type: string
                       credentialsSecretRef:
                         description: |-
-                          CredentialsSecretRef references a Secret containing AWS credentials
-                          Secret must have "accessKeyId" and "secretAccessKey" keys
+                          CredentialsSecretRef names a Secret in the referring CR's own namespace
+                          holding "accessKeyId" and "secretAccessKey". The name is resolved
+                          verbatim, so it must be a DNS-1123 subdomain.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                         type: string
                       endpoint:
                         description: Endpoint is the S3-compatible endpoint (for MinIO,
@@ -99,6 +103,14 @@ spec:
                     required:
                     - bucket
                     type: object
+                    x-kubernetes-validations:
+                    - message: 'exactly one of s3.credentialsSecretRef or s3.useIAMRole
+                        must be set: with neither, the AWS SDK signs the request with
+                        whatever ambient identity the operator pod carries and never
+                        passes the destination allowlist; with both, the Secret wins
+                        and useIAMRole says nothing about which identity signed'
+                      rule: has(self.credentialsSecretRef) != (has(self.useIAMRole)
+                        && self.useIAMRole)
                 required:
                 - backupPath
                 - s3
