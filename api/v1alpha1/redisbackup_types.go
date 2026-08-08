@@ -61,8 +61,13 @@ type S3Config struct {
 
 // RedisBackupSpec defines the desired state of RedisBackup
 type RedisBackupSpec struct {
-	// RedisClusterRef references the RedisSentinel instance to backup
+	// RedisClusterRef is the name of a RedisSentinel in this RedisBackup's own
+	// namespace. It is resolved verbatim and is joined into the S3 key prefix
+	// this backup writes and prunes under, so it must be a DNS-1123 subdomain.
 	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	RedisClusterRef string `json:"redisClusterRef"`
 
 	// Schedule is a five-field cron expression (minute hour day-of-month month
@@ -72,15 +77,18 @@ type RedisBackupSpec struct {
 	// a parse failure as Degraded.
 	// +optional
 	// +kubebuilder:validation:MaxLength=256
-	// +kubebuilder:validation:Pattern=`^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,-]+(\s+[0-9A-Za-z*/,-]+){4}$`
+	// +kubebuilder:validation:Pattern=`^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,?-]+(\s+[0-9A-Za-z*/,?-]+){4}$`
 	Schedule string `json:"schedule,omitempty"`
 
 	// S3 defines S3 storage configuration
 	// +required
 	S3 S3Config `json:"s3"`
 
-	// RetentionPolicy defines how many backups to keep
+	// RetentionPolicy is how many of this cluster's backups to keep; older ones
+	// are deleted after a successful run. Zero disables pruning and keeps every
+	// backup.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=7
 	RetentionPolicy int32 `json:"retentionPolicy,omitempty"`
 

@@ -39,8 +39,12 @@ type BackupSource struct {
 
 // RedisRestoreSpec defines the desired state of RedisRestore
 type RedisRestoreSpec struct {
-	// RedisClusterRef references the RedisSentinel instance to restore
+	// RedisClusterRef is the name of a RedisSentinel in this RedisRestore's own
+	// namespace. It is resolved verbatim, so it must be a DNS-1123 subdomain.
 	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	RedisClusterRef string `json:"redisClusterRef"`
 
 	// BackupSource defines where to restore from

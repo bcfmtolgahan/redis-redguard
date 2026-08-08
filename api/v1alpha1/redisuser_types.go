@@ -59,8 +59,12 @@ type ACLRule struct {
 
 // RedisUserSpec defines the desired state of RedisUser
 type RedisUserSpec struct {
-	// RedisClusterRef references the RedisSentinel instance
+	// RedisClusterRef is the name of a RedisSentinel in this RedisUser's own
+	// namespace. It is resolved verbatim, so it must be a DNS-1123 subdomain.
 	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	RedisClusterRef string `json:"redisClusterRef"`
 
 	// Username is the Redis ACL username. The name "default" is reserved: it

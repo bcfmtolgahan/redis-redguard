@@ -164,6 +164,73 @@ var _ = Describe("Secret reference validation", func() {
 	})
 })
 
+// A cluster reference is resolved verbatim as a name in the CR's own namespace,
+// and RedisBackup joins it into the S3 key prefix that retention prunes under.
+var _ = Describe("Cluster reference validation", func() {
+	DescribeTable("rejects a RedisBackup cluster reference that is not a DNS name",
+		func(objName, ref string) {
+			backup := newValidationBackup(objName)
+			backup.Spec.RedisClusterRef = ref
+
+			err := k8sClient.Create(ctx, backup)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("redisClusterRef"))
+		},
+		Entry("empty", "clusterref-empty", ""),
+		Entry("uppercase", "clusterref-upper", "TestCluster"),
+		Entry("parent directory", "clusterref-dotdot", ".."),
+		Entry("path separator", "clusterref-slash", "prod/cluster"),
+		Entry("wildcard", "clusterref-glob", "*"),
+	)
+
+	It("rejects a RedisUser cluster reference that is not a DNS name", func() {
+		user := &redisv1alpha1.RedisUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "clusterref-user", Namespace: "default"},
+			Spec: redisv1alpha1.RedisUserSpec{
+				RedisClusterRef:   "Not A Cluster",
+				Username:          "appuser",
+				PasswordSecretRef: "user-pass",
+			},
+		}
+
+		err := k8sClient.Create(ctx, user)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("redisClusterRef"))
+	})
+
+	It("rejects a RedisRestore cluster reference that is not a DNS name", func() {
+		restore := newValidationRestore("clusterref-restore")
+		restore.Spec.RedisClusterRef = "Not A Cluster"
+
+		err := k8sClient.Create(ctx, restore)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("redisClusterRef"))
+	})
+})
+
+// Retention is a count of backups to keep. A negative count has no meaning and
+// the pruner reads it as "keep everything", which is the opposite of what a
+// user asking for fewer backups intends.
+var _ = Describe("RedisBackup retention validation", func() {
+	It("rejects a negative retentionPolicy", func() {
+		u := asUnstructured(newValidationBackup("retention-negative"), "RedisBackup")
+		Expect(unstructured.SetNestedField(u.Object, int64(-1), "spec", "retentionPolicy")).To(Succeed())
+
+		err := k8sClient.Create(ctx, u)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("retentionPolicy"))
+		Expect(err.Error()).To(ContainSubstring("greater than or equal to 0"))
+	})
+
+	It("accepts retentionPolicy 0, which keeps every backup", func() {
+		u := asUnstructured(newValidationBackup("retention-zero"), "RedisBackup")
+		Expect(unstructured.SetNestedField(u.Object, int64(0), "spec", "retentionPolicy")).To(Succeed())
+
+		Expect(k8sClient.Create(ctx, u)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, u)).To(Succeed())
+	})
+})
+
 // An unparsable schedule silently disables backups forever, so it is refused at
 // admission where the shape allows and at reconcile where it does not.
 var _ = Describe("RedisBackup schedule validation", func() {
@@ -194,6 +261,7 @@ var _ = Describe("RedisBackup schedule validation", func() {
 		Entry("step and list", "sched-step", "*/15 0,12 1-15 * MON-FRI"),
 		Entry("timezone prefix", "sched-tz", "CRON_TZ=Europe/Istanbul 0 2 * * *"),
 		Entry("one-time backup", "sched-empty", ""),
+		Entry("quartz blank field", "sched-qmark", "0 2 ? * MON-FRI"),
 	)
 
 	It("degrades on a schedule the cron parser rejects", func() {

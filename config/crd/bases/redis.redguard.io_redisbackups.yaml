@@ -60,13 +60,22 @@ spec:
                 description: Compression enables gzip compression
                 type: boolean
               redisClusterRef:
-                description: RedisClusterRef references the RedisSentinel instance
-                  to backup
+                description: |-
+                  RedisClusterRef is the name of a RedisSentinel in this RedisBackup's own
+                  namespace. It is resolved verbatim and is joined into the S3 key prefix
+                  this backup writes and prunes under, so it must be a DNS-1123 subdomain.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
               retentionPolicy:
                 default: 7
-                description: RetentionPolicy defines how many backups to keep
+                description: |-
+                  RetentionPolicy is how many of this cluster's backups to keep; older ones
+                  are deleted after a successful run. Zero disables pruning and keeps every
+                  backup.
                 format: int32
+                minimum: 0
                 type: integer
               s3:
                 description: S3 defines S3 storage configuration
@@ -123,7 +132,7 @@ spec:
                   only fixes the shape; ranges are checked by the controller, which reports
                   a parse failure as Degraded.
                 maxLength: 256
-                pattern: ^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,-]+(\s+[0-9A-Za-z*/,-]+){4}$
+                pattern: ^$|^((TZ|CRON_TZ)=[A-Za-z0-9_+/-]+\s+)?[0-9A-Za-z*/,?-]+(\s+[0-9A-Za-z*/,?-]+){4}$
                 type: string
               suspend:
                 description: Suspend pauses scheduled backups
