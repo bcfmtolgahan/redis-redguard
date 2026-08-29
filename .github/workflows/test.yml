@@ -56,7 +56,7 @@ jobs:
           if-no-files-found: error
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Verify chart is in sync with config/
         run: make verify-chart

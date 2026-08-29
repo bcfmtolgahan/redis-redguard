@@ -64,7 +64,7 @@ jobs:
       # The suite installs the operator from charts/redguard, the path a user
       # follows, so helm has to be present and not left to the runner image.
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       # make test-e2e creates, owns and deletes a cluster of its own, with its
       # own kubeconfig. Nothing here may create a cluster or set KUBECONFIG.
